@@ -13,6 +13,30 @@ struct SidebarView: View {
                         .onTapGesture {
                             tabManager.selectTab(tab)
                         }
+                        .contextMenu {
+                            Button("Rename Tab...") {
+                                tabManager.promptRenameTab(tab)
+                            }
+
+                            Divider()
+
+                            Button("Close Tab") {
+                                tabManager.closeTab(tab)
+                            }
+
+                            Button("Close Other Tabs") {
+                                tabManager.closeOtherTabs(tab)
+                            }
+                            .disabled(tabManager.tabs.count <= 1)
+
+                            Button("Close Tabs to the Right") {
+                                tabManager.closeTabsToTheRight(of: tab)
+                            }
+                            .disabled({
+                                guard let idx = tabManager.tabs.firstIndex(where: { $0.id == tab.id }) else { return true }
+                                return idx >= tabManager.tabs.count - 1
+                            }())
+                        }
                 }
             }
             .padding(.horizontal, 8)

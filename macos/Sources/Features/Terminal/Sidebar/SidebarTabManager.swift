@@ -90,4 +90,46 @@ class SidebarTabManager: ObservableObject {
         guard let controller = tab.window.windowController as? TerminalController else { return }
         controller.closeTab(nil)
     }
+
+    func renameTab(_ tab: TabItem, to newTitle: String) {
+        guard let controller = tab.window.windowController as? BaseTerminalController else { return }
+        controller.titleOverride = newTitle.isEmpty ? nil : newTitle
+        refresh()
+    }
+
+    func promptRenameTab(_ tab: TabItem) {
+        guard let controller = tab.window.windowController as? BaseTerminalController else { return }
+        controller.promptTabTitle()
+    }
+
+    func closeOtherTabs(_ tab: TabItem) {
+        guard let window else { return }
+        let tabWindows: [NSWindow]
+        if let tabbedWindows = window.tabbedWindows, !tabbedWindows.isEmpty {
+            tabWindows = tabbedWindows
+        } else {
+            return
+        }
+        for w in tabWindows where ObjectIdentifier(w) != tab.id {
+            if let controller = w.windowController as? TerminalController {
+                controller.closeTab(nil)
+            }
+        }
+    }
+
+    func closeTabsToTheRight(of tab: TabItem) {
+        guard let window else { return }
+        let tabWindows: [NSWindow]
+        if let tabbedWindows = window.tabbedWindows, !tabbedWindows.isEmpty {
+            tabWindows = tabbedWindows
+        } else {
+            return
+        }
+        guard let idx = tabWindows.firstIndex(where: { ObjectIdentifier($0) == tab.id }) else { return }
+        for w in tabWindows[(idx + 1)...] {
+            if let controller = w.windowController as? TerminalController {
+                controller.closeTab(nil)
+            }
+        }
+    }
 }

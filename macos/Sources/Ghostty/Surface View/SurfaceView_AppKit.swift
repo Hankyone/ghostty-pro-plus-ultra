@@ -604,7 +604,25 @@ extension Ghostty {
             }
         }
 
+        /// Prefix used to set a sticky tab title override from CLI.
+        /// Usage: printf '\e]2;!rename:My Tab Name\a'
+        private static let renamePrefix = "!rename:"
+
         func setTitle(_ title: String) {
+            // Intercept sticky rename command before any coalescing or filtering.
+            // This sets titleOverride on the window controller, which persists
+            // across shell prompt title resets.
+            if title.hasPrefix(Self.renamePrefix) {
+                let newTitle = String(title.dropFirst(Self.renamePrefix.count))
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          let window = self.window,
+                          let controller = window.windowController as? BaseTerminalController else { return }
+                    controller.titleOverride = newTitle.isEmpty ? nil : newTitle
+                }
+                return
+            }
+
             // This fixes an issue where very quick changes to the title could
             // cause an unpleasant flickering. We set a timer so that we can
             // coalesce rapid changes. The timer is short enough that it still
