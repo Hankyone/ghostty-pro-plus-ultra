@@ -173,6 +173,9 @@ class AppDelegate: NSObject,
             // it manually.
             "NSFullScreenMenuItemEverywhere": false,
 
+            // Show the thin card border around sidebar tab cards by default.
+            "SidebarShowCardBorder": true,
+
             // On macOS 26 RC1, the autofill heuristic controller causes unusable levels
             // of slowdowns and CPU usage in the terminal window under certain [unknown]
             // conditions. We don't know exactly why/how. This disables the full heuristic
@@ -299,6 +302,7 @@ class AppDelegate: NSObject,
 
         // Setup our menu
         setupMenuImages()
+        setupTabColorSubmenu()
 
         // Setup signal handlers
         setupSignals()
@@ -596,6 +600,38 @@ class AppDelegate: NSObject,
         self.menuMoveSplitDividerRight?.setImageIfDesired(systemSymbolName: "arrow.right.to.line")
         self.menuFloatOnTop?.setImageIfDesired(systemSymbolName: "square.filled.on.square")
         self.menuFindParent?.setImageIfDesired(systemSymbolName: "text.page.badge.magnifyingglass")
+    }
+
+    /// Build a "Tab Color" submenu and insert it into the View menu after "Change Tab Title...".
+    private func setupTabColorSubmenu() {
+        guard let viewMenu = NSApp.mainMenu?.item(withTitle: "View")?.submenu else { return }
+        guard let changeTabTitleItem = self.menuChangeTabTitle else { return }
+        guard let insertIndex = viewMenu.items.firstIndex(of: changeTabTitleItem) else { return }
+
+        let tabColorSubmenu = NSMenu(title: "Tab Color")
+        for color in TerminalTabColor.allCases {
+            let item = NSMenuItem(
+                title: color.localizedName,
+                action: #selector(BaseTerminalController.setTabColor(_:)),
+                keyEquivalent: ""
+            )
+            item.tag = color.rawValue
+            item.image = color.swatchImage(selected: false)
+            tabColorSubmenu.addItem(item)
+        }
+
+        let tabColorMenuItem = NSMenuItem(title: "Tab Color", action: nil, keyEquivalent: "")
+        tabColorMenuItem.submenu = tabColorSubmenu
+        tabColorMenuItem.setImageIfDesired(systemSymbolName: "paintpalette")
+        viewMenu.insertItem(tabColorMenuItem, at: insertIndex + 1)
+
+        let tabBorderItem = NSMenuItem(
+            title: "Show Tab Border",
+            action: #selector(BaseTerminalController.toggleTabBorder(_:)),
+            keyEquivalent: ""
+        )
+        tabBorderItem.setImageIfDesired(systemSymbolName: "rectangle.inset.filled")
+        viewMenu.insertItem(tabBorderItem, at: insertIndex + 2)
     }
 
     /// Sync all of our menu item keyboard shortcuts with the Ghostty configuration.

@@ -1305,6 +1305,16 @@ class BaseTerminalController: NSWindowController,
         promptTabTitle()
     }
 
+    @IBAction func setTabColor(_ sender: NSMenuItem) {
+        guard let color = TerminalTabColor(rawValue: sender.tag) else { return }
+        (window as? TerminalWindow)?.tabColor = color
+    }
+
+    @IBAction func toggleTabBorder(_ sender: Any) {
+        let current = UserDefaults.standard.bool(forKey: "SidebarShowCardBorder")
+        UserDefaults.standard.set(!current, forKey: "SidebarShowCardBorder")
+    }
+
     @IBAction func splitRight(_ sender: Any) {
         guard let surface = focusedSurface?.surface else { return }
         ghostty.split(surface: surface, direction: GHOSTTY_SPLIT_DIRECTION_RIGHT)
@@ -1459,6 +1469,15 @@ extension BaseTerminalController: NSMenuItemValidation {
         switch item.action {
         case #selector(findHide):
             return focusedSurface?.searchState != nil
+
+        case #selector(setTabColor(_:)):
+            let current = (window as? TerminalWindow)?.tabColor ?? .none
+            item.state = (TerminalTabColor(rawValue: item.tag) == current) ? .on : .off
+            return true
+
+        case #selector(toggleTabBorder(_:)):
+            item.state = UserDefaults.standard.bool(forKey: "SidebarShowCardBorder") ? .on : .off
+            return true
 
         default:
             return true

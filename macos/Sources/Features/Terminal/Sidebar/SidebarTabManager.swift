@@ -13,6 +13,7 @@ class SidebarTabManager: ObservableObject {
         let statusEntries: [TabMetadataStore.StatusEntry]
         let isSelected: Bool
         let needsAttention: Bool
+        let tabColor: TerminalTabColor
         let window: NSWindow
 
         /// The last path component of the pwd, for compact display.
@@ -32,6 +33,7 @@ class SidebarTabManager: ObservableObject {
                 && lhs.surfaceId == rhs.surfaceId
                 && lhs.statusEntries == rhs.statusEntries
                 && lhs.needsAttention == rhs.needsAttention
+                && lhs.tabColor == rhs.tabColor
         }
     }
 
@@ -183,6 +185,7 @@ class SidebarTabManager: ObservableObject {
             let pwd = surface?.pwd
             let entries = sid.map { metadataStore.statusEntries(for: $0) } ?? []
             let branch = pwd.flatMap { gitBranch(at: $0) }
+            let color = (w as? TerminalWindow)?.tabColor ?? .none
 
             return TabItem(
                 id: wid,
@@ -193,6 +196,7 @@ class SidebarTabManager: ObservableObject {
                 statusEntries: entries,
                 isSelected: w === selectedWindow,
                 needsAttention: attentionWindows.contains(wid) && w !== selectedWindow,
+                tabColor: color,
                 window: w
             )
         }
@@ -207,6 +211,11 @@ class SidebarTabManager: ObservableObject {
     func selectTab(_ tab: TabItem) {
         clearAttention(for: tab.id)
         tab.window.makeKeyAndOrderFront(nil)
+    }
+
+    func setTabColor(_ color: TerminalTabColor, for tab: TabItem) {
+        (tab.window as? TerminalWindow)?.tabColor = color
+        refresh()
     }
 
     func closeTab(_ tab: TabItem) {
