@@ -287,9 +287,9 @@ class SidebarTabManager: ObservableObject {
 
         let selectedWindow = window.tabGroup?.selectedWindow ?? window
         let metadataStore = TabMetadataStore.shared
-        // Only run git when the window is active and enough time has passed
-        let isWindowActive = window.isKeyWindow || NSApp.isActive
-        let needsGitRefresh = isWindowActive && Date().timeIntervalSince(gitStatsCacheTime) >= Self.gitStatsCacheInterval
+
+        // Collect pwds for background git refresh
+        var tabPwds: [String] = []
 
         let newTabs = tabWindows.map { w -> TabItem in
             let controller = w.windowController as? BaseTerminalController
@@ -298,21 +298,12 @@ class SidebarTabManager: ObservableObject {
             let sid = surface?.id
             let pwd = surface?.pwd
             let entries = sid.map { metadataStore.statusEntries(for: $0) } ?? []
-            // Only re-run git every few seconds to avoid spawning processes on every refresh
-            let diffStats: String?
-            if let p = pwd {
-                if needsGitRefresh {
-                    let stats = gitDiffStats(at: p)
-                    gitStatsCache[p] = stats
-                    diffStats = stats
-                } else {
-                    diffStats = gitStatsCache[p] ?? nil
-                }
-            } else {
-                diffStats = nil
-            }
+            // Always use cached git stats (never block the main thread)
+            let diffStats = pwd.flatMap { gitStatsCache[$0] ?? nil }
             let favicon = pwd.flatMap { detectFavicon(at: $0) }
             let color = (w as? TerminalWindow)?.tabColor ?? .none
+
+            if let p = pwd { tabPwds.append(p) }
 
             return TabItem(
                 id: wid,
@@ -329,8 +320,45 @@ class SidebarTabManager: ObservableObject {
             )
         }
 
-        if needsGitRefresh {
+        // Refresh git stats in the background periodically
+        let isWindowActive = window.isKeyWindow || NSApp.isActive
+        if isWindowActive && Date().timeIntervalSince(gitStatsCacheTime) >= Self.gitStatsCacheInterval {
             gitStatsCacheTime = Date()
+            let pwds = tabPwds
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                var newStats: [String: String?] = [:]
+                for pwd in pwds {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+                    process.arguments = ["diff", "--shortstat", "HEAD"]
+                    process.currentDirectoryURL = URL(fileURLWithPath: pwd)
+                    let pipe = Pipe()
+                    process.standardOutput = pipe
+                    process.standardError = Pipe()
+                    guard (try? process.run()) != nil else { newStats[pwd] = nil; continue }
+                    process.waitUntilExit()
+                    guard process.terminationStatus == 0 else { newStats[pwd] = nil; continue }
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    guard let output = String(data: data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                        !output.isEmpty else { newStats[pwd] = nil; continue }
+                    var ins = 0, del = 0
+                    if let r = output.range(of: #"\d+ insertion"#, options: .regularExpression) {
+                        ins = Int(output[r].split(separator: " ")[0]) ?? 0
+                    }
+                    if let r = output.range(of: #"\d+ deletion"#, options: .regularExpression) {
+                        del = Int(output[r].split(separator: " ")[0]) ?? 0
+                    }
+                    newStats[pwd] = (ins == 0 && del == 0) ? nil : "+\(ins) -\(del)"
+                }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    for (pwd, stats) in newStats {
+                        self.gitStatsCache[pwd] = stats
+                    }
+                    self.refresh()
+                }
+            }
         }
 
         if newTabs != tabs {
