@@ -1,15 +1,36 @@
-**Personal fork of [Ghostty](https://github.com/ghostty-org/ghostty)** with a sidebar tab system for macOS. Not affiliated with the upstream project. For the official Ghostty terminal, visit [ghostty.org](https://ghostty.org).
+**Personal fork of [pacaya/ghostty](https://github.com/pacaya/ghostty)** (itself a fork of [Ghostty](https://github.com/ghostty-org/ghostty)) with additional sidebar polish and Claude Code integration. Not affiliated with the upstream project. For the official Ghostty terminal, visit [ghostty.org](https://ghostty.org).
 
-🧪 **Experimental**  
-Please note that this is experimental and I built it for my own use. It works fine for me, but feel free and try to break it.
+## What this fork adds
 
-🐛 **Known bugs**  
-~~- Unread indicator does not clear correctly, and might re-appear when switching tabs~~
+Built on top of pacaya's sidebar tab system, this fork adds:
 
-<img width="1125" height="749" alt="ghostty-sidebar" src="https://github.com/user-attachments/assets/919a9220-4e07-4b2e-b491-c9d385b6585f" />
+- **Hover state** — tab cards highlight on mouse hover
+- **Middle-click to close** — middle-click any tab card to close it
+- **Claude Code session summary** — when running Claude Code, the sidebar shows an AI-generated summary of what you're working on (replaces git branch display), with the full text as a tooltip on hover
 
+### Claude Code session summary
 
-## Sidebar
+Uses Claude Code hooks to automatically track your session context. A hook script collects your messages and periodically summarizes them via `claude -p --model haiku`, then pushes the summary to the sidebar via `ghosttyctl set-status`.
+
+**Setup:**
+
+1. The hook script lives at `~/.claude/hooks/ghostty-sidebar.sh`
+2. Register hooks in `~/.claude/settings.json`:
+   ```json
+   {
+     "hooks": {
+       "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
+       "SessionEnd": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }]
+     }
+   }
+   ```
+3. Requires `jq` and the `claude` CLI in your PATH
+
+The summary appears where the git branch normally shows. If no Claude session is active, it falls back to showing git branch as before.
+
+---
+
+## Sidebar (from upstream fork)
 
 Replaces the native tab bar with a left sidebar showing rich tab cards:
 
@@ -37,15 +58,6 @@ ghosttyctl set-status server "localhost:3000" --icon network  # add status entry
 ghosttyctl clear-status server                                # remove it
 ghosttyctl list                                               # list all tabs
 ghosttyctl current                                            # current tab info
-```
-
-### Claude Code
-
-Add to your `~/.claude/CLAUDE.md` so Claude Code can name its tabs and set status:
-
-```markdown
-- Rename the workspace using: `ghosttyctl rename "Claude: <name>"`. Name it after the work being done.
-- Set sidebar status entries using `ghosttyctl set-status <key> <value> [--icon <sf-symbol>]` and clear with `ghosttyctl clear-status <key>`.
 ```
 
 ---
