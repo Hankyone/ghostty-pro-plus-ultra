@@ -67,13 +67,17 @@ struct SidebarView: View {
     @AppStorage("SidebarShowCardBorder") private var showCardBorder: Bool = true
     @State private var draggingTabID: ObjectIdentifier?
     @State private var dropTargetTabID: ObjectIdentifier?
+    @State private var hoveredTabID: ObjectIdentifier?
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                    SidebarTabCard(tab: tab, theme: theme, fields: fields, showCardBorder: showCardBorder)
+                    SidebarTabCard(tab: tab, theme: theme, fields: fields, showCardBorder: showCardBorder, isHovered: hoveredTabID == tab.id)
                         .contentShape(Rectangle())
+                        .onHover { isHovering in
+                            hoveredTabID = isHovering ? tab.id : nil
+                        }
                         .opacity(draggingTabID == tab.id ? 0.4 : 1.0)
                         .overlay(alignment: .top) {
                             if dropTargetTabID == tab.id && draggingTabID != tab.id {
@@ -195,6 +199,7 @@ private struct SidebarTabCard: View {
     let theme: SidebarTheme
     let fields: Set<SidebarField>
     var showCardBorder: Bool = true
+    var isHovered: Bool = false
 
     private static let cardRadius: CGFloat = 8
 
@@ -296,7 +301,7 @@ private struct SidebarTabCard: View {
         .clipShape(RoundedRectangle(cornerRadius: Self.cardRadius))
         .background(
             RoundedRectangle(cornerRadius: Self.cardRadius)
-                .fill(tab.isSelected ? theme.activeTabBackground : Color.clear)
+                .fill(tab.isSelected ? theme.activeTabBackground : (isHovered ? theme.foreground.opacity(0.06) : Color.clear))
         )
         .overlay(
             Group {
