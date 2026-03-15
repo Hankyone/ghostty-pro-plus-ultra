@@ -30,4 +30,8 @@ if ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) != GHOSTTY_SUCCE
 // action is a command starting with a `+`, such as `ghostty +boo`.
 ghostty_cli_try_action()
 
+// Make tooltips appear near-instantly (default is ~1.5s).
+// Must be set before NSApplicationMain so the tooltip system picks it up.
+UserDefaults.standard.set(100, forKey: "NSInitialToolTipDelay")
+
 _ = NSApplicationMain(CommandLine.argc, CommandLine.unsafeArgv)

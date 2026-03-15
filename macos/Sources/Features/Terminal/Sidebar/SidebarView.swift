@@ -157,10 +157,6 @@ struct SidebarView: View {
         .onTapGesture(count: 2) {
             tabManager.createNewTab()
         }
-        .onAppear {
-            // Make tooltips appear near-instantly (default is ~1.5s)
-            UserDefaults.standard.set(100, forKey: "NSInitialToolTipDelay")
-        }
     }
 }
 
