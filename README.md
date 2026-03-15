@@ -1,5 +1,7 @@
 **Personal fork of [pacaya/ghostty](https://github.com/pacaya/ghostty)** (itself a fork of [Ghostty](https://github.com/ghostty-org/ghostty)) with additional sidebar polish and Claude Code integration. Not affiliated with the upstream project. For the official Ghostty terminal, visit [ghostty.org](https://ghostty.org).
 
+<img alt="ghostty-sidebar-claude" src="macos/screenshot.png" />
+
 ## What this fork adds
 
 Built on top of pacaya's sidebar tab system, this fork adds:
