@@ -90,6 +90,9 @@ struct SidebarView: View {
                         .onTapGesture {
                             tabManager.selectTab(tab)
                         }
+                        .overlay(MiddleClickOverlay {
+                            tabManager.closeTab(tab)
+                        })
                         .onDrag {
                             draggingTabID = tab.id
                             return NSItemProvider(object: "\(index)" as NSString)
@@ -311,5 +314,39 @@ private struct SidebarTabCard: View {
                 }
             }
         )
+    }
+}
+
+// MARK: - MiddleClickOverlay
+
+/// Transparent NSView overlay that captures middle-click (button 2) events.
+private struct MiddleClickOverlay: NSViewRepresentable {
+    var action: () -> Void
+
+    func makeNSView(context: Context) -> MiddleClickView {
+        MiddleClickView(action: action)
+    }
+
+    func updateNSView(_ nsView: MiddleClickView, context: Context) {
+        nsView.action = action
+    }
+
+    class MiddleClickView: NSView {
+        var action: () -> Void
+
+        init(action: @escaping () -> Void) {
+            self.action = action
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func otherMouseUp(with event: NSEvent) {
+            if event.buttonNumber == 2 {
+                action()
+            } else {
+                super.otherMouseUp(with: event)
+            }
+        }
     }
 }
