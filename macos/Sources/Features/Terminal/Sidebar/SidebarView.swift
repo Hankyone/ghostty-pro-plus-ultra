@@ -157,6 +157,10 @@ struct SidebarView: View {
         .onTapGesture(count: 2) {
             tabManager.createNewTab()
         }
+        .onAppear {
+            // Make tooltips appear near-instantly (default is ~1.5s)
+            UserDefaults.standard.set(100, forKey: "NSInitialToolTipDelay")
+        }
     }
 }
 
@@ -250,7 +254,15 @@ private struct SidebarTabCard: View {
 
                         Spacer()
 
-                        if tab.needsAttention {
+                        if let activeEntry = tab.statusEntries.first(where: { $0.key == "claude-active" }) {
+                            if activeEntry.value == "done" {
+                                Circle()
+                                    .fill(.green)
+                                    .frame(width: 8, height: 8)
+                            } else {
+                                PulsingDot(color: .accentColor)
+                            }
+                        } else if tab.needsAttention {
                             Circle()
                                 .fill(theme.attentionColor)
                                 .frame(width: 8, height: 8)
@@ -258,7 +270,7 @@ private struct SidebarTabCard: View {
                     }
                 }
 
-                // Directory name
+                // Directory name + git diff stats
                 if fields.contains(.directory), let dir = tab.directoryName {
                     HStack(spacing: 4) {
                         Image(systemName: "folder")
@@ -268,39 +280,35 @@ private struct SidebarTabCard: View {
                             .font(.system(size: 10))
                             .foregroundColor(theme.secondaryText)
                             .lineLimit(1)
+
+                        if let stats = tab.gitDiffStats {
+                            Spacer()
+                            Text(stats)
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundColor(theme.secondaryText)
+                                .lineLimit(1)
+                        }
                     }
                 }
 
-                // Claude session summary (replaces git branch when active)
-                if fields.contains(.gitBranch) {
-                    if let claudeEntry = tab.statusEntries.first(where: { $0.key == "claude" }) {
-                        HStack(spacing: 4) {
-                            Image(systemName: claudeEntry.icon ?? "bubble.left.fill")
-                                .font(.system(size: 9))
-                                .foregroundColor(theme.secondaryText)
-                            Text(claudeEntry.value)
-                                .font(.system(size: 10))
-                                .foregroundColor(theme.secondaryText)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                        }
-                        .help(claudeEntry.value)
-                    } else if let branch = tab.gitBranch {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.triangle.branch")
-                                .font(.system(size: 9))
-                                .foregroundColor(theme.secondaryText)
-                            Text(branch)
-                                .font(.system(size: 10))
-                                .foregroundColor(theme.secondaryText)
-                                .lineLimit(1)
-                        }
+                // Claude session summary
+                if let claudeEntry = tab.statusEntries.first(where: { $0.key == "claude" }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: claudeEntry.icon ?? "bubble.left.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(theme.secondaryText)
+                        Text(claudeEntry.value)
+                            .font(.system(size: 10))
+                            .foregroundColor(theme.secondaryText)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
+                    .help(claudeEntry.value)
                 }
 
                 // Status entries (excluding "claude" which is shown in the branch slot)
                 if fields.contains(.status) {
-                    let filteredEntries = tab.statusEntries.filter { $0.key != "claude" }
+                    let filteredEntries = tab.statusEntries.filter { $0.key != "claude" && $0.key != "claude-active" }
                     ForEach(filteredEntries, id: \.key) { entry in
                         HStack(spacing: 4) {
                             if let icon = entry.icon {
@@ -377,5 +385,26 @@ private struct MiddleClickOverlay: NSViewRepresentable {
                 super.otherMouseUp(with: event)
             }
         }
+    }
+}
+
+// MARK: - PulsingDot
+
+/// Animated pulsing dot that indicates Claude Code is actively working.
+/// Runs as a SwiftUI animation, so it stays animated even when the tab is not focused.
+private struct PulsingDot: View {
+    let color: Color
+    @State private var isPulsing = false
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 8, height: 8)
+            .opacity(isPulsing ? 0.3 : 1.0)
+            .animation(
+                .easeInOut(duration: 0.8).repeatForever(autoreverses: true),
+                value: isPulsing
+            )
+            .onAppear { isPulsing = true }
     }
 }

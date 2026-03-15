@@ -8,7 +8,7 @@ class SidebarTabManager: ObservableObject {
         let id: ObjectIdentifier
         let title: String
         let pwd: String?
-        let gitBranch: String?
+        let gitDiffStats: String?
         let surfaceId: UUID?
         let statusEntries: [TabMetadataStore.StatusEntry]
         let isSelected: Bool
@@ -29,7 +29,7 @@ class SidebarTabManager: ObservableObject {
 
         static func == (lhs: TabItem, rhs: TabItem) -> Bool {
             lhs.id == rhs.id && lhs.title == rhs.title && lhs.isSelected == rhs.isSelected
-                && lhs.pwd == rhs.pwd && lhs.gitBranch == rhs.gitBranch
+                && lhs.pwd == rhs.pwd && lhs.gitDiffStats == rhs.gitDiffStats
                 && lhs.surfaceId == rhs.surfaceId
                 && lhs.statusEntries == rhs.statusEntries
                 && lhs.needsAttention == rhs.needsAttention
@@ -142,24 +142,47 @@ class SidebarTabManager: ObservableObject {
         attentionWindows.remove(id)
     }
 
-    // MARK: - Git Branch
+    // MARK: - Git Diff Stats
 
-    /// Read the git branch from .git/HEAD in the given directory.
-    /// Walks up to find the repo root (supports subdirectories).
-    private func gitBranch(at pwd: String) -> String? {
-        var dir = pwd
-        while dir != "/" {
-            let headPath = (dir as NSString).appendingPathComponent(".git/HEAD")
-            if let contents = try? String(contentsOfFile: headPath, encoding: .utf8) {
-                let prefix = "ref: refs/heads/"
-                if contents.hasPrefix(prefix) {
-                    return contents.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
-                }
-                return nil // detached HEAD
-            }
-            dir = (dir as NSString).deletingLastPathComponent
+    /// Run `git diff --shortstat HEAD` and return a compact "+N -N" string,
+    /// or nil if there are no uncommitted changes or the directory is not a git repo.
+    private func gitDiffStats(at pwd: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["diff", "--shortstat", "HEAD"]
+        process.currentDirectoryURL = URL(fileURLWithPath: pwd)
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
         }
-        return nil
+
+        guard process.terminationStatus == 0 else { return nil }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !output.isEmpty else { return nil }
+
+        // Parse: " 3 files changed, 12 insertions(+), 5 deletions(-)"
+        var insertions = 0
+        var deletions = 0
+
+        if let range = output.range(of: #"\d+ insertion"#, options: .regularExpression) {
+            insertions = Int(output[range].split(separator: " ")[0]) ?? 0
+        }
+        if let range = output.range(of: #"\d+ deletion"#, options: .regularExpression) {
+            deletions = Int(output[range].split(separator: " ")[0]) ?? 0
+        }
+
+        if insertions == 0 && deletions == 0 { return nil }
+        return "+\(insertions) -\(deletions)"
     }
 
     // MARK: - Refresh
@@ -184,14 +207,14 @@ class SidebarTabManager: ObservableObject {
             let sid = surface?.id
             let pwd = surface?.pwd
             let entries = sid.map { metadataStore.statusEntries(for: $0) } ?? []
-            let branch = pwd.flatMap { gitBranch(at: $0) }
+            let diffStats = pwd.flatMap { gitDiffStats(at: $0) }
             let color = (w as? TerminalWindow)?.tabColor ?? .none
 
             return TabItem(
                 id: wid,
                 title: w.title,
                 pwd: pwd,
-                gitBranch: branch,
+                gitDiffStats: diffStats,
                 surfaceId: sid,
                 statusEntries: entries,
                 isSelected: w === selectedWindow,
