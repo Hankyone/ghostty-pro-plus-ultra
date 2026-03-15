@@ -273,9 +273,16 @@ private struct SidebarTabCard: View {
                 // Directory name + git diff stats
                 if fields.contains(.directory), let dir = tab.directoryName {
                     HStack(spacing: 4) {
-                        Image(systemName: "folder")
-                            .font(.system(size: 9))
-                            .foregroundColor(theme.secondaryText)
+                        if let favicon = tab.faviconImage {
+                            Image(nsImage: favicon)
+                                .resizable()
+                                .interpolation(.high)
+                                .frame(width: 11, height: 11)
+                        } else {
+                            Image(systemName: "folder")
+                                .font(.system(size: 9))
+                                .foregroundColor(theme.secondaryText)
+                        }
                         Text(dir)
                             .font(.system(size: 10))
                             .foregroundColor(theme.secondaryText)
