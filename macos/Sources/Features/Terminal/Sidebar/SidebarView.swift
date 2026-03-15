@@ -267,22 +267,37 @@ private struct SidebarTabCard: View {
                     }
                 }
 
-                // Git branch
-                if fields.contains(.gitBranch), let branch = tab.gitBranch {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrow.triangle.branch")
-                            .font(.system(size: 9))
-                            .foregroundColor(theme.secondaryText)
-                        Text(branch)
-                            .font(.system(size: 10))
-                            .foregroundColor(theme.secondaryText)
-                            .lineLimit(1)
+                // Claude session summary (replaces git branch when active)
+                if fields.contains(.gitBranch) {
+                    if let claudeEntry = tab.statusEntries.first(where: { $0.key == "claude" }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: claudeEntry.icon ?? "bubble.left.fill")
+                                .font(.system(size: 9))
+                                .foregroundColor(theme.secondaryText)
+                            Text(claudeEntry.value)
+                                .font(.system(size: 10))
+                                .foregroundColor(theme.secondaryText)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        .help(claudeEntry.value)
+                    } else if let branch = tab.gitBranch {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.system(size: 9))
+                                .foregroundColor(theme.secondaryText)
+                            Text(branch)
+                                .font(.system(size: 10))
+                                .foregroundColor(theme.secondaryText)
+                                .lineLimit(1)
+                        }
                     }
                 }
 
-                // Status entries
-                if fields.contains(.status), !tab.statusEntries.isEmpty {
-                    ForEach(tab.statusEntries, id: \.key) { entry in
+                // Status entries (excluding "claude" which is shown in the branch slot)
+                if fields.contains(.status) {
+                    let filteredEntries = tab.statusEntries.filter { $0.key != "claude" }
+                    ForEach(filteredEntries, id: \.key) { entry in
                         HStack(spacing: 4) {
                             if let icon = entry.icon {
                                 Image(systemName: icon)
