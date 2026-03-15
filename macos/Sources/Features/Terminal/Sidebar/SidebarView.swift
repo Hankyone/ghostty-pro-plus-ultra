@@ -153,6 +153,10 @@ struct SidebarView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.background)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            tabManager.createNewTab()
+        }
     }
 }
 
@@ -355,6 +359,16 @@ private struct MiddleClickOverlay: NSViewRepresentable {
         }
 
         required init?(coder: NSCoder) { fatalError() }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            // Only intercept middle-click events; pass everything else through
+            // so SwiftUI gestures (tap, hover, drag) work normally.
+            if let event = NSApp.currentEvent,
+               event.type == .otherMouseDown || event.type == .otherMouseUp {
+                return super.hitTest(point)
+            }
+            return nil
+        }
 
         override func otherMouseUp(with event: NSEvent) {
             if event.buttonNumber == 2 {

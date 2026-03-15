@@ -208,6 +208,10 @@ class SidebarTabManager: ObservableObject {
 
     // MARK: - Tab Actions
 
+    func createNewTab() {
+        NSApp.sendAction(#selector(TerminalController.newTab(_:)), to: nil, from: nil)
+    }
+
     func selectTab(_ tab: TabItem) {
         clearAttention(for: tab.id)
         tab.window.makeKeyAndOrderFront(nil)
