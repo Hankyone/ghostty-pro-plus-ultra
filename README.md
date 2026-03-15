@@ -8,11 +8,14 @@ Built on top of pacaya's sidebar tab system, this fork adds:
 
 - **Hover state** — tab cards highlight on mouse hover
 - **Middle-click to close** — middle-click any tab card to close it
-- **Claude Code session summary** — when running Claude Code, the sidebar shows an AI-generated summary of what you're working on (replaces git branch display), with the full text as a tooltip on hover
+- **Double-click empty space** — double-click below the tab list to create a new tab
+- **Git diff stats** — shows `+N -N` uncommitted changes right-aligned on the directory row (replaces git branch)
+- **Claude Code session summary** — AI-generated summary of what you're working on, with full text as an instant tooltip on hover
+- **Claude activity indicator** — pulsing blue dot while Claude is working, solid green dot when done/needs your attention
 
-### Claude Code session summary
+### Claude Code integration
 
-Uses Claude Code hooks to automatically track your session context. A hook script collects your messages and periodically summarizes them via `claude -p --model haiku`, then pushes the summary to the sidebar via `ghosttyctl set-status`.
+Uses Claude Code hooks to automatically track session context and activity. A hook script collects messages, periodically summarizes them via `claude -p --model haiku`, and pushes status to the sidebar via `ghosttyctl set-status`.
 
 **Setup:**
 
@@ -22,13 +25,12 @@ Uses Claude Code hooks to automatically track your session context. A hook scrip
    {
      "hooks": {
        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
+       "Stop": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
        "SessionEnd": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }]
      }
    }
    ```
 3. Requires `jq` and the `claude` CLI in your PATH
-
-The summary appears where the git branch normally shows. If no Claude session is active, it falls back to showing git branch as before.
 
 ---
 
@@ -36,7 +38,7 @@ The summary appears where the git branch normally shows. If no Claude session is
 
 Replaces the native tab bar with a left sidebar showing rich tab cards:
 
-- **Title, directory, git branch** — git branch detected automatically, no setup needed
+- **Title, directory, git diff stats** — uncommitted change counts detected automatically
 - **Custom status entries** — show ports, environments, or any metadata via CLI
 - **Attention indicators** — orange dot on tabs with notifications or bell
 - **Drag-and-drop** — reorder tabs by dragging
