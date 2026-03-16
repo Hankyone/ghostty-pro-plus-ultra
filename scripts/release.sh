@@ -156,7 +156,6 @@ cat > /tmp/appcast.xml << APPCAST_EOF
       <enclosure
         url="${DMG_URL}"
         ${SPARKLE_SIG}
-        length="${DMG_SIZE}"
         type="application/octet-stream" />
     </item>
   </channel>
