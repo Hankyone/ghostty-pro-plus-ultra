@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      PPU_VERSION: ${{ github.event.inputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract build info
+        id: info
+        run: |
+          GHOSTTY_BUILD=$(git rev-list --count HEAD)
+          GHOSTTY_COMMIT=$(git rev-parse --short HEAD)
+          echo "build=$GHOSTTY_BUILD" >> "$GITHUB_OUTPUT"
+          echo "commit=$GHOSTTY_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Xcode version
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app
+          xcodebuild -version
+
+      # Build the Zig framework that the Swift app depends on
+      - name: Build GhosttyKit
+        env:
+          GHOSTTY_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          VERSION=${GHOSTTY_VERSION#v}
+          nix develop -c \
+            zig build \
+            -Doptimize=ReleaseFast \
+            -Demit-macos-app=false \
+            -Dversion-string=${VERSION}
+
+      # Build the native macOS app via Xcode
+      - name: Build Ghostty.app
+        run: |
+          cd macos
+          xcodebuild -target Ghostty -configuration Release
+
+      - name: Update Info.plist
+        env:
+          GHOSTTY_BUILD: ${{ steps.info.outputs.build }}
+          GHOSTTY_COMMIT: ${{ steps.info.outputs.commit }}
+        run: |
+          VERSION=${PPU_VERSION#v}
+          PLIST="macos/build/Release/Ghostty.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :GhosttyCommit $GHOSTTY_COMMIT" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GHOSTTY_BUILD" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PWD: ${{ secrets.KEYCHAIN_PWD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" build.keychain
+
+      - name: Codesign app bundle
+        env:
+          MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+        run: |
+          # Sign the dock tile plugin
+          /usr/bin/codesign --verbose -f -s "$MACOS_CERTIFICATE_NAME" -o runtime \
+            "macos/build/Release/Ghostty.app/Contents/PlugIns/DockTilePlugin.plugin"
+
+          # Sign the main app bundle
+          /usr/bin/codesign --verbose -f -s "$MACOS_CERTIFICATE_NAME" -o runtime \
+            --entitlements "macos/Ghostty.entitlements" \
+            macos/build/Release/Ghostty.app
+
+      - name: Create DMG
+        env:
+          MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+        run: |
+          npm install --global create-dmg
+          create-dmg \
+            --identity="$MACOS_CERTIFICATE_NAME" \
+            ./macos/build/Release/Ghostty.app \
+            ./
+          mv ./Ghostty*.dmg ./GhosttyProPlusUltra.dmg
+
+      - name: Notarize DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "GhosttyProPlusUltra.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          xcrun stapler staple "GhosttyProPlusUltra.dmg"
+          xcrun stapler staple "macos/build/Release/Ghostty.app"
+
+      - name: Zip app for GitHub Release
+        run: |
+          cd macos/build/Release
+          zip -9 -r --symlinks ../../../GhosttyProPlusUltra-macos-universal.zip Ghostty.app
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: Ghostty Pro Plus Ultra ${{ github.event.inputs.version }}
+          draft: true
+          files: |
+            GhosttyProPlusUltra.dmg
+            GhosttyProPlusUltra-macos-universal.zip
