@@ -11,7 +11,6 @@ class SidebarTabManager: ObservableObject {
         let gitDiffStats: String?
         let surfaceId: UUID?
         let statusEntries: [TabMetadataStore.StatusEntry]
-        let isSelected: Bool
         let needsAttention: Bool
         let tabColor: TerminalTabColor
         let faviconImage: NSImage?
@@ -29,7 +28,7 @@ class SidebarTabManager: ObservableObject {
         }
 
         static func == (lhs: TabItem, rhs: TabItem) -> Bool {
-            lhs.id == rhs.id && lhs.title == rhs.title && lhs.isSelected == rhs.isSelected
+            lhs.id == rhs.id && lhs.title == rhs.title
                 && lhs.pwd == rhs.pwd && lhs.gitDiffStats == rhs.gitDiffStats
                 && lhs.surfaceId == rhs.surfaceId
                 && lhs.statusEntries == rhs.statusEntries
@@ -40,6 +39,7 @@ class SidebarTabManager: ObservableObject {
     }
 
     @Published var tabs: [TabItem] = []
+    @Published var selectedTabID: ObjectIdentifier?
 
     /// Windows that need attention, cleared when the tab is selected.
     private var attentionWindows: Set<ObjectIdentifier> = []
@@ -64,11 +64,18 @@ class SidebarTabManager: ObservableObject {
     private var observers: [NSObjectProtocol] = []
     private var timer: Timer?
 
+    /// Guard flag: when true, notification-driven refreshSelection() calls are
+    /// suppressed so they don't overwrite the optimistic selectedTabID that
+    /// selectTab() just set. The tabGroup.selectedWindow setter fires key-window
+    /// notifications synchronously during assignment, and at that point the tab
+    /// group's selectedWindow can return intermediate (old) state.
+    private var isSelectingTab = false
+
     init(window: NSWindow, bellTriggersAttention: Bool = true) {
         self.window = window
         self.bellTriggersAttention = bellTriggersAttention
         setupObservers()
-        refresh()
+        refresh(reason: "init")
     }
 
     deinit {
@@ -79,18 +86,30 @@ class SidebarTabManager: ObservableObject {
     private func setupObservers() {
         let center = NotificationCenter.default
 
-        let titleObserver = center.addObserver(
+        let keyObserver = center.addObserver(
             forName: NSWindow.didBecomeKeyNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in self?.refresh() }
-        observers.append(titleObserver)
+        ) { [weak self] notification in
+            guard let self, let window = self.window,
+                  let notifWindow = notification.object as? NSWindow,
+                  (window.tabbedWindows ?? [window]).contains(notifWindow)
+            else { return }
+            self.refreshSelection()
+        }
+        observers.append(keyObserver)
 
         let resignObserver = center.addObserver(
             forName: NSWindow.didResignKeyNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in self?.refresh() }
+        ) { [weak self] notification in
+            guard let self, let window = self.window,
+                  let notifWindow = notification.object as? NSWindow,
+                  (window.tabbedWindows ?? [window]).contains(notifWindow)
+            else { return }
+            self.refreshSelection()
+        }
         observers.append(resignObserver)
 
         // Bell: respect bell-features config
@@ -108,7 +127,7 @@ class SidebarTabManager: ObservableObject {
                     self.markAttention(window: w)
                 } else {
                     self.clearAttention(for: ObjectIdentifier(w))
-                    self.refresh()
+                    self.refresh(reason: "bell cleared")
                 }
             }
             observers.append(bellObserver)
@@ -141,7 +160,8 @@ class SidebarTabManager: ObservableObject {
 
         // Poll periodically for tab group changes, title changes, pwd changes, metadata changes.
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.refresh()
+            guard let self else { return }
+            self.refresh(reason: "timer")
         }
     }
 
@@ -149,11 +169,23 @@ class SidebarTabManager: ObservableObject {
 
     private func markAttention(window w: NSWindow) {
         attentionWindows.insert(ObjectIdentifier(w))
-        refresh()
+        refresh(reason: "attention set")
     }
 
     private func clearAttention(for id: ObjectIdentifier) {
-        attentionWindows.remove(id)
+        guard attentionWindows.remove(id) != nil else { return }
+        // Patch the cached tab model so the attention indicator clears immediately
+        // without waiting for a full refresh().
+        if let idx = tabs.firstIndex(where: { $0.id == id && $0.needsAttention }) {
+            let old = tabs[idx]
+            tabs[idx] = TabItem(
+                id: old.id, title: old.title, pwd: old.pwd,
+                gitDiffStats: old.gitDiffStats, surfaceId: old.surfaceId,
+                statusEntries: old.statusEntries, needsAttention: false,
+                tabColor: old.tabColor, faviconImage: old.faviconImage,
+                window: old.window
+            )
+        }
     }
 
     // MARK: - Git Diff Stats
@@ -277,9 +309,27 @@ class SidebarTabManager: ObservableObject {
         return image
     }
 
+    // MARK: - Selection
+
+    /// Lightweight update that only syncs `selectedTabID` from the window's tab group,
+    /// without rebuilding the full tab list.
+    private func refreshSelection() {
+        guard !isSelectingTab else { return }
+        guard let window else { return }
+        let selectedWindow = window.tabGroup?.selectedWindow ?? window
+        let newID = ObjectIdentifier(selectedWindow)
+        if selectedTabID != newID {
+            selectedTabID = newID
+        }
+    }
+
     // MARK: - Refresh
 
     func refresh() {
+        refresh(reason: "manual")
+    }
+
+    private func refresh(reason: String) {
         guard let window else { return }
 
         let tabWindows: [NSWindow]
@@ -294,6 +344,7 @@ class SidebarTabManager: ObservableObject {
 
         // Collect pwds for background git refresh
         var tabPwds: [String] = []
+        var faviconCacheMisses = 0
 
         let newTabs = tabWindows.map { w -> TabItem in
             let controller = w.windowController as? BaseTerminalController
@@ -304,7 +355,12 @@ class SidebarTabManager: ObservableObject {
             let entries = sid.map { metadataStore.statusEntries(for: $0) } ?? []
             // Always use cached git stats (never block the main thread)
             let diffStats = pwd.flatMap { gitStatsCache[$0] ?? nil }
-            let favicon = pwd.flatMap { detectFavicon(at: $0) }
+            let favicon = pwd.flatMap { pwd -> NSImage? in
+                if faviconCache.index(forKey: pwd) == nil {
+                    faviconCacheMisses += 1
+                }
+                return detectFavicon(at: pwd)
+            }
             let color = (w as? TerminalWindow)?.tabColor ?? .none
 
             if let p = pwd { tabPwds.append(p) }
@@ -316,8 +372,7 @@ class SidebarTabManager: ObservableObject {
                 gitDiffStats: diffStats,
                 surfaceId: sid,
                 statusEntries: entries,
-                isSelected: w === selectedWindow,
-                needsAttention: attentionWindows.contains(wid) && w !== selectedWindow,
+                needsAttention: attentionWindows.contains(wid),
                 tabColor: color,
                 faviconImage: favicon,
                 window: w
@@ -332,7 +387,8 @@ class SidebarTabManager: ObservableObject {
 
         // Refresh git stats in the background periodically
         let isWindowActive = window.isKeyWindow || NSApp.isActive
-        if isWindowActive && Date().timeIntervalSince(gitStatsCacheTime) >= Self.gitStatsCacheInterval {
+        let shouldRefreshGitStats = isWindowActive && Date().timeIntervalSince(gitStatsCacheTime) >= Self.gitStatsCacheInterval
+        if shouldRefreshGitStats {
             gitStatsCacheTime = Date()
             let pwds = tabPwds
             DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -366,13 +422,19 @@ class SidebarTabManager: ObservableObject {
                     for (pwd, stats) in newStats {
                         self.gitStatsCache[pwd] = stats
                     }
-                    self.refresh()
+                    self.refresh(reason: "git stats completed")
                 }
             }
         }
 
-        if newTabs != tabs {
+        let tabsChanged = newTabs != tabs
+        if tabsChanged {
             tabs = newTabs
+        }
+
+        let currentSelectedID = ObjectIdentifier(selectedWindow)
+        if selectedTabID != currentSelectedID {
+            selectedTabID = currentSelectedID
         }
     }
 
@@ -384,7 +446,28 @@ class SidebarTabManager: ObservableObject {
 
     func selectTab(_ tab: TabItem) {
         clearAttention(for: tab.id)
-        tab.window.makeKeyAndOrderFront(nil)
+        selectedTabID = tab.id
+        // Guard against notification-driven refreshSelection() calls that fire
+        // synchronously during the tabGroup.selectedWindow setter. Without this,
+        // those handlers read intermediate state and revert our optimistic update.
+        isSelectingTab = true
+        if let window,
+           let tabGroup = window.tabGroup,
+           tabGroup.windows.contains(tab.window) {
+            tabGroup.selectedWindow = tab.window
+        } else {
+            tab.window.makeKeyAndOrderFront(nil)
+        }
+        isSelectingTab = false
+
+        // After the setter, the target window's sidebar is now visible to the user.
+        // Its manager's refreshSelection may have run during the setter and read
+        // intermediate (old) state. Correct it now that the setter has completed.
+        if let targetController = tab.window.windowController as? TerminalController,
+           let targetManager = targetController.sidebarTabManager,
+           targetManager !== self {
+            targetManager.selectedTabID = tab.id
+        }
     }
 
     func setTabColor(_ color: TerminalTabColor, for tab: TabItem) {

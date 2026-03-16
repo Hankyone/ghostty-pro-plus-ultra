@@ -73,7 +73,7 @@ struct SidebarView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 4) {
                 ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                    SidebarTabCard(tab: tab, theme: theme, fields: fields, showCardBorder: showCardBorder, isHovered: hoveredTabID == tab.id)
+                    SidebarTabCard(tab: tab, isSelected: tab.id == tabManager.selectedTabID, theme: theme, fields: fields, showCardBorder: showCardBorder, isHovered: hoveredTabID == tab.id)
                         .contentShape(Rectangle())
                         .onHover { isHovering in
                             hoveredTabID = isHovering ? tab.id : nil
@@ -203,6 +203,7 @@ private struct TabDropDelegate: DropDelegate {
 
 private struct SidebarTabCard: View {
     let tab: SidebarTabManager.TabItem
+    let isSelected: Bool
     let theme: SidebarTheme
     let fields: Set<SidebarField>
     var showCardBorder: Bool = true
@@ -215,9 +216,9 @@ private struct SidebarTabCard: View {
     private var accentColor: Color {
         if let nsColor = tab.tabColor.displayColor {
             let base = Color(nsColor: nsColor)
-            return tab.isSelected ? base : base.opacity(0.4)
+            return isSelected ? base : base.opacity(0.4)
         }
-        return Color(nsColor: .separatorColor).opacity(tab.isSelected ? 0.3 : 0.15)
+        return Color(nsColor: .separatorColor).opacity(isSelected ? 0.3 : 0.15)
     }
 
     /// The border color for the thin card border — always neutral gray.
@@ -243,10 +244,10 @@ private struct SidebarTabCard: View {
                 if fields.contains(.title) {
                     HStack(spacing: 6) {
                         Text(tab.displayTitle)
-                            .font(.system(size: 12, weight: tab.isSelected ? .semibold : .regular))
+                            .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
                             .lineLimit(1)
                             .truncationMode(.tail)
-                            .foregroundColor(tab.isSelected ? theme.foreground : theme.secondaryText)
+                            .foregroundColor(isSelected ? theme.foreground : theme.secondaryText)
 
                         Spacer()
 
@@ -260,7 +261,7 @@ private struct SidebarTabCard: View {
                             } else {
                                 PulsingDot(color: .accentColor)
                             }
-                        } else if tab.needsAttention {
+                        } else if tab.needsAttention && !isSelected {
                             Circle()
                                 .fill(theme.attentionColor)
                                 .frame(width: 8, height: 8)
@@ -336,7 +337,7 @@ private struct SidebarTabCard: View {
         .clipShape(RoundedRectangle(cornerRadius: Self.cardRadius))
         .background(
             RoundedRectangle(cornerRadius: Self.cardRadius)
-                .fill(tab.isSelected ? theme.activeTabBackground : (isHovered ? theme.foreground.opacity(0.06) : Color.clear))
+                .fill(isSelected ? theme.activeTabBackground : (isHovered ? theme.foreground.opacity(0.06) : Color.clear))
         )
         .overlay(
             Group {

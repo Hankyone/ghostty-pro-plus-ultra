@@ -534,7 +534,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// shortcut that activates it (if any). This is called when the key window
     /// changes, when a window is closed, and when tabs are reordered
     /// with the mouse.
-    func relabelTabs() {
+    func relabelTabs(refreshSidebars: Bool = true) {
         // We only listen for frame changes if we have more than 1 window,
         // otherwise the accessory view doesn't matter.
         tabListenForFrame = window?.tabbedWindows?.count ?? 0 > 1
@@ -556,8 +556,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             }
         }
 
-        // Refresh sidebar across all windows in the tab group
-        refreshAllSidebars()
+        if refreshSidebars {
+            // Structural tab changes still need a full sidebar refresh so order and
+            // metadata stay in sync, but pure selection changes should not pay that cost.
+            refreshAllSidebars()
+        }
     }
 
     /// Updates the sidebar theme when the terminal config changes.
@@ -1252,7 +1255,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     override func windowDidBecomeKey(_ notification: Notification) {
         super.windowDidBecomeKey(notification)
-        self.relabelTabs()
+        self.relabelTabs(refreshSidebars: false)
         self.fixTabBar()
         self.syncSidebarWidth()
         terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: true)

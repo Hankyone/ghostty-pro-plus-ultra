@@ -461,6 +461,12 @@ class BaseTerminalController: NSWindowController,
             nil
         }
 
+        // Clean up metadata store entries for removed surfaces so stale status
+        // indicators (e.g. claude-active) don't linger for reused UUIDs.
+        for surface in node.leaves() {
+            TabMetadataStore.shared.removeAll(for: surface.id)
+        }
+
         replaceSurfaceTree(
             surfaceTree.removing(node),
             moveFocusTo: nextFocus,
@@ -1228,6 +1234,11 @@ class BaseTerminalController: NSWindowController,
         // the view and the window so we had to nil this out to break it but I think this
         // may now be resolved. We should verify that no memory leaks and we can remove this.
         window.contentView = nil
+
+        // Clean up metadata store entries for all surfaces in this window
+        for surface in surfaceTree {
+            TabMetadataStore.shared.removeAll(for: surface.id)
+        }
 
         // Make sure we clean up all our undos
         window.undoManager?.removeAllActions(withTarget: self)
