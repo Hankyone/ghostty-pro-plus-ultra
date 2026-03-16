@@ -3,8 +3,9 @@ import SwiftUI
 struct AboutView: View {
     @Environment(\.openURL) var openURL
 
-    private let githubURL = URL(string: "https://github.com/ghostty-org/ghostty")
+    private let githubURL = URL(string: "https://github.com/Hankyone/ghostty-pro-plus-ultra")
     private let docsURL = URL(string: "https://ghostty.org/docs")
+    private let upstreamURL = URL(string: "https://github.com/ghostty-org/ghostty")
 
     /// Read the commit from the bundle.
     private var build: String? { Bundle.main.infoDictionary?["CFBundleVersion"] as? String }
@@ -47,10 +48,10 @@ struct AboutView: View {
 
             VStack(alignment: .center, spacing: 32) {
                 VStack(alignment: .center, spacing: 8) {
-                    Text("Ghostty")
+                    Text("Ghostty Pro Plus Ultra")
                         .bold()
-                        .font(.title)
-                    Text("Fast, native, feature-rich terminal \nemulator pushing modern features.")
+                        .font(.title3)
+                    Text("A Ghostty fork with sidebar tabs, Claude Code\nintegration, and quality-of-life improvements.")
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                         .font(.caption)
@@ -74,13 +75,18 @@ struct AboutView: View {
                 .frame(maxWidth: .infinity)
 
                 HStack(spacing: 8) {
+                    if let url = githubURL {
+                        Button("GitHub") {
+                            openURL(url)
+                        }
+                    }
                     if let url = docsURL {
                         Button("Docs") {
                             openURL(url)
                         }
                     }
-                    if let url = githubURL {
-                        Button("GitHub") {
+                    if let url = upstreamURL {
+                        Button("Upstream") {
                             openURL(url)
                         }
                     }
