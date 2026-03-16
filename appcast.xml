@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>Ghostty Pro Plus Ultra</title>
+    <link>https://hankyone.github.io/ghostty-pro-plus-ultra/appcast.xml</link>
+    <description>Updates for Ghostty Pro Plus Ultra</description>
+    <language>en</language>
+    <item>
+      <title>Version 0.1.0</title>
+      <pubDate>Mon, 16 Mar 2026 18:04:26 +0000</pubDate>
+      <sparkle:version>15195</sparkle:version>
+      <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+      <enclosure
+        url="https://github.com/Hankyone/ghostty-pro-plus-ultra/releases/download/ppu-v0.1.0/GhosttyProPlusUltra-0.1.0.dmg"
+        sparkle:edSignature="v8PKidfNTwfQN5II32HGR4pKo4s8R5sK2ljda7xZhjmDZEBvoxENscVOdFeH1kNbUqRn1aMxBKL1Sn1685JcAQ==" length="34126864"
+        length="34126864"
+        type="application/octet-stream" />
+    </item>
+  </channel>
+</rss>
