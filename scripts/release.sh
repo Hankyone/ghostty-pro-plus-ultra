@@ -58,7 +58,9 @@ cd macos
 xcodebuild -target Ghostty -configuration Release -quiet
 cd "$ROOT_DIR"
 
-APP="macos/build/Release/Ghostty.app"
+APP_BUILD="macos/build/Release/Ghostty.app"
+APP="macos/build/Release/Ghostty Pro Plus Ultra.app"
+mv "$APP_BUILD" "$APP"
 PLIST="${APP}/Contents/Info.plist"
 
 # --- Update Info.plist ---
@@ -114,7 +116,7 @@ npx create-dmg \
     ./ 2>/dev/null || true
 
 # create-dmg names the file based on the app name
-mv ./Ghostty*.dmg "$DMG_NAME" 2>/dev/null || true
+mv ./"Ghostty Pro Plus Ultra"*.dmg "$DMG_NAME" 2>/dev/null || mv ./Ghostty*.dmg "$DMG_NAME" 2>/dev/null || true
 
 if [ ! -f "$DMG_NAME" ]; then
     echo "Error: DMG creation failed."
