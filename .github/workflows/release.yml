@@ -46,7 +46,7 @@ jobs:
 
       - name: Xcode version
         run: |
-          sudo xcode-select -s /Applications/Xcode_16.2.app
+          sudo xcode-select -s /Applications/Xcode_26.2.app
           xcodebuild -version
 
       # Build the Zig framework that the Swift app depends on
