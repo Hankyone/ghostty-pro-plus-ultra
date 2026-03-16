@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  pages: write
 
 jobs:
   build-macos:
@@ -133,6 +134,82 @@ jobs:
         run: |
           cd macos/build/Release
           zip -9 -r --symlinks ../../../GhosttyProPlusUltra-macos-universal.zip Ghostty.app
+
+      - name: Setup Sparkle
+        run: |
+          mkdir -p .action/sparkle
+          cd .action/sparkle
+          curl -sL https://github.com/sparkle-project/Sparkle/releases/download/2.9.0/Sparkle-2.9.0.tar.xz -o sparkle.tar.xz
+          tar xf sparkle.tar.xz
+          echo "$(pwd)/bin" >> "$GITHUB_PATH"
+
+      - name: Generate Sparkle signature
+        id: sparkle
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          echo "$SPARKLE_PRIVATE_KEY" > sparkle.key
+          SIGNATURE=$(sign_update -f sparkle.key GhosttyProPlusUltra.dmg)
+          rm sparkle.key
+          echo "signature=$SIGNATURE" >> "$GITHUB_OUTPUT"
+          DMG_SIZE=$(stat -f%z GhosttyProPlusUltra.dmg)
+          echo "dmg_size=$DMG_SIZE" >> "$GITHUB_OUTPUT"
+
+      - name: Generate appcast.xml
+        env:
+          GHOSTTY_BUILD: ${{ steps.info.outputs.build }}
+          SPARKLE_SIG: ${{ steps.sparkle.outputs.signature }}
+          DMG_SIZE: ${{ steps.sparkle.outputs.dmg_size }}
+        run: |
+          VERSION=${PPU_VERSION#v}
+          RELEASE_DATE=$(date -u +"%a, %d %b %Y %H:%M:%S %z")
+          DMG_URL="https://github.com/Hankyone/ghostty-pro-plus-ultra/releases/download/${PPU_VERSION}/GhosttyProPlusUltra.dmg"
+
+          cat > appcast.xml << APPCAST_EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <channel>
+              <title>Ghostty Pro Plus Ultra</title>
+              <link>https://hankyone.github.io/ghostty-pro-plus-ultra/appcast.xml</link>
+              <description>Updates for Ghostty Pro Plus Ultra</description>
+              <language>en</language>
+              <item>
+                <title>Version ${VERSION}</title>
+                <pubDate>${RELEASE_DATE}</pubDate>
+                <sparkle:version>${GHOSTTY_BUILD}</sparkle:version>
+                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
+                <enclosure
+                  url="${DMG_URL}"
+                  ${SPARKLE_SIG}
+                  length="${DMG_SIZE}"
+                  type="application/octet-stream" />
+              </item>
+            </channel>
+          </rss>
+          APPCAST_EOF
+
+      - name: Publish appcast to GitHub Pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch or create gh-pages branch
+          git fetch origin gh-pages || true
+          git checkout gh-pages 2>/dev/null || git checkout --orphan gh-pages
+
+          # Clean everything except .git
+          git rm -rf . 2>/dev/null || true
+          git checkout main -- .gitignore 2>/dev/null || true
+
+          # Copy appcast
+          cp /Users/runner/work/ghostty-pro-plus-ultra/ghostty-pro-plus-ultra/appcast.xml appcast.xml 2>/dev/null || cp appcast.xml . 2>/dev/null || true
+
+          git add appcast.xml
+          git commit -m "Update appcast for ${PPU_VERSION}" || echo "No changes to commit"
+          git push origin gh-pages
+
+          # Return to main branch
+          git checkout main
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
