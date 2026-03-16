@@ -53,6 +53,7 @@ zig build \
     -Dversion-string="${VERSION}"
 
 # --- Build macOS app ---
+rm -rf macos/build/Release/Ghostty.app macos/build/Release/"Ghostty Pro Plus Ultra.app"
 echo "==> Building Ghostty.app..."
 cd macos
 xcodebuild -target Ghostty -configuration Release -quiet
