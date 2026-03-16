@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build-macos:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 120
     env:
       PPU_VERSION: ${{ github.event.inputs.version }}
