@@ -35,7 +35,8 @@ When running Claude Code, the sidebar shows:
 
 - **Session summary** — AI-generated description of what you're working on, updated every 3 messages
 - **Instant tooltip** — hover to see the full summary
-- **Activity indicator** — pulsing blue dot while Claude is working, solid green dot when done
+- **Activity indicator** — pulsing blue dot while Claude is working, orange pulsing dot when waiting for input, solid green dot when done
+- **Stale session cleanup** — automatically detects crashed Claude processes and cleans up sidebar entries
 
 Powered by Claude Code hooks that call `ghosttyctl set-status` to push context to the sidebar.
 
@@ -73,6 +74,10 @@ ghosttyctl current                                            # current tab info
 # Choose which fields to show (default: all)
 sidebar-fields = title,directory,git-branch,status
 ```
+
+### Auto-Update
+
+Built-in Sparkle auto-updates. The app checks for new versions automatically and prompts to install.
 
 ## Building
 
