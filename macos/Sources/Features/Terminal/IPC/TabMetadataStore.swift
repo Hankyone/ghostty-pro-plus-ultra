@@ -40,4 +40,25 @@ final class TabMetadataStore: ObservableObject {
     func removeAll(for tabId: UUID) {
         entries.removeValue(forKey: tabId)
     }
+
+    /// Sweep stale Claude sessions whose PIDs are no longer alive.
+    /// Called periodically from SidebarTabManager.
+    func sweepStaleClaude() {
+        for (tabId, tabEntries) in entries {
+            guard let pidEntry = tabEntries["claude-pid"],
+                  let pid = Int32(pidEntry.value) else { continue }
+
+            // kill(pid, 0) checks if the process exists without sending a signal.
+            // Returns -1 with ESRCH if the process doesn't exist.
+            if kill(pid, 0) == -1 && errno == ESRCH {
+                // Process is dead — clean up all Claude-related entries
+                entries[tabId]?.removeValue(forKey: "claude")
+                entries[tabId]?.removeValue(forKey: "claude-active")
+                entries[tabId]?.removeValue(forKey: "claude-pid")
+                if entries[tabId]?.isEmpty == true {
+                    entries.removeValue(forKey: tabId)
+                }
+            }
+        }
+    }
 }

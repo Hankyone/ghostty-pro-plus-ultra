@@ -255,6 +255,8 @@ private struct SidebarTabCard: View {
                                 Circle()
                                     .fill(.green)
                                     .frame(width: 8, height: 8)
+                            } else if activeEntry.value == "needs-input" {
+                                PulsingDot(color: .orange)
                             } else {
                                 PulsingDot(color: .accentColor)
                             }
@@ -311,7 +313,7 @@ private struct SidebarTabCard: View {
 
                 // Status entries (excluding "claude" which is shown in the branch slot)
                 if fields.contains(.status) {
-                    let filteredEntries = tab.statusEntries.filter { $0.key != "claude" && $0.key != "claude-active" }
+                    let filteredEntries = tab.statusEntries.filter { $0.key != "claude" && $0.key != "claude-active" && $0.key != "claude-pid" }
                     ForEach(filteredEntries, id: \.key) { entry in
                         HStack(spacing: 4) {
                             if let icon = entry.icon {

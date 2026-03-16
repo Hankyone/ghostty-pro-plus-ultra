@@ -56,6 +56,10 @@ class SidebarTabManager: ObservableObject {
     private var gitStatsCacheTime: Date = .distantPast
     private static let gitStatsCacheInterval: TimeInterval = 5.0
 
+    /// Throttle for stale Claude PID sweeping (every 30s).
+    private var lastPidSweepTime: Date = .distantPast
+    private static let pidSweepInterval: TimeInterval = 30.0
+
     private weak var window: NSWindow?
     private var observers: [NSObjectProtocol] = []
     private var timer: Timer?
@@ -318,6 +322,12 @@ class SidebarTabManager: ObservableObject {
                 faviconImage: favicon,
                 window: w
             )
+        }
+
+        // Sweep stale Claude sessions (every 30s) — detects crashed Claude processes
+        if Date().timeIntervalSince(lastPidSweepTime) >= Self.pidSweepInterval {
+            lastPidSweepTime = Date()
+            metadataStore.sweepStaleClaude()
         }
 
         // Refresh git stats in the background periodically
