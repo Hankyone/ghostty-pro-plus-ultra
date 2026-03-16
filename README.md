@@ -36,7 +36,6 @@ When running Claude Code, the sidebar shows:
 - **Session summary** — AI-generated description of what you're working on, updated every 3 messages
 - **Instant tooltip** — hover to see the full summary
 - **Activity indicator** — pulsing blue dot while Claude is working, orange pulsing dot when waiting for input, solid green dot when done
-- **Stale session cleanup** — automatically detects crashed Claude processes and cleans up sidebar entries
 
 Powered by Claude Code hooks that call `ghosttyctl set-status` to push context to the sidebar.
 
