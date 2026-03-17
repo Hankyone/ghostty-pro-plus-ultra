@@ -50,6 +50,7 @@ jobs:
         if: steps.merge.outputs.has_conflicts == 'true'
         run: |
           gh pr create \
+            --repo ${{ github.repository }} \
             --head sync/upstream-$(date +%Y%m%d) \
             --title "Upstream sync — manual conflict resolution needed" \
             --body "$(cat <<'EOF'
