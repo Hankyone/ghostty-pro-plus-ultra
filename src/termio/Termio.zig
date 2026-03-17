@@ -42,7 +42,7 @@ terminal: terminalpkg.Terminal,
 /// The shared render state
 renderer_state: *renderer.State,
 
-/// A handle to wake up the renderer. This hints to the renderer that that
+/// A handle to wake up the renderer. This hints to the renderer that
 /// a repaint should happen.
 renderer_wakeup: xev.Async,
 
@@ -391,8 +391,8 @@ pub fn threadExit(self: *Termio, data: *ThreadData) void {
     self.backend.threadExit(data);
 }
 
-/// Send a message to the the mailbox. Depending on the mailbox type in
-/// use this may process now or it may just enqueue and process later.
+/// Send a message to the mailbox. Depending on the mailbox type in use
+/// this may process now or it may just enqueue and process later.
 ///
 /// This will also notify the mailbox thread to process the message. If
 /// you're sending a lot of messages, it may be more efficient to use
@@ -609,7 +609,7 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
             // Clear all Kitty graphics state for this screen. This copies
             // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
             // didn't spend time researching whether it only deletes Kitty
-            // graphics that are placed baove the cursor or if it deletes
+            // graphics that are placed above the cursor or if it deletes
             // all of them. We delete all of them for now but if this behavior
             // isn't fully correct we should fix this later.
             self.terminal.screens.active.kitty_images.delete(
@@ -664,8 +664,13 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 
     // If we have focus events enabled, we send the focus event.
     if (focus_event) {
-        const seq = if (focused) "\x1b[I" else "\x1b[O";
-        try self.queueWrite(td, seq, false);
+        var buf: [terminalpkg.focus.max_encode_size]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        terminalpkg.focus.encode(&writer, if (focused) .gained else .lost) catch |err| {
+            log.err("error encoding focus event err={}", .{err});
+            return;
+        };
+        try self.queueWrite(td, writer.buffered(), false);
     }
 
     // We always notify our backend of focus changes.
@@ -721,12 +726,10 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
                 log.err("error recording pty read in inspector err={}", .{err});
             };
 
-            self.terminal_stream.next(byte) catch |err|
-                log.err("error processing terminal data: {}", .{err});
+            self.terminal_stream.next(byte);
         }
     } else {
-        self.terminal_stream.nextSlice(buf) catch |err|
-            log.err("error processing terminal data: {}", .{err});
+        self.terminal_stream.nextSlice(buf);
     }
 
     // If our stream handling caused messages to be sent to the mailbox
