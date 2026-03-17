@@ -53,7 +53,6 @@ jobs:
 
           This PR has merge conflicts that need manual resolution.
           EOF
-          )" \
-            --label "upstream-sync"
+          )"
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT }}
