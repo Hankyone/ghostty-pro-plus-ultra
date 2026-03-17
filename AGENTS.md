@@ -22,6 +22,16 @@ A file for [guiding coding agents](https://agents.md/).
 - macOS app: `macos/`
 - GTK (Linux and FreeBSD) app: `src/apprt/gtk`
 
+## Releasing
+
+- Releases are done locally via `scripts/release.sh` (auto-increments patch from last `ppu-v*` tag).
+
+## Upstream Sync
+
+- This is a fork of `ghostty-org/ghostty`. Daily sync via `.github/workflows/sync-upstream.yml`.
+- `SYNC_PAT` secret is required for pushing upstream workflow file changes (GITHUB_TOKEN can't push `.github/workflows/` changes).
+- The `gh` CLI defaults to the parent repo for forks — always use `--repo ${{ github.repository }}` in workflows.
+
 ## Issue and PR Guidelines
 
 - Never create an issue.
