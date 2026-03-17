@@ -36,7 +36,7 @@ jobs:
         if: steps.merge.outputs.has_conflicts != 'true'
         run: git push origin main
 
-      - name: Create PR if conflicts
+      - name: Push conflict branch
         if: steps.merge.outputs.has_conflicts == 'true'
         run: |
           git merge --abort
@@ -45,6 +45,10 @@ jobs:
           git add -A
           git commit -m "sync: merge upstream ghostty-org/ghostty (conflicts)"
           git push origin sync/upstream-$(date +%Y%m%d)
+
+      - name: Create PR for conflicts
+        if: steps.merge.outputs.has_conflicts == 'true'
+        run: |
           gh pr create \
             --head sync/upstream-$(date +%Y%m%d) \
             --title "Upstream sync — manual conflict resolution needed" \
@@ -55,4 +59,4 @@ jobs:
           EOF
           )"
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
