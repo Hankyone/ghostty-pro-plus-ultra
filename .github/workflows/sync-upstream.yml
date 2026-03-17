@@ -46,6 +46,7 @@ jobs:
           git commit -m "sync: merge upstream ghostty-org/ghostty (conflicts)"
           git push origin sync/upstream-$(date +%Y%m%d)
           gh pr create \
+            --head sync/upstream-$(date +%Y%m%d) \
             --title "Upstream sync — manual conflict resolution needed" \
             --body "$(cat <<'EOF'
           Automated daily sync from [ghostty-org/ghostty](https://github.com/ghostty-org/ghostty).
