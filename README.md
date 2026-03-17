@@ -46,7 +46,10 @@ Powered by Claude Code hooks that call `ghosttyctl set-status` to push context t
    ```json
    {
      "hooks": {
+       "SessionStart": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
        "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
+       "PreToolUse": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
+       "Notification": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
        "Stop": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
        "SessionEnd": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }]
      }
