@@ -44,7 +44,7 @@ jobs:
           git merge upstream/main --no-commit --no-ff || true
           git add -A
           git commit -m "sync: merge upstream ghostty-org/ghostty (conflicts)"
-          git push origin sync/upstream-$(date +%Y%m%d)
+          git push --force origin sync/upstream-$(date +%Y%m%d)
 
       - name: Create PR for conflicts
         if: steps.merge.outputs.has_conflicts == 'true'
