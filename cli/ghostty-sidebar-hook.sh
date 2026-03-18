@@ -8,7 +8,7 @@
 set -euo pipefail
 
 GHOSTTYCTL="/Users/hankyone/ghostty/cli/ghosttyctl"
-SOCKET_PATH="/tmp/ghostty-$(id -u).sock"
+SOCKET_PATH="${GHOSTTY_SOCKET:-/tmp/ghostty-$(id -u).sock}"
 
 # Exit early if Ghostty isn't running (no IPC socket)
 [ -S "$SOCKET_PATH" ] || exit 0
@@ -58,8 +58,14 @@ case "$event" in
   SessionStart)
     # Capture the tab/surface UUID so all future IPC calls target the right tab,
     # even if the user switches focus away from Ghostty.
-    tab_json=$("$GHOSTTYCTL" current 2>/dev/null || echo "")
-    tab_id=$(echo "$tab_json" | jq -r '.tab_id // empty' 2>/dev/null || echo "")
+    # Prefer the GHOSTTY_TAB_ID env var (set by Ghostty for this terminal) over
+    # an IPC call, which can fail if the window isn't key or another Ghostty
+    # instance has replaced the socket.
+    tab_id="${GHOSTTY_TAB_ID:-}"
+    if [ -z "$tab_id" ]; then
+      tab_json=$("$GHOSTTYCTL" current 2>/dev/null || echo "")
+      tab_id=$(echo "$tab_json" | jq -r '.tab_id // empty' 2>/dev/null || echo "")
+    fi
     if [ -n "$tab_id" ]; then
       echo "$tab_id" > "$TAB_ID_FILE"
       export GHOSTTY_TAB_ID="$tab_id"

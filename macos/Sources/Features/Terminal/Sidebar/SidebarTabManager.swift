@@ -49,7 +49,11 @@ class SidebarTabManager: ObservableObject {
     private let bellTriggersAttention: Bool
 
     /// Cache of detected favicons keyed by pwd to avoid re-scanning every refresh.
-    private var faviconCache: [String: NSImage?] = [:]
+    /// Static so all SidebarTabManager instances share it.
+    private static var faviconCache: [String: NSImage?] = [:]
+
+    /// Pwds currently being detected in the background, to avoid duplicate work.
+    private static var faviconDetectionInFlight: Set<String> = []
 
     /// Cache for git diff stats to avoid spawning git every 0.5s.
     private var gitStatsCache: [String: String?] = [:]
@@ -59,6 +63,9 @@ class SidebarTabManager: ObservableObject {
     /// Throttle for stale Claude PID sweeping (every 30s).
     private var lastPidSweepTime: Date = .distantPast
     private static let pidSweepInterval: TimeInterval = 30.0
+
+    /// Fingerprint of the last timer-driven refresh, used to skip no-op rebuilds.
+    private var lastRefreshFingerprint: Int = 0
 
     private weak var window: NSWindow?
     private var observers: [NSObjectProtocol] = []
@@ -251,16 +258,29 @@ class SidebarTabManager: ObservableObject {
     /// Detect a favicon image for the project at the given pwd.
     /// Walks up to find a project root (package.json or .git), then searches
     /// known locations for favicon files. Results are cached by pwd.
+    /// On cache miss, detection runs on a background queue and triggers a
+    /// refresh when complete — returns nil immediately so the main thread
+    /// is never blocked by filesystem scans.
     private func detectFavicon(at pwd: String) -> NSImage? {
         // Return cached result if available
-        if let cached = faviconCache[pwd] {
+        if let cached = Self.faviconCache[pwd] {
             return cached
         }
 
-        let fm = FileManager.default
-        let result = findFavicon(at: pwd, using: fm)
-        faviconCache[pwd] = result
-        return result
+        // Start background detection if not already in progress
+        if !Self.faviconDetectionInFlight.contains(pwd) {
+            Self.faviconDetectionInFlight.insert(pwd)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let fm = FileManager.default
+                let result = SidebarTabManager.findFaviconInBackground(at: pwd, using: fm)
+                DispatchQueue.main.async {
+                    Self.faviconDetectionInFlight.remove(pwd)
+                    Self.faviconCache[pwd] = result
+                    self?.refresh(reason: "favicon detected")
+                }
+            }
+        }
+        return nil
     }
 
     /// Fallback icon filenames when no favicon.* is found.
@@ -269,7 +289,9 @@ class SidebarTabManager: ObservableObject {
         "apple-touch-icon.png", "logo.svg", "logo.png",
     ]
 
-    private func findFavicon(at pwd: String, using fm: FileManager) -> NSImage? {
+    /// Background-safe favicon search. Static so it can be called from a
+    /// background queue without capturing `self`.
+    nonisolated private static func findFaviconInBackground(at pwd: String, using fm: FileManager) -> NSImage? {
         var dir = pwd
         while dir != "/" && dir.hasPrefix("/Users") {
             let isProjectRoot = fm.fileExists(atPath: (dir as NSString).appendingPathComponent("package.json"))
@@ -278,20 +300,20 @@ class SidebarTabManager: ObservableObject {
                 || fm.fileExists(atPath: (dir as NSString).appendingPathComponent("go.mod"))
 
             if isProjectRoot {
-                for searchDir in Self.faviconSearchDirs {
+                for searchDir in faviconSearchDirs {
                     let base = searchDir.isEmpty ? dir : (dir as NSString).appendingPathComponent(searchDir)
                     // Try standard favicon.{ext}
-                    for ext in Self.faviconExtensions {
+                    for ext in faviconExtensions {
                         let path = (base as NSString).appendingPathComponent("favicon.\(ext)")
-                        if let image = loadFavicon(at: path) { return image }
+                        if let image = loadFaviconFromDisk(at: path) { return image }
                     }
                     // Try sized variants and fallback names
                     let sized = (base as NSString).appendingPathComponent("favicon-32x32.png")
-                    if let image = loadFavicon(at: sized) { return image }
+                    if let image = loadFaviconFromDisk(at: sized) { return image }
 
-                    for name in Self.fallbackIconNames {
+                    for name in fallbackIconNames {
                         let path = (base as NSString).appendingPathComponent(name)
-                        if let image = loadFavicon(at: path) { return image }
+                        if let image = loadFaviconFromDisk(at: path) { return image }
                     }
                 }
                 return nil  // Found project root but no favicon
@@ -301,7 +323,7 @@ class SidebarTabManager: ObservableObject {
         return nil
     }
 
-    private func loadFavicon(at path: String) -> NSImage? {
+    nonisolated private static func loadFaviconFromDisk(at path: String) -> NSImage? {
         guard FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let image = NSImage(data: data) else { return nil }
@@ -342,6 +364,33 @@ class SidebarTabManager: ObservableObject {
         let selectedWindow = window.tabGroup?.selectedWindow ?? window
         let metadataStore = TabMetadataStore.shared
 
+        // For timer-driven refreshes, skip if nothing observable has changed.
+        if reason == "timer" {
+            var hasher = Hasher()
+            hasher.combine(tabWindows.count)
+            hasher.combine(ObjectIdentifier(selectedWindow))
+            hasher.combine(attentionWindows.count)
+            for w in tabWindows {
+                hasher.combine(ObjectIdentifier(w))
+                hasher.combine(w.title)
+                if let ctrl = w.windowController as? BaseTerminalController,
+                   let surface = ctrl.focusedSurface {
+                    hasher.combine(surface.pwd)
+                    hasher.combine(surface.id)
+                    for entry in metadataStore.statusEntries(for: surface.id) {
+                        hasher.combine(entry.key)
+                        hasher.combine(entry.value)
+                        hasher.combine(entry.icon)
+                    }
+                }
+            }
+            let fingerprint = hasher.finalize()
+            if fingerprint == lastRefreshFingerprint {
+                return
+            }
+            lastRefreshFingerprint = fingerprint
+        }
+
         // Collect pwds for background git refresh
         var tabPwds: [String] = []
         var faviconCacheMisses = 0
@@ -356,7 +405,7 @@ class SidebarTabManager: ObservableObject {
             // Always use cached git stats (never block the main thread)
             let diffStats = pwd.flatMap { gitStatsCache[$0] ?? nil }
             let favicon = pwd.flatMap { pwd -> NSImage? in
-                if faviconCache.index(forKey: pwd) == nil {
+                if Self.faviconCache.index(forKey: pwd) == nil {
                     faviconCacheMisses += 1
                 }
                 return detectFavicon(at: pwd)
@@ -451,7 +500,10 @@ class SidebarTabManager: ObservableObject {
     }
 
     func selectTab(_ tab: TabItem) {
-        clearAttention(for: tab.id)
+        // Only remove from the set — don't patch the @Published tabs array.
+        // The source sidebar is about to become invisible anyway, and the next
+        // timer-driven refresh() will rebuild tabs with needsAttention=false.
+        attentionWindows.remove(tab.id)
         selectedTabID = tab.id
         // Guard against notification-driven refreshSelection() calls that fire
         // synchronously during the tabGroup.selectedWindow setter. Without this,

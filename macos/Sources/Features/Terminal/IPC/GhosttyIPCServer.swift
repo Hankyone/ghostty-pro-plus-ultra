@@ -29,7 +29,9 @@ final class GhosttyIPCServer {
     private var serverFd: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private var clients: [Int32: ClientConnection] = [:]
-    private var socketPath: String = ""
+    /// The socket path this server is listening on. Exposed for `BaseTerminalController`
+    /// to pass via the `GHOSTTY_SOCKET` env var so child processes connect to the correct instance.
+    private(set) var socketPath: String = ""
 
     /// Per-client state for buffering partial reads.
     private class ClientConnection {
@@ -48,9 +50,13 @@ final class GhosttyIPCServer {
 
     func start() {
         let uid = getuid()
-        socketPath = "/tmp/ghostty-\(uid).sock"
+        let pid = getpid()
+        socketPath = "/tmp/ghostty-\(uid)-\(pid).sock"
 
-        // Remove stale socket if it exists
+        // Clean up stale sockets from dead Ghostty instances
+        Self.cleanupStaleSockets(uid: uid, currentPid: pid)
+
+        // Remove stale socket if it exists (e.g., PID reuse)
         unlink(socketPath)
 
         // Create socket
@@ -120,6 +126,36 @@ final class GhosttyIPCServer {
         acceptSource = source
 
         Self.logger.info("IPC: listening on \(self.socketPath)")
+    }
+
+    /// Remove sockets left behind by dead Ghostty instances.
+    /// Matches the pattern `/tmp/ghostty-{uid}-{pid}.sock` and also the
+    /// legacy `/tmp/ghostty-{uid}.sock` (no PID suffix).
+    private static func cleanupStaleSockets(uid: uid_t, currentPid: pid_t) {
+        let fm = FileManager.default
+        let prefix = "ghostty-\(uid)"
+        guard let contents = try? fm.contentsOfDirectory(atPath: "/tmp") else { return }
+        for name in contents {
+            guard name.hasPrefix(prefix) && name.hasSuffix(".sock") else { continue }
+            let path = "/tmp/\(name)"
+
+            // Extract PID from the filename if present (ghostty-{uid}-{pid}.sock)
+            let afterPrefix = name.dropFirst(prefix.count)
+            if afterPrefix.hasPrefix("-"), let dotIndex = afterPrefix.lastIndex(of: ".") {
+                let pidStr = afterPrefix.dropFirst().prefix(upTo: dotIndex)
+                if let pid = Int32(pidStr), pid != currentPid {
+                    // Check if the process is still alive
+                    if kill(pid, 0) == -1 && errno == ESRCH {
+                        unlink(path)
+                        logger.info("IPC: cleaned up stale socket \(path)")
+                    }
+                }
+            } else if afterPrefix == ".sock" {
+                // Legacy socket without PID suffix — remove it
+                unlink(path)
+                logger.info("IPC: cleaned up legacy socket \(path)")
+            }
+        }
     }
 
     func stop() {

@@ -140,7 +140,7 @@ class BaseTerminalController: NSWindowController,
         // Initialize our initial surface, injecting IPC environment variables.
         guard let ghostty_app = ghostty.app else { preconditionFailure("app must be loaded") }
         var config = base ?? Ghostty.SurfaceConfiguration()
-        config.environmentVariables["GHOSTTY_SOCKET"] = "/tmp/ghostty-\(getuid()).sock"
+        config.environmentVariables["GHOSTTY_SOCKET"] = GhosttyIPCServer.shared.socketPath
         let surfaceUUID = UUID()
         config.environmentVariables["GHOSTTY_TAB_ID"] = surfaceUUID.uuidString
         self.surfaceTree = tree ?? .init(view: Ghostty.SurfaceView(ghostty_app, baseConfig: config, uuid: surfaceUUID))

@@ -7,7 +7,8 @@ A file for [guiding coding agents](https://agents.md/).
 - **Build:** `zig build`
   - If you're on macOS and don't need to build the macOS app, use
     `-Demit-macos-app=false` to skip building the app bundle and speed up
-    compilation.
+    compilation. To build and run the app locally: `cd macos && xcodebuild -target Ghostty -configuration Release -quiet` then `codesign --force --deep --sign - macos/build/Release/Ghostty.app` (ad-hoc re-sign fixes Sparkle team ID mismatch).
+  - This fork uses `ppu-v*` tags which don't match upstream's expected `vX.Y.Z` format. Pass `-Dversion-string="<version>"` to bypass the tag validation (e.g. `zig build -Dversion-string="0.1.5-dev"`).
 - **Test (Zig):** `zig build test`
   - Prefer to run targeted tests with `-Dtest-filter` because the full
     test suite is slow to run.
