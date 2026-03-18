@@ -41,21 +41,25 @@ Powered by Claude Code hooks that call `ghosttyctl set-status` to push context t
 
 **Setup:**
 
-1. Copy the hook script to `~/.claude/hooks/ghostty-sidebar.sh`
-2. Register hooks in `~/.claude/settings.json`:
-   ```json
-   {
-     "hooks": {
-       "SessionStart": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
-       "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
-       "PreToolUse": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
-       "Notification": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
-       "Stop": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }],
-       "SessionEnd": [{ "hooks": [{ "type": "command", "command": "bash ~/.claude/hooks/ghostty-sidebar.sh" }] }]
-     }
-   }
-   ```
-3. Requires `jq` and the `claude` CLI in your PATH
+```bash
+# 1. Copy the hook script
+mkdir -p ~/.claude/hooks
+cp cli/ghostty-sidebar-hook.sh ~/.claude/hooks/ghostty-sidebar.sh
+
+# 2. Register hooks in Claude Code settings (merges with existing settings)
+python3 -c "
+import json, os
+p = os.path.expanduser('~/.claude/settings.json')
+s = json.load(open(p)) if os.path.exists(p) else {}
+cmd = 'bash ~/.claude/hooks/ghostty-sidebar.sh'
+entry = [{'hooks': [{'type': 'command', 'command': cmd}]}]
+s['hooks'] = {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','Notification','Stop','SessionEnd']}
+json.dump(s, open(p, 'w'), indent=2)
+print('Hooks installed.')
+"
+```
+
+Requires `jq` and the `claude` CLI in your PATH.
 
 ### CLI
 
