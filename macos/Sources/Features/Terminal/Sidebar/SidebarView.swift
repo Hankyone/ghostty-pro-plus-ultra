@@ -68,12 +68,10 @@ struct SidebarView: View {
     @State private var draggingTabID: ObjectIdentifier?
     @State private var dropTargetTabID: ObjectIdentifier?
     @State private var hoveredTabID: ObjectIdentifier?
+    @State private var tabCardFrames: [ObjectIdentifier: CGRect] = [:]
     @State private var lastTappedTabID: ObjectIdentifier?
     @State private var lastTapTime: Date = .distantPast
-
-    /// Flag set by the per-card manual double-click handler so the container's
-    /// event monitor knows not to also create a new tab.
-    fileprivate static var cardDoubleClickHandled = false
+    private static let scrollCoordinateSpace = "SidebarScrollCoordinateSpace"
 
     var body: some View {
         ScrollView {
@@ -97,14 +95,22 @@ struct SidebarView: View {
                             let now = Date()
                             if tab.id == lastTappedTabID,
                                now.timeIntervalSince(lastTapTime) < NSEvent.doubleClickInterval {
-                                SidebarView.cardDoubleClickHandled = true
                                 tabManager.promptRenameTab(tab)
                                 lastTappedTabID = nil
+                                lastTapTime = .distantPast
                             } else {
                                 tabManager.selectTab(tab)
+                                lastTappedTabID = tab.id
+                                lastTapTime = now
                             }
-                            lastTappedTabID = tab.id
-                            lastTapTime = now
+                        }
+                        .background {
+                            GeometryReader { proxy in
+                                Color.clear.preference(
+                                    key: SidebarCardFramePreferenceKey.self,
+                                    value: [tab.id: proxy.frame(in: .named(Self.scrollCoordinateSpace))]
+                                )
+                            }
                         }
                         .overlay(MiddleClickOverlay {
                             tabManager.closeTab(tab)
@@ -167,9 +173,11 @@ struct SidebarView: View {
             .padding(.horizontal, 8)
             .padding(.top, 8)
         }
+        .coordinateSpace(name: Self.scrollCoordinateSpace)
+        .onPreferenceChange(SidebarCardFramePreferenceKey.self) { tabCardFrames = $0 }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.background)
-        .overlay(DoubleClickOverlay {
+        .overlay(DoubleClickOverlay(excludedRects: Array(tabCardFrames.values)) {
             tabManager.createNewTab()
         })
     }
@@ -409,6 +417,14 @@ private struct MiddleClickOverlay: NSViewRepresentable {
     }
 }
 
+private struct SidebarCardFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [ObjectIdentifier: CGRect] = [:]
+
+    static func reduce(value: inout [ObjectIdentifier: CGRect], nextValue: () -> [ObjectIdentifier: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
 // MARK: - DoubleClickOverlay
 
 /// Transparent NSView overlay that captures double-click events at the AppKit level,
@@ -416,25 +432,28 @@ private struct MiddleClickOverlay: NSViewRepresentable {
 /// Transparent NSView overlay that monitors double-click events via an event
 /// monitor, bypassing SwiftUI's gesture system entirely. The view itself is
 /// completely transparent (hitTest always returns nil), so it has zero impact
-/// on layout or rendering. A per-card flag (`SidebarView.cardDoubleClickHandled`)
-/// prevents a new tab from being created when the user double-clicks a tab card
-/// (which triggers rename instead).
+/// on layout or rendering. It only fires when the double-click lands in blank
+/// space instead of on top of a tab card.
 private struct DoubleClickOverlay: NSViewRepresentable {
+    var excludedRects: [CGRect]
     var action: () -> Void
 
     func makeNSView(context: Context) -> DoubleClickView {
-        DoubleClickView(action: action)
+        DoubleClickView(excludedRects: excludedRects, action: action)
     }
 
     func updateNSView(_ nsView: DoubleClickView, context: Context) {
+        nsView.excludedRects = excludedRects
         nsView.action = action
     }
 
     class DoubleClickView: NSView {
+        var excludedRects: [CGRect]
         var action: () -> Void
         private var eventMonitor: Any?
 
-        init(action: @escaping () -> Void) {
+        init(excludedRects: [CGRect], action: @escaping () -> Void) {
+            self.excludedRects = excludedRects
             self.action = action
             super.init(frame: .zero)
         }
@@ -459,17 +478,9 @@ private struct DoubleClickOverlay: NSViewRepresentable {
                   self.window?.isKeyWindow == true else { return }
             let locationInView = convert(event.locationInWindow, from: nil)
             guard bounds.contains(locationInView) else { return }
+            guard !excludedRects.contains(where: { $0.contains(locationInView) }) else { return }
 
-            // Defer to the next run-loop iteration so the per-card tap handler
-            // has a chance to set the cardDoubleClickHandled flag first.
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                if SidebarView.cardDoubleClickHandled {
-                    SidebarView.cardDoubleClickHandled = false
-                    return
-                }
-                self.action()
-            }
+            action()
         }
 
         override func hitTest(_ point: NSPoint) -> NSView? {
