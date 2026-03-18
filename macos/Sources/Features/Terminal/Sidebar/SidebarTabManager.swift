@@ -419,6 +419,12 @@ class SidebarTabManager: ObservableObject {
                 }
                 DispatchQueue.main.async {
                     guard let self else { return }
+                    // Clear all checked pwds first — assigning nil to a
+                    // [String: String?] dict removes the key rather than
+                    // storing nil, so stale entries would never be cleared.
+                    for pwd in pwds {
+                        self.gitStatsCache.removeValue(forKey: pwd)
+                    }
                     for (pwd, stats) in newStats {
                         self.gitStatsCache[pwd] = stats
                     }
