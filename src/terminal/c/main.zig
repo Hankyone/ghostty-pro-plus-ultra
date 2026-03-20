@@ -1,3 +1,4 @@
+pub const cell = @import("cell.zig");
 pub const color = @import("color.zig");
 pub const focus = @import("focus.zig");
 pub const formatter = @import("formatter.zig");
@@ -8,8 +9,10 @@ pub const key_encode = @import("key_encode.zig");
 pub const mouse_event = @import("mouse_event.zig");
 pub const mouse_encode = @import("mouse_encode.zig");
 pub const paste = @import("paste.zig");
+pub const row = @import("row.zig");
 pub const sgr = @import("sgr.zig");
 pub const size_report = @import("size_report.zig");
+pub const style = @import("style.zig");
 pub const terminal = @import("terminal.zig");
 
 // The full C API, unexported.
@@ -90,6 +93,13 @@ pub const paste_is_safe = paste.is_safe;
 
 pub const size_report_encode = size_report.encode;
 
+pub const cell_get = cell.get;
+
+pub const row_get = row.get;
+
+pub const style_default = style.default_style;
+pub const style_is_default = style.style_is_default;
+
 pub const terminal_new = terminal.new;
 pub const terminal_free = terminal.free;
 pub const terminal_reset = terminal.reset;
@@ -98,9 +108,20 @@ pub const terminal_vt_write = terminal.vt_write;
 pub const terminal_scroll_viewport = terminal.scroll_viewport;
 pub const terminal_mode_get = terminal.mode_get;
 pub const terminal_mode_set = terminal.mode_set;
+pub const terminal_get = terminal.get;
+pub const terminal_grid_ref = terminal.grid_ref;
+
+const grid_ref = @import("grid_ref.zig");
+pub const grid_ref_cell = grid_ref.grid_ref_cell;
+pub const grid_ref_row = grid_ref.grid_ref_row;
+pub const grid_ref_graphemes = grid_ref.grid_ref_graphemes;
+pub const grid_ref_style = grid_ref.grid_ref_style;
 
 test {
+    _ = cell;
     _ = color;
+    _ = grid_ref;
+    _ = row;
     _ = focus;
     _ = formatter;
     _ = modes;
@@ -112,6 +133,7 @@ test {
     _ = paste;
     _ = sgr;
     _ = size_report;
+    _ = style;
     _ = terminal;
 
     // We want to make sure we run the tests for the C allocator interface.
