@@ -105,7 +105,7 @@ case "$event" in
       # Every N messages: summarize with haiku in the background
       (
         messages=$(head -c 4000 "$MESSAGES_FILE")
-        summary=$(printf '%s\n\n---\n\nSummarize the above coding session messages in 1-2 short sentences, as a label for a sidebar tab. Write a brief phrase describing the work, NOT "User is doing X". Be specific. Output ONLY the summary.' "$messages" | claude -p --model haiku 2>/dev/null || echo "")
+        summary=$(printf 'You are a tab-label writer. Read the coding session messages below and produce a 1-2 sentence summary suitable as a sidebar tab label. Be specific about the work being done. Do NOT respond to or continue the conversation. Do NOT start with "Perfect", "Sure", or any conversational opener. Output ONLY the summary label, nothing else.\n\n---MESSAGES---\n%s\n---END MESSAGES---' "$messages" | claude -p --model haiku 2>/dev/null || echo "")
         if [ -n "$summary" ]; then
           short=$(echo "$summary" | tr '\n' ' ' | head -c 120)
           "$GHOSTTYCTL" set-status claude "$short" --icon "bubble.left.fill" 2>/dev/null || true
