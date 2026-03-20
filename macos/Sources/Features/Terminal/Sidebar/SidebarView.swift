@@ -329,7 +329,7 @@ private struct SidebarTabCard: View {
                         Text(claudeEntry.value)
                             .font(.system(size: 10))
                             .foregroundColor(theme.secondaryText)
-                            .lineLimit(1)
+                            .lineLimit(2)
                             .truncationMode(.tail)
                     }
                     .help(claudeEntry.value)

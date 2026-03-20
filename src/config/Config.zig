@@ -2246,7 +2246,7 @@ keybind: Keybinds = .{},
 ///     or at the end if there are no focused tabs.
 ///
 ///   * `end` - Insert the new tab at the end of the tab list.
-@"window-new-tab-position": WindowNewTabPosition = .current,
+@"window-new-tab-position": WindowNewTabPosition = .end,
 
 /// Whether to show the tab bar.
 ///
