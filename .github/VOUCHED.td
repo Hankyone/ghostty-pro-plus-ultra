@@ -87,6 +87,7 @@ halosatrio
 heaths
 heddxh heddxh
 -highimpact-dev Disrespectful AI user
+hlcfan
 hqnna
 hulet
 icodesign
@@ -114,11 +115,13 @@ laxystem
 liby
 linustalacko
 lonsagisawa
+luisnquin
 mac0ne
 mahnokropotkinvich
 marijagjorgjieva
 markdorison
 markhuot
+marler8997
 marrocco-simone
 matkotiric
 micaeljarniac
