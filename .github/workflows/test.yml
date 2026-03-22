@@ -408,11 +408,11 @@ jobs:
 
       - name: Build
         run: |
-          nix develop -c zig build lib-vt \
+          nix develop -c zig build -Demit-lib-vt \
             -Dtarget=${{ matrix.target }} \
             -Dsimd=false
 
-  # lib-vt requires macOS runner for macOS/iOS builds becauase it requires the `apple_sdk` path
+  # lib-vt requires macOS runner for macOS/iOS builds because it requires the `apple_sdk` path
   build-libghostty-vt-macos:
     strategy:
       matrix:
@@ -448,7 +448,7 @@ jobs:
 
       - name: Build
         run: |
-          nix develop -c zig build lib-vt \
+          nix develop -c zig build -Demit-lib-vt \
             -Dtarget=${{ matrix.target }}
 
   # lib-vt requires the Android NDK for Android builds
@@ -494,7 +494,7 @@ jobs:
 
       - name: Build
         run: |
-          nix develop -c zig build lib-vt \
+          nix develop -c zig build -Demit-lib-vt \
             -Dtarget=${{ matrix.target }}
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
