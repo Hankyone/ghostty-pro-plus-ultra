@@ -176,7 +176,7 @@ struct SidebarView: View {
         .coordinateSpace(name: Self.scrollCoordinateSpace)
         .onPreferenceChange(SidebarCardFramePreferenceKey.self) { tabCardFrames = $0 }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(theme.background)
+        .background(.clear)
         .overlay(DoubleClickOverlay(excludedRects: Array(tabCardFrames.values)) {
             tabManager.createNewTab()
         })
