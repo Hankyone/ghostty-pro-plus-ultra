@@ -1101,11 +1101,28 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         ))
         self.sidebarHostingView = sidebarHostingView
 
+        // Wrap the sidebar in a frosted glass effect view (NSVisualEffectView
+        // with .sidebar material). The SwiftUI view has a clear background so
+        // the vibrancy shows through.
+        let sidebarEffectView = NSVisualEffectView()
+        sidebarEffectView.material = .sidebar
+        sidebarEffectView.blendingMode = .behindWindow
+        sidebarEffectView.state = .followsWindowActiveState
+
+        sidebarHostingView.translatesAutoresizingMaskIntoConstraints = false
+        sidebarEffectView.addSubview(sidebarHostingView)
+        NSLayoutConstraint.activate([
+            sidebarHostingView.topAnchor.constraint(equalTo: sidebarEffectView.topAnchor),
+            sidebarHostingView.bottomAnchor.constraint(equalTo: sidebarEffectView.bottomAnchor),
+            sidebarHostingView.leadingAnchor.constraint(equalTo: sidebarEffectView.leadingAnchor),
+            sidebarHostingView.trailingAnchor.constraint(equalTo: sidebarEffectView.trailingAnchor),
+        ])
+
         // Build the split view: sidebar | terminal
         let splitView = NSSplitView()
         splitView.isVertical = true
         splitView.dividerStyle = .thin
-        splitView.addSubview(sidebarHostingView)
+        splitView.addSubview(sidebarEffectView)
         splitView.addSubview(terminalContainer)
         splitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
         splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
@@ -1114,7 +1131,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Set initial sidebar width (synced across tabs via UserDefaults)
         let savedWidth = UserDefaults.standard.double(forKey: "SidebarWidth")
         let sidebarWidth = savedWidth > 0 ? min(max(savedWidth, 140), 280) : 200
-        sidebarHostingView.frame = NSRect(x: 0, y: 0, width: sidebarWidth, height: 400)
+        sidebarEffectView.frame = NSRect(x: 0, y: 0, width: sidebarWidth, height: 400)
         terminalContainer.frame = NSRect(x: sidebarWidth, y: 0, width: 600, height: 400)
 
         window.contentView = splitView
