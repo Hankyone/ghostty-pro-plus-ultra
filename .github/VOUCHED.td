@@ -59,6 +59,7 @@ damyanbogoev
 danulqua
 dariogriffo
 davidsanchez222
+deblasis
 dervedro
 devsunb
 diaaeddin
@@ -108,6 +109,7 @@ khipp
 kirwiisp
 kjvdven
 kloneets
+-kody-w
 koranir
 kristina8888
 kristofersoler
@@ -116,6 +118,7 @@ liby
 linustalacko
 lonsagisawa
 luisnquin
+lynicis
 mac0ne
 mahnokropotkinvich
 marijagjorgjieva
@@ -171,6 +174,7 @@ seruman
 silveirapf
 slsrepo
 sunshine-syz
+tdgroot
 tdslot
 ticclick
 tnagatomi
@@ -182,6 +186,7 @@ uhojin
 unphased
 uzaaft
 vaughanandrews
+viruslobster
 vlsi
 wyounas
 yamshta
