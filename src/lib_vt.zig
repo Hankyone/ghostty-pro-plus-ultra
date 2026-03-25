@@ -58,10 +58,9 @@ pub const SizeReportStyle = terminal.SizeReportStyle;
 pub const StringMap = terminal.StringMap;
 pub const Style = terminal.Style;
 pub const Terminal = terminal.Terminal;
+pub const TerminalStream = terminal.TerminalStream;
 pub const Stream = terminal.Stream;
 pub const StreamAction = terminal.StreamAction;
-pub const ReadonlyStream = terminal.ReadonlyStream;
-pub const ReadonlyHandler = terminal.ReadonlyHandler;
 pub const Cursor = Screen.Cursor;
 pub const CursorStyle = Screen.CursorStyle;
 pub const CursorStyleReq = terminal.CursorStyle;
@@ -207,6 +206,7 @@ comptime {
         @export(&c.terminal_free, .{ .name = "ghostty_terminal_free" });
         @export(&c.terminal_reset, .{ .name = "ghostty_terminal_reset" });
         @export(&c.terminal_resize, .{ .name = "ghostty_terminal_resize" });
+        @export(&c.terminal_set, .{ .name = "ghostty_terminal_set" });
         @export(&c.terminal_vt_write, .{ .name = "ghostty_terminal_vt_write" });
         @export(&c.terminal_scroll_viewport, .{ .name = "ghostty_terminal_scroll_viewport" });
         @export(&c.terminal_mode_get, .{ .name = "ghostty_terminal_mode_get" });
@@ -218,6 +218,8 @@ comptime {
         @export(&c.grid_ref_graphemes, .{ .name = "ghostty_grid_ref_graphemes" });
         @export(&c.grid_ref_style, .{ .name = "ghostty_grid_ref_style" });
         @export(&c.build_info, .{ .name = "ghostty_build_info" });
+        @export(&c.alloc_alloc, .{ .name = "ghostty_alloc" });
+        @export(&c.alloc_free, .{ .name = "ghostty_free" });
 
         // On Wasm we need to export our allocator convenience functions.
         if (builtin.target.cpu.arch.isWasm()) {
