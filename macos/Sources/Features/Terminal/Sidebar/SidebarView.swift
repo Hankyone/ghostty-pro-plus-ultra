@@ -149,6 +149,12 @@ struct SidebarView: View {
 
                             Toggle("Show Tab Border", isOn: $showCardBorder)
 
+                            if let pwd = tab.pwd {
+                                Button("Open in Finder") {
+                                    NSWorkspace.shared.open(URL(fileURLWithPath: pwd))
+                                }
+                            }
+
                             Divider()
 
                             Button("Close Tab") {
