@@ -1,4 +1,8 @@
+const lib = @import("../lib.zig");
+const CAllocator = lib.alloc.Allocator;
+
 const buildpkg = @import("build_info.zig");
+pub const allocator = @import("allocator.zig");
 pub const cell = @import("cell.zig");
 pub const color = @import("color.zig");
 pub const focus = @import("focus.zig");
@@ -112,6 +116,9 @@ pub const mouse_encoder_encode = mouse_encode.encode;
 
 pub const paste_is_safe = paste.is_safe;
 
+pub const alloc_alloc = allocator.alloc;
+pub const alloc_free = allocator.free;
+
 pub const size_report_encode = size_report.encode;
 
 pub const cell_get = cell.get;
@@ -125,6 +132,7 @@ pub const terminal_new = terminal.new;
 pub const terminal_free = terminal.free;
 pub const terminal_reset = terminal.reset;
 pub const terminal_resize = terminal.resize;
+pub const terminal_set = terminal.set;
 pub const terminal_vt_write = terminal.vt_write;
 pub const terminal_scroll_viewport = terminal.scroll_viewport;
 pub const terminal_mode_get = terminal.mode_get;
@@ -139,6 +147,7 @@ pub const grid_ref_graphemes = grid_ref.grid_ref_graphemes;
 pub const grid_ref_style = grid_ref.grid_ref_style;
 
 test {
+    _ = allocator;
     _ = buildpkg;
     _ = cell;
     _ = color;

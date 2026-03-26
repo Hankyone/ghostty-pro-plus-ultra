@@ -45,6 +45,7 @@ bitigchi
 bkircher
 bo2themax
 brentschroeter
+brianc442
 cespare
 charliie-dev
 chernetskyi
@@ -59,6 +60,7 @@ damyanbogoev
 danulqua
 dariogriffo
 davidsanchez222
+deblasis
 dervedro
 devsunb
 diaaeddin
@@ -108,6 +110,7 @@ khipp
 kirwiisp
 kjvdven
 kloneets
+-kody-w
 koranir
 kristina8888
 kristofersoler
@@ -116,6 +119,7 @@ liby
 linustalacko
 lonsagisawa
 luisnquin
+lynicis
 mac0ne
 mahnokropotkinvich
 marijagjorgjieva
@@ -144,6 +148,7 @@ noib3
 nwehg
 ocean6954
 oshdubh
+paaloeye
 pan93412
 pangoraw
 pauley-unsaturated
@@ -171,6 +176,7 @@ seruman
 silveirapf
 slsrepo
 sunshine-syz
+tdgroot
 tdslot
 ticclick
 tnagatomi
@@ -182,6 +188,7 @@ uhojin
 unphased
 uzaaft
 vaughanandrews
+viruslobster
 vlsi
 wyounas
 yamshta
