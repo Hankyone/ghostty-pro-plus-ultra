@@ -26,12 +26,18 @@ step: *Step,
 output: LazyPath,
 
 /// Run libtool against a list of library files to combine into a single
-/// static library.
+/// static library. Uses a wrapper script that extracts .o files from
+/// input archives first, working around Apple's libtool silently dropping
+/// misaligned archive members produced by Zig 0.15+.
 pub fn create(b: *std.Build, opts: Options) *LibtoolStep {
     const self = b.allocator.create(LibtoolStep) catch @panic("OOM");
 
     const run_step = RunStep.create(b, b.fmt("libtool {s}", .{opts.name}));
-    run_step.addArgs(&.{ "libtool", "-static", "-o" });
+    run_step.addArgs(&.{
+        b.pathFromRoot("scripts/libtool_wrapper.sh"),
+        "-static",
+        "-o",
+    });
     const output = run_step.addOutputFileArg(opts.out_name);
     for (opts.sources) |source| run_step.addFileArg(source);
 
