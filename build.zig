@@ -106,27 +106,27 @@ pub fn build(b: *std.Build) !void {
     };
     libghostty_vt_shared.install(b.getInstallStep());
 
-    // libghostty-vt static lib. We don't build this for wasm since wasm has
-    // no concept of static vs shared and we put the wasm binary up in
-    // our shared handling.
-    if (!config.target.result.cpu.arch.isWasm()) {
-        const libghostty_vt_static = try buildpkg.GhosttyLibVt.initStatic(
-            b,
-            &mod,
-        );
-
-        if (config.is_dep) {
-            // If we're a dependency, we need to install everything as-is
-            // so that dep.artifact("ghostty-vt-static") works.
-            libghostty_vt_static.install(b.getInstallStep());
-        } else {
-            // If we're not a dependency, we rename the static lib to
-            // be idiomatic.
-            b.getInstallStep().dependOn(&b.addInstallLibFile(
-                libghostty_vt_static.output,
-                "libghostty-vt.a",
-            ).step);
-        }
+    // libghostty-vt static lib
+    const libghostty_vt_static = try buildpkg.GhosttyLibVt.initStatic(
+        b,
+        &mod,
+    );
+    if (config.is_dep) {
+        // If we're a dependency, we need to install everything as-is
+        // so that dep.artifact("ghostty-vt-static") works.
+        libghostty_vt_static.install(b.getInstallStep());
+    } else {
+        // If we're not a dependency, we rename the static lib to
+        // be idiomatic. On Windows, we use a distinct name to avoid
+        // colliding with the DLL import library (ghostty-vt.lib).
+        const static_lib_name = if (config.target.result.os.tag == .windows)
+            "ghostty-vt-static.lib"
+        else
+            "libghostty-vt.a";
+        b.getInstallStep().dependOn(&b.addInstallLibFile(
+            libghostty_vt_static.output,
+            static_lib_name,
+        ).step);
     }
 
     // Helpgen
@@ -152,8 +152,13 @@ pub fn build(b: *std.Build) !void {
         // build on macOS this way ironically so we need to fix that.
         if (!config.target.result.os.tag.isDarwin()) {
             lib_shared.installHeader(); // Only need one header
-            lib_shared.install("libghostty.so");
-            lib_static.install("libghostty.a");
+            if (config.target.result.os.tag == .windows) {
+                lib_shared.install("ghostty.dll");
+                lib_static.install("ghostty-static.lib");
+            } else {
+                lib_shared.install("libghostty.so");
+                lib_static.install("libghostty.a");
+            }
         }
     }
 
