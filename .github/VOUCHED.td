@@ -45,6 +45,7 @@ bitigchi
 bkircher
 bo2themax
 brentschroeter
+brianc442
 cespare
 charliie-dev
 chernetskyi
@@ -54,11 +55,13 @@ crayxt
 craziestowl
 curtismoncoq
 d-dudas
+-daedaevibin
 daiimus
 damyanbogoev
 danulqua
 dariogriffo
 davidsanchez222
+deblasis
 dervedro
 devsunb
 diaaeddin
@@ -90,6 +93,7 @@ heddxh heddxh
 hlcfan
 hqnna
 hulet
+i999rri
 icodesign
 j0hnm4r5
 jacobsandlund
@@ -102,12 +106,14 @@ johnslavik
 josephmart
 jparise
 juniqlim
+karesansui-u
 kawarimidoll
 kenvandine
 khipp
 kirwiisp
 kjvdven
 kloneets
+-kody-w
 koranir
 kristina8888
 kristofersoler
@@ -116,6 +122,7 @@ liby
 linustalacko
 lonsagisawa
 luisnquin
+lynicis
 mac0ne
 mahnokropotkinvich
 marijagjorgjieva
@@ -134,6 +141,7 @@ mischief
 mitchellh
 miupa
 molechowski
+mrconnorkenway
 mrmage
 mtak
 natesmyth
@@ -144,6 +152,7 @@ noib3
 nwehg
 ocean6954
 oshdubh
+paaloeye
 pan93412
 pangoraw
 pauley-unsaturated
@@ -171,6 +180,7 @@ seruman
 silveirapf
 slsrepo
 sunshine-syz
+tdgroot
 tdslot
 ticclick
 tnagatomi
@@ -182,6 +192,7 @@ uhojin
 unphased
 uzaaft
 vaughanandrews
+viruslobster
 vlsi
 wyounas
 yamshta
