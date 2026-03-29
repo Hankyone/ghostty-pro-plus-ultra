@@ -86,21 +86,21 @@ extern "C" {
  *
  * @ingroup render
  */
-typedef struct GhosttyRenderState* GhosttyRenderState;
+typedef struct GhosttyRenderStateImpl* GhosttyRenderState;
 
 /**
  * Opaque handle to a render-state row iterator.
  *
  * @ingroup render
  */
-typedef struct GhosttyRenderStateRowIterator* GhosttyRenderStateRowIterator;
+typedef struct GhosttyRenderStateRowIteratorImpl* GhosttyRenderStateRowIterator;
 
 /**
  * Opaque handle to render-state row cells.
  *
  * @ingroup render
  */
-typedef struct GhosttyRenderStateRowCells* GhosttyRenderStateRowCells;
+typedef struct GhosttyRenderStateRowCellsImpl* GhosttyRenderStateRowCells;
 
 /**
  * Dirty state of a render state after update.
@@ -514,6 +514,22 @@ typedef enum {
    *  The buffer must be at least graphemes_len elements. The base codepoint
    *  is written first, followed by any extra codepoints. */
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF = 4,
+
+  /** The resolved background color of the cell (GhosttyColorRgb).
+   *  Flattens the three possible sources: content-tag bg_color_rgb,
+   *  content-tag bg_color_palette (looked up in the palette), or the
+   *  style's bg_color. Returns GHOSTTY_INVALID_VALUE if the cell has
+   *  no background color, in which case the caller should use whatever
+   *  default background color it wants (e.g. the terminal background). */
+  GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR = 5,
+
+  /** The resolved foreground color of the cell (GhosttyColorRgb).
+   *  Resolves palette indices through the palette. Bold color handling
+   *  is not applied; the caller should handle bold styling separately.
+   *  Returns GHOSTTY_INVALID_VALUE if the cell has no explicit foreground
+   *  color, in which case the caller should use whatever default foreground
+   *  color it wants (e.g. the terminal foreground). */
+  GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR = 6,
 } GhosttyRenderStateRowCellsData;
 
 /**
