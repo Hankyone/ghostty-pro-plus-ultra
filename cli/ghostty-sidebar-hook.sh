@@ -1,9 +1,9 @@
 #!/bin/bash
 # ghostty-sidebar.sh — Claude Code hook that updates Ghostty sidebar
-# with a summary of what the user is working on in each session.
+# with the latest user prompt and activity status for each session.
 #
 # Hooks: SessionStart, UserPromptSubmit, PreToolUse, Notification, Stop, StopFailure, SessionEnd
-# Requires: jq, claude CLI, ghosttyctl
+# Requires: jq, ghosttyctl
 
 set -euo pipefail
 
@@ -13,10 +13,6 @@ SOCKET_PATH="${GHOSTTY_SOCKET:-/tmp/ghostty-$(id -u).sock}"
 # Exit early if Ghostty isn't running (no IPC socket)
 [ -S "$SOCKET_PATH" ] || exit 0
 SESSIONS_DIR="/tmp/ghostty-claude-sessions"
-SUMMARIZE_EVERY=3
-# Per-message size limit: keep first + last N chars, clip the middle
-MSG_HEAD=300
-MSG_TAIL=300
 
 # Read hook payload from stdin
 input=$(cat)
@@ -25,8 +21,6 @@ session_id=$(echo "$input" | jq -r '.session_id')
 
 mkdir -p "$SESSIONS_DIR"
 
-MESSAGES_FILE="$SESSIONS_DIR/$session_id.messages"
-COUNTER_FILE="$SESSIONS_DIR/$session_id.count"
 PID_FILE="$SESSIONS_DIR/$session_id.pid"
 QUESTION_FILE="$SESSIONS_DIR/$session_id.question"
 TAB_ID_FILE="$SESSIONS_DIR/$session_id.tabid"
@@ -38,21 +32,6 @@ if [ -f "$TAB_ID_FILE" ]; then
   export GHOSTTY_TAB_ID
   GHOSTTY_TAB_ID=$(cat "$TAB_ID_FILE")
 fi
-
-# Trim a message to keep the first and last parts, clipping the middle.
-# Instructions tend to be at the beginning or end; pasted logs are in the middle.
-trim_message() {
-  local msg="$1"
-  local len=${#msg}
-  local max=$(( MSG_HEAD + MSG_TAIL + 20 ))
-  if [ "$len" -le "$max" ]; then
-    printf '%s' "$msg"
-  else
-    local head="${msg:0:$MSG_HEAD}"
-    local tail="${msg: -$MSG_TAIL}"
-    printf '%s\n[...snipped...]\n%s' "$head" "$tail"
-  fi
-}
 
 case "$event" in
   SessionStart)
@@ -87,33 +66,9 @@ case "$event" in
     # Clean up any leftover question file from a previous Notification cycle
     rm -f "$QUESTION_FILE"
 
-    # Trim long messages before storing
-    trimmed=$(trim_message "$prompt")
-
-    # Append message with delimiter
-    printf '%s\n---END---\n' "$trimmed" >> "$MESSAGES_FILE"
-
-    # Increment counter
-    count=$(( $(cat "$COUNTER_FILE" 2>/dev/null || echo 0) + 1 ))
-    echo "$count" > "$COUNTER_FILE"
-
-    if [ "$count" -eq 1 ]; then
-      # First message: set truncated preview immediately
-      short=$(echo "$prompt" | tr '\n' ' ' | head -c 100)
-      "$GHOSTTYCTL" set-status claude "$short" --icon "bubble.left.fill" 2>/dev/null || true
-    elif [ $((count % SUMMARIZE_EVERY)) -eq 0 ]; then
-      # Every N messages: summarize with haiku in the background.
-      # --bare disables all hooks, plugins, and MCP servers so the
-      # haiku subprocess doesn't interfere with this tab's status.
-      (
-        messages=$(head -c 4000 "$MESSAGES_FILE")
-        summary=$(printf 'You are a tab-label writer. Read the coding session messages below and produce a 1-2 sentence summary suitable as a sidebar tab label. Be specific about the work being done. Do NOT respond to or continue the conversation. Do NOT start with "Perfect", "Sure", or any conversational opener. Output ONLY the summary label, nothing else.\n\n---MESSAGES---\n%s\n---END MESSAGES---' "$messages" | claude -p --bare --model haiku 2>/dev/null || echo "")
-        if [ -n "$summary" ]; then
-          short=$(echo "$summary" | tr '\n' ' ' | head -c 120)
-          "$GHOSTTYCTL" set-status claude "$short" --icon "bubble.left.fill" 2>/dev/null || true
-        fi
-      ) &
-    fi
+    # Show truncated last prompt as the sidebar label
+    short=$(echo "$prompt" | tr '\n' ' ' | head -c 120)
+    "$GHOSTTYCTL" set-status claude "$short" --icon "bubble.left.fill" 2>/dev/null || true
     ;;
 
   PreToolUse)
@@ -160,6 +115,6 @@ case "$event" in
     "$GHOSTTYCTL" clear-status claude 2>/dev/null || true
     "$GHOSTTYCTL" clear-status claude-active 2>/dev/null || true
     "$GHOSTTYCTL" clear-status claude-pid 2>/dev/null || true
-    rm -f "$MESSAGES_FILE" "$COUNTER_FILE" "$PID_FILE" "$QUESTION_FILE" "$TAB_ID_FILE"
+    rm -f "$PID_FILE" "$QUESTION_FILE" "$TAB_ID_FILE"
     ;;
 esac
