@@ -2,7 +2,7 @@
 # ghostty-sidebar.sh — Claude Code hook that updates Ghostty sidebar
 # with a summary of what the user is working on in each session.
 #
-# Hooks: SessionStart, UserPromptSubmit, PreToolUse, Notification, Stop, SessionEnd
+# Hooks: SessionStart, UserPromptSubmit, PreToolUse, Notification, Stop, StopFailure, SessionEnd
 # Requires: jq, claude CLI, ghosttyctl
 
 set -euo pipefail
@@ -102,10 +102,12 @@ case "$event" in
       short=$(echo "$prompt" | tr '\n' ' ' | head -c 100)
       "$GHOSTTYCTL" set-status claude "$short" --icon "bubble.left.fill" 2>/dev/null || true
     elif [ $((count % SUMMARIZE_EVERY)) -eq 0 ]; then
-      # Every N messages: summarize with haiku in the background
+      # Every N messages: summarize with haiku in the background.
+      # --bare disables all hooks, plugins, and MCP servers so the
+      # haiku subprocess doesn't interfere with this tab's status.
       (
         messages=$(head -c 4000 "$MESSAGES_FILE")
-        summary=$(printf 'You are a tab-label writer. Read the coding session messages below and produce a 1-2 sentence summary suitable as a sidebar tab label. Be specific about the work being done. Do NOT respond to or continue the conversation. Do NOT start with "Perfect", "Sure", or any conversational opener. Output ONLY the summary label, nothing else.\n\n---MESSAGES---\n%s\n---END MESSAGES---' "$messages" | claude -p --model haiku 2>/dev/null || echo "")
+        summary=$(printf 'You are a tab-label writer. Read the coding session messages below and produce a 1-2 sentence summary suitable as a sidebar tab label. Be specific about the work being done. Do NOT respond to or continue the conversation. Do NOT start with "Perfect", "Sure", or any conversational opener. Output ONLY the summary label, nothing else.\n\n---MESSAGES---\n%s\n---END MESSAGES---' "$messages" | claude -p --bare --model haiku 2>/dev/null || echo "")
         if [ -n "$summary" ]; then
           short=$(echo "$summary" | tr '\n' ' ' | head -c 120)
           "$GHOSTTYCTL" set-status claude "$short" --icon "bubble.left.fill" 2>/dev/null || true
@@ -147,8 +149,8 @@ case "$event" in
     fi
     ;;
 
-  Stop)
-    # Claude finished responding — show "done" indicator
+  Stop|StopFailure)
+    # Claude finished responding (or hit an API error) — show "done" indicator
     "$GHOSTTYCTL" set-status claude-active "done" 2>/dev/null || true
     # Clean up any leftover question file
     rm -f "$QUESTION_FILE"
