@@ -215,6 +215,14 @@ extension Ghostty {
         func sendText(_ text: String) {
             surfaceModel?.sendText(text)
         }
+
+        /// Protect the current title from being overwritten by terminal OSC sequences.
+        /// Used before auto-resuming Claude Code, which sets the terminal title to its session name.
+        func protectTitle() {
+            if titleFromTerminal == nil, !title.isEmpty {
+                titleFromTerminal = title
+            }
+        }
         /// Current scrollbar state, cached here for persistence across rebuilds
         /// of the SwiftUI view hierarchy, for example when changing splits
         var scrollbar: Ghostty.Action.Scrollbar?
