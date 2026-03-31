@@ -782,9 +782,8 @@ class AppDelegate: NSObject,
         // state restoration system.
         switch config.windowSaveState {
         case "never": UserDefaults.ghostty.setValue(false, forKey: "NSQuitAlwaysKeepsWindows")
-        case "always": UserDefaults.ghostty.setValue(true, forKey: "NSQuitAlwaysKeepsWindows")
         case "default": fallthrough
-        default: UserDefaults.ghostty.removeObject(forKey: "NSQuitAlwaysKeepsWindows")
+        default: UserDefaults.ghostty.setValue(true, forKey: "NSQuitAlwaysKeepsWindows")
         }
 
         // Sync our auto-update settings. If SUEnableAutomaticChecks (in our Info.plist) is
