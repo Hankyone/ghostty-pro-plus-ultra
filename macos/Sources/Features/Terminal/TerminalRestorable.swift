@@ -143,6 +143,12 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         }
 
         completionHandler(window, nil)
+
+        // Auto-resume Claude Code sessions for all surfaces in this window.
+        for surface in c.surfaceTree {
+            attemptClaudeResume(for: surface)
+        }
+
         guard let mode = state.effectiveFullscreenMode, mode != .native else {
             // We let AppKit handle native fullscreen
             return
@@ -150,6 +156,31 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // Give the window to AppKit first, then adjust its frame and style
         // to minimise any visible frame changes.
         c.toggleFullscreen(mode: mode)
+    }
+
+    /// Attempt to auto-resume a Claude Code session in a restored surface.
+    /// Looks up the persisted `claude-session` entry, validates it, and sends
+    /// `claude --resume <id>` after a delay to let the shell initialize.
+    @MainActor
+    private static func attemptClaudeResume(for surface: Ghostty.SurfaceView) {
+        let surfaceId = surface.id
+        let store = TabMetadataStore.shared
+
+        guard let sessionEntry = store.entries[surfaceId]?["claude-session"] else { return }
+        let sessionId = sessionEntry.value
+        guard !sessionId.isEmpty else { return }
+
+        // Validate session ID format (alphanumeric + hyphens only) to prevent injection.
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
+
+        // Clear the entry so we don't retry on future restores.
+        store.clearStatus(tabId: surfaceId, key: "claude-session")
+
+        // Delay to let the shell initialize and display its prompt.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            surface.sendText("claude --resume \(sessionId) --dangerously-skip-permissions\n")
+        }
     }
 
     /// This restores the focus state of the surfaceview within the given window. When restoring,

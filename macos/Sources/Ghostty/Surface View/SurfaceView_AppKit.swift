@@ -210,6 +210,11 @@ extension Ghostty {
         var surface: ghostty_surface_t? {
             surfaceModel?.unsafeCValue
         }
+
+        /// Send text to the terminal as if typed. Used for auto-resume after restoration.
+        func sendText(_ text: String) {
+            surfaceModel?.sendText(text)
+        }
         /// Current scrollbar state, cached here for persistence across rebuilds
         /// of the SwiftUI view hierarchy, for example when changing splits
         var scrollbar: Ghostty.Action.Scrollbar?
@@ -1788,6 +1793,13 @@ extension Ghostty {
             let uuid = UUID(uuidString: try container.decode(String.self, forKey: .uuid))
             var config = Ghostty.SurfaceConfiguration()
             config.workingDirectory = try container.decode(String?.self, forKey: .pwd)
+
+            // Inject IPC env vars so sidebar hooks work in restored terminals.
+            config.environmentVariables["GHOSTTY_SOCKET"] = GhosttyIPCServer.shared.socketPath
+            if let uuid = uuid {
+                config.environmentVariables["GHOSTTY_TAB_ID"] = uuid.uuidString
+            }
+
             let savedTitle = try container.decodeIfPresent(String.self, forKey: .title)
             let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false
 

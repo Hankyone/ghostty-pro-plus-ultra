@@ -201,6 +201,14 @@ class AppDelegate: NSObject,
             // Manual autofill via the `Edit => AutoFill` menu item still work as expected.
             "NSAutoFillHeuristicControllerEnabled": false,
         ])
+
+        // Start IPC socket server early so restored surfaces get the socket path
+        // in their environment. Window restoration runs between willFinish and
+        // didFinish, so the socket must be available by then.
+        GhosttyIPCServer.shared.start()
+
+        // Force-load persisted tab metadata so it's available during window restoration.
+        _ = TabMetadataStore.shared
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -295,9 +303,6 @@ class AppDelegate: NSObject,
         ])
         center.delegate = self
 
-        // Start IPC socket server
-        GhosttyIPCServer.shared.start()
-
         // Observe our appearance so we can report the correct value to libghostty.
         self.appearanceObserver = NSApplication.shared.observe(
             \.effectiveAppearance,
@@ -321,6 +326,18 @@ class AppDelegate: NSObject,
 
         // Setup signal handlers
         setupSignals()
+
+        // Prune orphaned tab metadata after restoration completes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            var liveSurfaceIds = Set<UUID>()
+            for window in NSApp.windows {
+                guard let controller = window.windowController as? BaseTerminalController else { continue }
+                for surface in controller.surfaceTree {
+                    liveSurfaceIds.insert(surface.id)
+                }
+            }
+            TabMetadataStore.shared.pruneOrphanedEntries(liveSurfaceIds: liveSurfaceIds)
+        }
 
         switch Ghostty.launchSource {
         case .app:

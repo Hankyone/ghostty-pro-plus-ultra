@@ -54,6 +54,7 @@ case "$event" in
     # $PPID is the Claude Code process that spawned this hook.
     echo "$PPID" > "$PID_FILE"
     "$GHOSTTYCTL" set-status claude-pid "$PPID" 2>/dev/null || true
+    "$GHOSTTYCTL" set-status claude-session "$session_id" 2>/dev/null || true
     ;;
 
   UserPromptSubmit)
