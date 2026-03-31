@@ -23,18 +23,29 @@ Replaces the native tab bar with a left sidebar showing rich tab cards:
 - **Hover state** — tab cards highlight on mouse hover
 - **Middle-click to close** — middle-click any tab card to close it
 - **Double-click empty space** — creates a new tab
+- **Double-click a tab** — rename it
+- **Right-click context menu** — rename, set color, open in Finder, close
 - **Drag-and-drop** — reorder tabs by dragging
 - **Custom status entries** — show ports, environments, or any metadata via CLI
 - **Attention indicators** — orange dot on tabs with notifications or bell
 - **Theme-aware** — colors derived from your terminal theme
 - **Tab colors** — assign colors to tabs via context menu
 
+### Tab Restore
+
+Browser-like session persistence — quit and reopen, and everything comes back:
+
+- **Working directories** — each tab reopens in the same folder
+- **Sidebar metadata** — last prompt text and status persist across restarts
+- **Claude session resume** — the resume command is pre-filled, just press Enter
+- **Tab titles and colors** — renamed tabs and color assignments are preserved
+- Enabled by default (set `window-save-state = never` to disable)
+
 ### Claude Code Integration
 
 When running Claude Code, the sidebar shows:
 
-- **Session summary** — AI-generated description of what you're working on, updated every 3 messages
-- **Instant tooltip** — hover to see the full summary
+- **Last prompt** — shows what you last asked Claude, updated on every message
 - **Activity indicator** — pulsing blue dot while Claude is working, orange pulsing dot when waiting for input, solid green dot when done
 
 Powered by Claude Code hooks that call `ghosttyctl set-status` to push context to the sidebar.
@@ -53,13 +64,13 @@ p = os.path.expanduser('~/.claude/settings.json')
 s = json.load(open(p)) if os.path.exists(p) else {}
 cmd = 'bash ~/.claude/hooks/ghostty-sidebar.sh'
 entry = [{'hooks': [{'type': 'command', 'command': cmd}]}]
-s['hooks'] = {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','Notification','Stop','SessionEnd']}
+s['hooks'] = {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','Notification','Stop','StopFailure','SessionEnd']}
 json.dump(s, open(p, 'w'), indent=2)
 print('Hooks installed.')
 "
 ```
 
-Requires `jq` and the `claude` CLI in your PATH.
+Requires `jq` in your PATH.
 
 ### CLI
 

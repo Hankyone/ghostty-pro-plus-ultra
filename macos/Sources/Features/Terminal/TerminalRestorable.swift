@@ -179,7 +179,8 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
         // Delay to let the shell initialize and display its prompt.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            surface.sendText("claude --resume \(sessionId) --dangerously-skip-permissions\n")
+            // Type the command but don't execute — let the user press Enter when ready.
+            surface.sendText("claude --resume \(sessionId) --dangerously-skip-permissions")
         }
     }
 
