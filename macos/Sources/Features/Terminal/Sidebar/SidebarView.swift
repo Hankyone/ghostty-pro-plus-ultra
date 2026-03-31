@@ -337,7 +337,7 @@ private struct SidebarTabCard: View {
 
                 // Status entries (excluding "claude" which is shown in the branch slot)
                 if fields.contains(.status) {
-                    let filteredEntries = tab.statusEntries.filter { $0.key != "claude" && $0.key != "claude-active" && $0.key != "claude-pid" }
+                    let filteredEntries = tab.statusEntries.filter { $0.key != "claude" && $0.key != "claude-active" && $0.key != "claude-pid" && $0.key != "claude-session" }
                     ForEach(filteredEntries, id: \.key) { entry in
                         HStack(spacing: 4) {
                             if let icon = entry.icon {
