@@ -39,6 +39,7 @@ pub const Path = @import("path.zig").Path;
 pub const RepeatablePath = @import("path.zig").RepeatablePath;
 const ClipboardCodepointMap = @import("ClipboardCodepointMap.zig");
 const KeyRemapSet = @import("../input/key_mods.zig").RemapSet;
+pub const WindowPaddingBalance = @import("../renderer/size.zig").PaddingBalance;
 const string = @import("string.zig");
 
 // We do this instead of importing all of terminal/main.zig to
@@ -48,6 +49,7 @@ const string = @import("string.zig");
 const terminal = struct {
     const CursorStyle = @import("../terminal/cursor.zig").Style;
     const color = @import("../terminal/color.zig");
+    const style = @import("../terminal/style.zig");
     const x11_color = @import("../terminal/x11_color.zig");
 };
 
@@ -5253,12 +5255,6 @@ pub const Fullscreen = enum(c_int) {
     @"non-native-padded-notch",
 };
 
-pub const WindowPaddingBalance = enum {
-    false,
-    true,
-    equal,
-};
-
 pub const WindowPaddingColor = enum {
     background,
     extend,
@@ -5605,6 +5601,14 @@ pub const TerminalColor = union(enum) {
 pub const BoldColor = union(enum) {
     color: Color,
     bright,
+
+    /// Convert to the terminal-native BoldColor type.
+    pub fn toTerminal(self: BoldColor) terminal.style.Style.BoldColor {
+        return switch (self) {
+            .color => |col| .{ .color = col.toTerminalRGB() },
+            .bright => .bright,
+        };
+    }
 
     pub fn parseCLI(input_: ?[]const u8) !BoldColor {
         const input = input_ orelse return error.ValueRequired;
@@ -9815,9 +9819,16 @@ pub const Theme = struct {
         // we're parsing a light/dark mode theme pair. Note that "=" isn't
         // actually valid for setting a light/dark mode pair but I anticipate
         // it'll be a common typo.
+        //
+        // On Windows, a colon at index 1 is a drive letter (e.g. C:\...)
+        // and should not trigger light/dark pair parsing.
+        const has_colon = if (comptime builtin.os.tag == .windows)
+            if (std.mem.indexOf(u8, input, ":")) |idx| idx != 1 else false
+        else
+            std.mem.indexOf(u8, input, ":") != null;
         if (std.mem.indexOf(u8, input, ",") != null or
             std.mem.indexOf(u8, input, "=") != null or
-            std.mem.indexOf(u8, input, ":") != null)
+            has_colon)
         {
             self.* = try cli.args.parseAutoStruct(
                 Theme,
