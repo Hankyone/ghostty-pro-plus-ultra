@@ -5,7 +5,7 @@
 <h1 align="center">Ghostty Pro Plus Ultra</h1>
 
 <p align="center">
-A personal Ghostty fork with a sidebar tab system, Claude Code integration, and quality-of-life improvements for macOS.
+A personal Ghostty fork with a project-grouped sidebar, AI agent integration, and quality-of-life improvements for macOS.
 </p>
 
 <p align="center">
@@ -14,43 +14,21 @@ A personal Ghostty fork with a sidebar tab system, Claude Code integration, and 
 
 ## Features
 
-### Sidebar
+### Project-Grouped Sidebar
 
-Replaces the native tab bar with a left sidebar showing rich tab cards:
+A T3 Code-inspired sidebar that replaces the native tab bar. Terminals are automatically grouped by project — detected from `.git`, `package.json`, `Cargo.toml`, and other markers. Each project section shows auto-detected favicons (from Xcode, Android, or web projects), git diff stats, and a collapsible tab list. Ungrouped terminals live in an "Other" section at the bottom.
 
-- **Tab cards** with title, directory, and git diff stats (`+N -N`)
-- **Project favicons** — auto-detected from web projects, shown instead of the folder icon
-- **Hover state** — tab cards highlight on mouse hover
-- **Middle-click to close** — middle-click any tab card to close it
-- **Double-click empty space** — creates a new tab
-- **Double-click a tab** — rename it
-- **Right-click context menu** — rename, set color, open in Finder, close
-- **Drag-and-drop** — reorder tabs by dragging
-- **Custom status entries** — show ports, environments, or any metadata via CLI
-- **Attention indicators** — orange dot on tabs with notifications or bell
-- **Theme-aware** — colors derived from your terminal theme
-- **Tab colors** — assign colors to tabs via context menu
+### AI Agent Integration
+
+Built-in support for Claude Code and Codex. The sidebar shows live status for each agent session — pulsing blue while working, orange when waiting for input, green when done. Each project header has a button to launch a new session or resume a recent one directly from the sidebar.
 
 ### Tab Restore
 
-Browser-like session persistence — quit and reopen, and everything comes back:
+Browser-like session persistence — quit and reopen, and everything comes back. Working directories, tab titles, colors, sidebar metadata, and agent resume commands are all preserved across restarts.
 
-- **Working directories** — each tab reopens in the same folder
-- **Sidebar metadata** — last prompt text and status persist across restarts
-- **Claude session resume** — the resume command is pre-filled, just press Enter
-- **Tab titles and colors** — renamed tabs and color assignments are preserved
-- Enabled by default (set `window-save-state = never` to disable)
+### Hook Setup
 
-### Claude Code Integration
-
-When running Claude Code, the sidebar shows:
-
-- **Last prompt** — shows what you last asked Claude, updated on every message
-- **Activity indicator** — pulsing blue dot while Claude is working, orange pulsing dot when waiting for input, solid green dot when done
-
-Powered by Claude Code hooks that call `ghosttyctl set-status` to push context to the sidebar.
-
-**Setup:**
+The sidebar integration is powered by Claude Code hooks that push status updates via `ghosttyctl`.
 
 ```bash
 # 1. Copy the hook script
