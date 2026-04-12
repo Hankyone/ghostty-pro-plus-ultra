@@ -138,7 +138,16 @@ echo "==> Notarization complete."
 
 # --- Sparkle appcast ---
 echo "==> Generating Sparkle appcast..."
-SPARKLE_SIG=$(/tmp/sparkle/bin/sign_update "$DMG_NAME" 2>/dev/null || echo "")
+if [ ! -x /tmp/sparkle/bin/sign_update ]; then
+    echo "ERROR: /tmp/sparkle/bin/sign_update not found. Install it:"
+    echo "  mkdir -p /tmp/sparkle/bin && cp ~/Library/Developer/Xcode/DerivedData/Ghostty-*/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update /tmp/sparkle/bin/"
+    exit 1
+fi
+SPARKLE_SIG=$(/tmp/sparkle/bin/sign_update "$DMG_NAME")
+if [ -z "$SPARKLE_SIG" ]; then
+    echo "ERROR: sign_update returned empty signature"
+    exit 1
+fi
 DMG_SIZE=$(stat -f%z "$DMG_NAME")
 DMG_URL="https://github.com/${REPO}/releases/download/${TAG}/${DMG_NAME}"
 RELEASE_DATE=$(date -u +"%a, %d %b %Y %H:%M:%S %z")
