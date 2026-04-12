@@ -290,10 +290,9 @@ enum UpdateState: Equatable {
         init?(displayVersionString: String, currentCommit: String?) {
             let version = displayVersionString
 
-            // Check for semantic version (x.y.z)
+            // Check for semantic version (x.y.z) — link to our GitHub release
             if let semver = Self.extractSemanticVersion(from: version) {
-                let slug = semver.replacingOccurrences(of: ".", with: "-")
-                if let url = URL(string: "https://ghostty.org/docs/install/release-notes/\(slug)") {
+                if let url = URL(string: "https://github.com/Hankyone/ghostty-pro-plus-ultra/releases/tag/ppu-v\(semver)") {
                     self = .tagged(url)
                     return
                 }
