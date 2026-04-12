@@ -1159,7 +1159,7 @@ class SidebarTabManager: ObservableObject {
     }
 
     /// Cached recent sessions per project root. Refreshed every 30 seconds in the background.
-    private var recentSessionsCache: [String: [RecentSession]] = [:]
+    @Published private var recentSessionsCache: [String: [RecentSession]] = [:]
     private var recentSessionsCacheTime: Date = .distantPast
     private static let recentSessionsCacheInterval: TimeInterval = 30.0
 

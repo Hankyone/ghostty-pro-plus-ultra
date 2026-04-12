@@ -129,7 +129,7 @@ struct SidebarView: View {
         .background(.clear)
         .overlay(DoubleClickOverlay(
             tabCardFrames: tabCardFrames,
-            onBlankSpaceDoubleClick: { tabManager.createNewTab() },
+            onBlankSpaceDoubleClick: { tabManager.createNewTab(projectRoot: NSHomeDirectory()) },
             onTabDoubleClick: { tabID in
                 if let tab = tabManager.tabs.first(where: { $0.id == tabID }) {
                     tabManager.promptRenameTab(tab)
@@ -154,31 +154,6 @@ private struct ProjectSection: View {
     @Binding var tabCardFrames: [ObjectIdentifier: CGRect]
     let isCollapsed: Bool
 
-    /// The highest-priority status indicator across all tabs in this group.
-    private var aggregateStatus: AggregateGroupStatus? {
-        var hasPendingInput = false
-        var hasWorking = false
-        var hasDone = false
-        var hasAttention = false
-
-        for tab in group.tabs {
-            if let active = tab.statusEntries.first(where: { $0.key == "claude-active" || $0.key == "codex-active" }) {
-                switch active.value {
-                case "needs-input": hasPendingInput = true
-                case "done": hasDone = true
-                default: hasWorking = true
-                }
-            }
-            if tab.needsAttention { hasAttention = true }
-        }
-
-        if hasPendingInput { return .needsInput }
-        if hasWorking { return .working }
-        if hasAttention { return .attention }
-        if hasDone { return .done }
-        return nil
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Project header
@@ -192,7 +167,6 @@ private struct ProjectSection: View {
                     theme: theme,
                     isCollapsed: isCollapsed,
                     isHovered: hoveredGroupID == group.id,
-                    aggregateStatus: aggregateStatus,
                     onNewTab: { tool in
                         tabManager.createNewTab(tool: tool, projectRoot: group.projectRoot)
                     },
@@ -239,15 +213,31 @@ private struct ProjectSection: View {
         let activeEntry = tab.statusEntries.first(where: { $0.key == "claude-active" || $0.key == "codex-active" })
         let titleColor = isSelected || isHovered ? theme.foreground : theme.secondaryText
         let subtitleColor = isSelected || isHovered ? theme.foreground.opacity(0.7) : theme.secondaryText
-        let rowBackground = isSelected ? theme.foreground.opacity(0.06) : (isHovered ? theme.foreground.opacity(0.04) : Color.clear)
+        // Tab color tint — subtle background wash instead of a left bar
+        let tabTint: Color? = tab.tabColor.displayColor.map { Color(nsColor: $0) }
+        let rowBackground: Color = {
+            if let tint = tabTint {
+                if isSelected { return tint.opacity(0.12) }
+                if isHovered { return tint.opacity(0.08) }
+                return tint.opacity(0.05)
+            }
+            if isSelected { return theme.foreground.opacity(0.06) }
+            if isHovered { return theme.foreground.opacity(0.04) }
+            return .clear
+        }()
 
         HStack(spacing: 0) {
-            // Tab color indicator — thin left bar
-            if let nsColor = tab.tabColor.displayColor {
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Color(nsColor: nsColor).opacity(isSelected ? 1.0 : 0.5))
-                    .frame(width: 3, height: 16)
-                    .padding(.trailing, 6)
+            // Status dot — leading position
+            if let activeEntry {
+                if activeEntry.value == "done" {
+                    Circle().fill(.green).frame(width: 6, height: 6).padding(.trailing, 6)
+                } else if activeEntry.value == "needs-input" {
+                    PulsingDot(color: .orange, size: 6).padding(.trailing, 6)
+                } else {
+                    PulsingDot(color: .accentColor, size: 6).padding(.trailing, 6)
+                }
+            } else if tab.needsAttention && !isSelected {
+                Circle().fill(theme.attentionColor).frame(width: 6, height: 6).padding(.trailing, 6)
             }
 
             // Title
@@ -267,19 +257,6 @@ private struct ProjectSection: View {
                     .font(.system(size: 9))
                     .foregroundColor(theme.secondaryText.opacity(0.5))
                     .fixedSize()
-            }
-
-            // Status dot
-            if let activeEntry {
-                if activeEntry.value == "done" {
-                    Circle().fill(.green).frame(width: 6, height: 6)
-                } else if activeEntry.value == "needs-input" {
-                    PulsingDot(color: .orange, size: 6)
-                } else {
-                    PulsingDot(color: .accentColor, size: 6)
-                }
-            } else if tab.needsAttention && !isSelected {
-                Circle().fill(theme.attentionColor).frame(width: 6, height: 6)
             }
         }
         .frame(height: 28)
@@ -376,31 +353,6 @@ private struct ProjectSection: View {
     }
 }
 
-// MARK: - AggregateGroupStatus
-
-private enum AggregateGroupStatus {
-    case needsInput
-    case working
-    case attention
-    case done
-
-    var color: Color {
-        switch self {
-        case .needsInput: return .orange
-        case .working: return .accentColor
-        case .attention: return .orange
-        case .done: return .green
-        }
-    }
-
-    var shouldPulse: Bool {
-        switch self {
-        case .working: return true
-        default: return false
-        }
-    }
-}
-
 // MARK: - ProjectHeader
 
 /// The header row for a project group — matches T3 Code's compact header style.
@@ -409,7 +361,6 @@ private struct ProjectHeader: View {
     let theme: SidebarTheme
     let isCollapsed: Bool
     let isHovered: Bool
-    let aggregateStatus: AggregateGroupStatus?
     var onNewTab: ((SidebarTabManager.SidebarTool) -> Void)? = nil
     var recentSessions: [SidebarTabManager.RecentSession] = []
     var onResumeSession: ((SidebarTabManager.RecentSession) -> Void)? = nil
@@ -456,17 +407,6 @@ private struct ProjectHeader: View {
                 Text(stats)
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundColor(theme.secondaryText)
-            }
-
-            // Aggregate status indicator
-            if let status = aggregateStatus {
-                if status.shouldPulse {
-                    PulsingDot(color: status.color, size: 7)
-                } else {
-                    Circle()
-                        .fill(status.color)
-                        .frame(width: 7, height: 7)
-                }
             }
 
             if let onNewTab {
