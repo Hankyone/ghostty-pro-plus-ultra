@@ -244,7 +244,7 @@ private struct ProjectSection: View {
             let primaryTitle = sessionTitleEntry?.value ?? tab.displayTitle
 
             Text(primaryTitle)
-                .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+                .font(.system(size: 12, weight: .regular))
                 .foregroundColor(titleColor)
                 .lineLimit(1)
                 .truncationMode(.tail)

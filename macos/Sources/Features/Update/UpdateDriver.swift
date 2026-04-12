@@ -37,19 +37,35 @@ class UpdateDriver: NSObject, SPUUserDriver {
         }
     }
 
+    // MARK: - Helpers
+
+    /// Ensure viewModel state updates happen on the main thread.
+    /// Sparkle may call SPUUserDriver methods from background threads.
+    private func setStateOnMain(_ newState: UpdateState) {
+        if Thread.isMainThread {
+            viewModel.state = newState
+        } else {
+            DispatchQueue.main.async { [weak viewModel] in
+                viewModel?.state = newState
+            }
+        }
+    }
+
+    // MARK: - SPUUserDriver
+
     func show(_ request: SPUUpdatePermissionRequest,
               reply: @escaping @Sendable (SUUpdatePermissionResponse) -> Void) {
-        viewModel.state = .permissionRequest(.init(request: request, reply: { [weak viewModel] response in
+        setStateOnMain(.permissionRequest(.init(request: request, reply: { [weak viewModel] response in
             viewModel?.state = .idle
             reply(response)
-        }))
+        })))
         if !hasUnobtrusiveTarget {
             standard.show(request, reply: reply)
         }
     }
 
     func showUserInitiatedUpdateCheck(cancellation: @escaping () -> Void) {
-        viewModel.state = .checking(.init(cancel: cancellation))
+        setStateOnMain(.checking(.init(cancel: cancellation)))
 
         if !hasUnobtrusiveTarget {
             standard.showUserInitiatedUpdateCheck(cancellation: cancellation)
@@ -59,7 +75,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
     func showUpdateFound(with appcastItem: SUAppcastItem,
                          state: SPUUserUpdateState,
                          reply: @escaping @Sendable (SPUUserUpdateChoice) -> Void) {
-        viewModel.state = .updateAvailable(.init(appcastItem: appcastItem, reply: reply))
+        setStateOnMain(.updateAvailable(.init(appcastItem: appcastItem, reply: reply)))
         if !hasUnobtrusiveTarget {
             standard.showUpdateFound(with: appcastItem, state: state, reply: reply)
         }
@@ -76,7 +92,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
 
     func showUpdateNotFoundWithError(_ error: any Error,
                                      acknowledgement: @escaping () -> Void) {
-        viewModel.state = .notFound(.init(acknowledgement: acknowledgement))
+        setStateOnMain(.notFound(.init(acknowledgement: acknowledgement)))
 
         if !hasUnobtrusiveTarget {
             standard.showUpdateNotFoundWithError(error, acknowledgement: acknowledgement)
@@ -85,7 +101,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
 
     func showUpdaterError(_ error: any Error,
                           acknowledgement: @escaping () -> Void) {
-        viewModel.state = .error(.init(
+        setStateOnMain(.error(.init(
             error: error,
             retry: { [weak self, weak viewModel] in
                 viewModel?.state = .idle
@@ -97,7 +113,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
             },
             dismiss: { [weak viewModel] in
                 viewModel?.state = .idle
-            }))
+            })))
 
         if !hasUnobtrusiveTarget {
             standard.showUpdaterError(error, acknowledgement: acknowledgement)
@@ -107,10 +123,10 @@ class UpdateDriver: NSObject, SPUUserDriver {
     }
 
     func showDownloadInitiated(cancellation: @escaping () -> Void) {
-        viewModel.state = .downloading(.init(
+        setStateOnMain(.downloading(.init(
             cancel: cancellation,
             expectedLength: nil,
-            progress: 0))
+            progress: 0)))
 
         if !hasUnobtrusiveTarget {
             standard.showDownloadInitiated(cancellation: cancellation)
@@ -122,10 +138,10 @@ class UpdateDriver: NSObject, SPUUserDriver {
             return
         }
 
-        viewModel.state = .downloading(.init(
+        setStateOnMain(.downloading(.init(
             cancel: downloading.cancel,
             expectedLength: expectedContentLength,
-            progress: 0))
+            progress: 0)))
 
         if !hasUnobtrusiveTarget {
             standard.showDownloadDidReceiveExpectedContentLength(expectedContentLength)
@@ -137,10 +153,10 @@ class UpdateDriver: NSObject, SPUUserDriver {
             return
         }
 
-        viewModel.state = .downloading(.init(
+        setStateOnMain(.downloading(.init(
             cancel: downloading.cancel,
             expectedLength: downloading.expectedLength,
-            progress: downloading.progress + length))
+            progress: downloading.progress + length)))
 
         if !hasUnobtrusiveTarget {
             standard.showDownloadDidReceiveData(ofLength: length)
@@ -148,7 +164,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
     }
 
     func showDownloadDidStartExtractingUpdate() {
-        viewModel.state = .extracting(.init(progress: 0))
+        setStateOnMain(.extracting(.init(progress: 0)))
 
         if !hasUnobtrusiveTarget {
             standard.showDownloadDidStartExtractingUpdate()
@@ -156,7 +172,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
     }
 
     func showExtractionReceivedProgress(_ progress: Double) {
-        viewModel.state = .extracting(.init(progress: progress))
+        setStateOnMain(.extracting(.init(progress: progress)))
 
         if !hasUnobtrusiveTarget {
             standard.showExtractionReceivedProgress(progress)
@@ -172,12 +188,12 @@ class UpdateDriver: NSObject, SPUUserDriver {
     }
 
     func showInstallingUpdate(withApplicationTerminated applicationTerminated: Bool, retryTerminatingApplication: @escaping () -> Void) {
-        viewModel.state = .installing(.init(
+        setStateOnMain(.installing(.init(
             retryTerminatingApplication: retryTerminatingApplication,
             dismiss: { [weak viewModel] in
                 viewModel?.state = .idle
             }
-        ))
+        )))
 
         if !hasUnobtrusiveTarget {
             standard.showInstallingUpdate(withApplicationTerminated: applicationTerminated, retryTerminatingApplication: retryTerminatingApplication)
@@ -186,7 +202,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
 
     func showUpdateInstalledAndRelaunched(_ relaunched: Bool, acknowledgement: @escaping () -> Void) {
         standard.showUpdateInstalledAndRelaunched(relaunched, acknowledgement: acknowledgement)
-        viewModel.state = .idle
+        setStateOnMain(.idle)
     }
 
     func showUpdateInFocus() {
@@ -196,7 +212,7 @@ class UpdateDriver: NSObject, SPUUserDriver {
     }
 
     func dismissUpdateInstallation() {
-        viewModel.state = .idle
+        setStateOnMain(.idle)
         standard.dismissUpdateInstallation()
     }
 
