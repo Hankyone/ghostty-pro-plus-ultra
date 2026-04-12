@@ -15,6 +15,10 @@ class SidebarTabManager: ObservableObject {
         let tabColor: TerminalTabColor
         let faviconImage: NSImage?
         let window: NSWindow
+        /// The detected project root directory for this tab, or nil if not in a project.
+        let projectRoot: String?
+        /// When this tab last had real activity (command execution, status change).
+        var lastActivity: Date?
 
         /// The last path component of the pwd, for compact display.
         var directoryName: String? {
@@ -22,9 +26,18 @@ class SidebarTabManager: ObservableObject {
             return (pwd as NSString).lastPathComponent
         }
 
-        /// Title with bell emoji stripped (the sidebar uses its own attention indicator).
+        /// Title with bell/ghost emoji stripped for clean sidebar display.
         var displayTitle: String {
-            title.hasPrefix("\u{1F514} ") ? String(title.dropFirst(3)) : title
+            var t = title
+            // Strip bell emoji prefix (sidebar has its own attention indicator)
+            if t.hasPrefix("\u{1F514} ") { t = String(t.dropFirst(3)) }
+            // Strip ghost emoji prefix (default Ghostty window title)
+            if t.hasPrefix("\u{1F47B} ") { t = String(t.dropFirst(3)) }
+            // If title is just "Ghostty" or empty after stripping, use directory name
+            if t.isEmpty || t == "Ghostty" {
+                if let dir = directoryName { return dir }
+            }
+            return t
         }
 
         static func == (lhs: TabItem, rhs: TabItem) -> Bool {
@@ -35,11 +48,60 @@ class SidebarTabManager: ObservableObject {
                 && lhs.needsAttention == rhs.needsAttention
                 && lhs.tabColor == rhs.tabColor
                 && lhs.faviconImage === rhs.faviconImage
+                && lhs.projectRoot == rhs.projectRoot
+                && lhs.lastActivity == rhs.lastActivity
+        }
+    }
+
+    /// A group of tabs sharing the same project root.
+    struct ProjectGroup: Identifiable, Equatable {
+        let id: String  // projectRoot path, or "__other__" for ungrouped
+        let name: String
+        let projectRoot: String?
+        let tabs: [TabItem]
+        let faviconImage: NSImage?
+        /// Aggregated git diff stats across all tabs in this project.
+        let gitDiffStats: String?
+
+        /// Whether this is the "Other" group for ungrouped tabs.
+        var isOtherGroup: Bool { id == "__other__" }
+
+        static func == (lhs: ProjectGroup, rhs: ProjectGroup) -> Bool {
+            lhs.id == rhs.id && lhs.name == rhs.name
+                && lhs.tabs == rhs.tabs
+                && lhs.faviconImage === rhs.faviconImage
+                && lhs.gitDiffStats == rhs.gitDiffStats
         }
     }
 
     @Published var tabs: [TabItem] = []
+    @Published var projectGroups: [ProjectGroup] = []
     @Published var selectedTabID: ObjectIdentifier?
+
+    /// Collapsed project group IDs, persisted to UserDefaults.
+    /// Always reads from UserDefaults so all SidebarTabManager instances
+    /// (one per tab window) stay in sync.
+    @Published var collapsedProjects: Set<String> = Set(
+        UserDefaults.standard.stringArray(forKey: "SidebarCollapsedProjects") ?? []
+    )
+
+    func toggleProjectCollapsed(_ groupId: String) {
+        if collapsedProjects.contains(groupId) {
+            collapsedProjects.remove(groupId)
+        } else {
+            collapsedProjects.insert(groupId)
+        }
+        UserDefaults.standard.set(Array(collapsedProjects), forKey: "SidebarCollapsedProjects")
+    }
+
+    /// Re-sync collapsed state from UserDefaults (called during refresh
+    /// so all tab managers agree on which projects are collapsed).
+    private func syncCollapsedProjects() {
+        let saved = Set(UserDefaults.standard.stringArray(forKey: "SidebarCollapsedProjects") ?? [])
+        if saved != collapsedProjects {
+            collapsedProjects = saved
+        }
+    }
 
     /// Windows that need attention, cleared when the tab is selected.
     private var attentionWindows: Set<ObjectIdentifier> = []
@@ -47,6 +109,10 @@ class SidebarTabManager: ObservableObject {
     /// Whether bells should trigger the sidebar attention indicator.
     /// Derived from `bell-features` containing `attention`.
     private let bellTriggersAttention: Bool
+
+    /// Cache of detected project roots keyed by pwd.
+    /// Static so all SidebarTabManager instances share it.
+    private static var projectRootCache: [String: String?] = [:]
 
     /// Cache of detected favicons keyed by pwd to avoid re-scanning every refresh.
     /// Static so all SidebarTabManager instances share it.
@@ -190,7 +256,8 @@ class SidebarTabManager: ObservableObject {
                 gitDiffStats: old.gitDiffStats, surfaceId: old.surfaceId,
                 statusEntries: old.statusEntries, needsAttention: false,
                 tabColor: old.tabColor, faviconImage: old.faviconImage,
-                window: old.window
+                window: old.window, projectRoot: old.projectRoot,
+                lastActivity: old.lastActivity
             )
         }
     }
@@ -236,6 +303,170 @@ class SidebarTabManager: ObservableObject {
 
         if insertions == 0 && deletions == 0 { return nil }
         return "+\(insertions) -\(deletions)"
+    }
+
+    // MARK: - Project Root Detection
+
+    /// Project root marker files, in priority order.
+    private static let projectRootMarkers = [
+        ".git", "package.json", "Cargo.toml", "go.mod",
+        "pyproject.toml", "Gemfile", "pom.xml", "build.gradle",
+    ]
+
+    /// Detect the project root for a given working directory by walking up the
+    /// directory tree looking for project root markers. Results are cached.
+    private func detectProjectRoot(at pwd: String) -> String? {
+        if let cached = Self.projectRootCache[pwd] {
+            return cached
+        }
+
+        let result = Self.findProjectRoot(at: pwd)
+        Self.projectRootCache[pwd] = result
+        return result
+    }
+
+    /// Walk up from `pwd` looking for a directory containing a project root marker.
+    nonisolated private static func findProjectRoot(at pwd: String) -> String? {
+        let fm = FileManager.default
+        var dir = pwd
+        while dir != "/" && dir.hasPrefix("/Users") {
+            for marker in projectRootMarkers {
+                let markerPath = (dir as NSString).appendingPathComponent(marker)
+                if fm.fileExists(atPath: markerPath) {
+                    return dir
+                }
+            }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        return nil
+    }
+
+    // MARK: - Project Grouping
+
+    /// Tracks when each tab's observable state last changed, for "Last activity" sorting.
+    /// Updated whenever title, pwd, or status entries change — NOT on tab selection.
+    private var lastActivityTime: [ObjectIdentifier: Date] = [:]
+
+    /// Previous state fingerprints per tab, used to detect real activity.
+    private var previousTabFingerprints: [ObjectIdentifier: Int] = [:]
+
+    /// Persisted manual ordering of project roots.
+    private var manualProjectOrder: [String] {
+        get { UserDefaults.standard.stringArray(forKey: "SidebarManualProjectOrder") ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: "SidebarManualProjectOrder") }
+    }
+
+    /// Tracks when each tab was first seen (created), for "Created at" sorting.
+    private var tabCreationTime: [ObjectIdentifier: Date] = [:]
+
+    /// Record creation time for a tab if not already tracked.
+    private func recordTabCreationTime(_ tabId: ObjectIdentifier) {
+        if tabCreationTime[tabId] == nil {
+            tabCreationTime[tabId] = Date()
+        }
+    }
+
+    /// Reorder a project group from one index to another (for manual sort).
+    func moveProjectGroup(fromId: String, toId: String) {
+        var order = manualProjectOrder
+        // Ensure all current groups are in the order list
+        let currentIds = projectGroups.filter({ !$0.isOtherGroup }).map(\.id)
+        for id in currentIds where !order.contains(id) {
+            order.append(id)
+        }
+        guard let fromIdx = order.firstIndex(of: fromId),
+              let toIdx = order.firstIndex(of: toId) else { return }
+        let item = order.remove(at: fromIdx)
+        order.insert(item, at: toIdx)
+        manualProjectOrder = order
+        projectGroups = buildProjectGroups(from: tabs)
+    }
+
+    /// Build project groups from the current tab list.
+    private func buildProjectGroups(from tabs: [TabItem]) -> [ProjectGroup] {
+        // Group tabs by project root, preserving tab order
+        var projectTabs: [String: [TabItem]] = [:]
+        var projectOrder: [String] = []  // stable insertion order
+        var otherTabs: [TabItem] = []
+
+        for tab in tabs {
+            if let root = tab.projectRoot {
+                if projectTabs[root] == nil {
+                    projectOrder.append(root)
+                }
+                projectTabs[root, default: []].append(tab)
+            } else {
+                otherTabs.append(tab)
+            }
+        }
+
+        var groups: [ProjectGroup] = []
+
+        // Build groups in stable insertion order (avoids Dictionary random iteration)
+        for root in projectOrder {
+            guard let rootTabs = projectTabs[root] else { continue }
+            let name = (root as NSString).lastPathComponent
+            let favicon = rootTabs.first?.faviconImage
+            let stats = rootTabs.first(where: { $0.pwd == root })?.gitDiffStats ?? rootTabs.first?.gitDiffStats
+
+            groups.append(ProjectGroup(
+                id: root,
+                name: name,
+                projectRoot: root,
+                tabs: rootTabs,
+                faviconImage: favicon,
+                gitDiffStats: stats
+            ))
+        }
+
+        // Sort groups based on selected sort mode
+        switch projectSortMode {
+        case .lastActivity:
+            groups.sort { a, b in
+                let aTime = a.tabs.compactMap({ lastActivityTime[$0.id] }).max() ?? .distantPast
+                let bTime = b.tabs.compactMap({ lastActivityTime[$0.id] }).max() ?? .distantPast
+                return aTime > bTime
+            }
+        case .createdAt:
+            // Sort by newest tab creation time per project (most recently created first).
+            groups.sort { a, b in
+                let aTime = a.tabs.compactMap({ tabCreationTime[$0.id] }).max() ?? .distantPast
+                let bTime = b.tabs.compactMap({ tabCreationTime[$0.id] }).max() ?? .distantPast
+                return aTime > bTime
+            }
+        case .manual:
+            // Ensure all current groups are in the persisted order
+            var order = manualProjectOrder
+            let currentIds = Set(groups.map(\.id))
+            var changed = false
+            for id in groups.map(\.id) where !order.contains(id) {
+                order.append(id)
+                changed = true
+            }
+            // Remove stale entries
+            order = order.filter { currentIds.contains($0) }
+            if changed { manualProjectOrder = order }
+
+            groups.sort { a, b in
+                let aIdx = order.firstIndex(of: a.id) ?? Int.max
+                let bIdx = order.firstIndex(of: b.id) ?? Int.max
+                return aIdx < bIdx
+            }
+        }
+
+        // Add "Other" group at the end always
+        if !otherTabs.isEmpty {
+            groups.append(ProjectGroup(
+                id: "__other__",
+                name: "Other",
+                projectRoot: nil,
+                tabs: otherTabs,
+                faviconImage: nil,
+                gitDiffStats: nil
+            ))
+        }
+
+        return groups
     }
 
     // MARK: - Favicon Detection
@@ -334,7 +565,7 @@ class SidebarTabManager: ObservableObject {
         guard FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let image = NSImage(data: data) else { return nil }
-        image.size = NSSize(width: 12, height: 12)
+        image.size = NSSize(width: 16, height: 16)
         return image
     }
 
@@ -624,7 +855,7 @@ class SidebarTabManager: ObservableObject {
         }
 
         guard let data = imageData, let image = NSImage(data: data) else { return nil }
-        image.size = NSSize(width: 12, height: 12)
+        image.size = NSSize(width: 16, height: 16)
         return image
     }
 
@@ -650,6 +881,9 @@ class SidebarTabManager: ObservableObject {
 
     private func refresh(reason: String) {
         guard let window else { return }
+
+        // Keep collapsed state in sync across all tab managers
+        syncCollapsedProjects()
 
         let tabWindows: [NSWindow]
         if let tabbedWindows = window.tabbedWindows, !tabbedWindows.isEmpty {
@@ -708,6 +942,7 @@ class SidebarTabManager: ObservableObject {
                 return detectFavicon(at: pwd)
             }
             let color = (w as? TerminalWindow)?.tabColor ?? .none
+            let projectRoot = pwd.flatMap { detectProjectRoot(at: $0) }
 
             if let p = pwd { tabPwds.append(p) }
 
@@ -721,8 +956,48 @@ class SidebarTabManager: ObservableObject {
                 needsAttention: attentionWindows.contains(wid),
                 tabColor: color,
                 faviconImage: favicon,
-                window: w
+                window: w,
+                projectRoot: projectRoot,
+                lastActivity: lastActivityTime[wid]
             )
+        }
+
+        // Detect real activity by comparing per-tab fingerprints.
+        // Activity = title, pwd, or status entries changed (not just tab selection).
+        // Persists to TabMetadataStore so timestamps survive app restarts.
+        let now = Date()
+        for tab in newTabs {
+            var hasher = Hasher()
+            hasher.combine(tab.title)
+            hasher.combine(tab.pwd)
+            for entry in tab.statusEntries where entry.key != "last-activity" {
+                hasher.combine(entry.key)
+                hasher.combine(entry.value)
+            }
+            let fp = hasher.finalize()
+            if let prev = previousTabFingerprints[tab.id] {
+                if prev != fp {
+                    lastActivityTime[tab.id] = now
+                    // Persist to disk so it survives restart
+                    if let sid = tab.surfaceId {
+                        metadataStore.setStatus(tabId: sid, key: "last-activity",
+                            value: String(Int(now.timeIntervalSince1970)))
+                    }
+                }
+            }
+            // First time seeing a tab: load persisted activity time or use creation order
+            if previousTabFingerprints[tab.id] == nil {
+                recordTabCreationTime(tab.id)
+                if let sid = tab.surfaceId,
+                   let entry = metadataStore.entries[sid]?["last-activity"],
+                   let epoch = Double(entry.value) {
+                    lastActivityTime[tab.id] = Date(timeIntervalSince1970: epoch)
+                } else {
+                    let idx = newTabs.firstIndex(where: { $0.id == tab.id }) ?? 0
+                    lastActivityTime[tab.id] = Date(timeIntervalSince1970: TimeInterval(idx))
+                }
+            }
+            previousTabFingerprints[tab.id] = fp
         }
 
         // Sweep stale Claude sessions (every 30s) — detects crashed Claude processes
@@ -782,12 +1057,294 @@ class SidebarTabManager: ObservableObject {
         let tabsChanged = newTabs != tabs
         if tabsChanged {
             tabs = newTabs
+            // Rebuild project groups whenever tabs change
+            projectGroups = buildProjectGroups(from: newTabs)
         }
 
         let currentSelectedID = ObjectIdentifier(selectedWindow)
         if selectedTabID != currentSelectedID {
             selectedTabID = currentSelectedID
         }
+    }
+
+    // MARK: - Sorting
+
+    enum SortMode: String, CaseIterable {
+        case manual = "Manual"
+        case createdAt = "Created at"
+        case lastActivity = "Last activity"
+    }
+
+    @Published var projectSortMode: SortMode = {
+        SortMode(rawValue: UserDefaults.standard.string(forKey: "SidebarProjectSort") ?? "") ?? .lastActivity
+    }()
+
+    func setProjectSortMode(_ mode: SortMode) {
+        projectSortMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "SidebarProjectSort")
+        // Rebuild groups with new sort order
+        projectGroups = buildProjectGroups(from: tabs)
+    }
+
+    // MARK: - Tool Launch
+
+    /// The CLI tools that can be auto-launched in a new tab.
+    enum SidebarTool: String, CaseIterable {
+        case terminal = "Terminal"
+        case claudeCode = "Claude Code"
+        case codex = "Codex"
+
+        var icon: String {
+            switch self {
+            case .terminal: return "terminal"
+            case .claudeCode: return "ClaudeIcon"
+            case .codex: return "CodexIcon"
+            }
+        }
+
+        var isCustomIcon: Bool {
+            switch self {
+            case .terminal: return false
+            case .claudeCode, .codex: return true
+            }
+        }
+
+        /// The shell command to launch this tool.
+        var launchCommand: String? {
+            switch self {
+            case .terminal: return nil
+            case .claudeCode: return "claude --dangerously-skip-permissions"
+            case .codex: return "codex --dangerously-bypass-approvals-and-sandbox"
+            }
+        }
+    }
+
+    /// Create a new tab, optionally in a project directory and/or running a tool.
+    func createNewTab(tool: SidebarTool = .terminal, projectRoot: String? = nil) {
+        guard let window,
+              let controller = window.windowController as? TerminalController else {
+            // Fallback: create a generic new tab
+            NSApp.sendAction(#selector(TerminalController.newTab(_:)), to: nil, from: nil)
+            return
+        }
+
+        var config = Ghostty.SurfaceConfiguration()
+        if let root = projectRoot {
+            config.workingDirectory = root
+        }
+        // Set the tool command as initialInput — this is fed directly into
+        // the PTY as stdin data, so the shell reads and executes it as if
+        // the user typed it and pressed Enter.
+        if let command = tool.launchCommand {
+            config.initialInput = command + "\n"
+        }
+
+        _ = TerminalController.newTab(
+            controller.ghostty,
+            from: window,
+            withBaseConfig: config
+        )
+    }
+
+    // MARK: - Session History
+
+    /// A recent session from Claude Code or Codex that can be resumed.
+    struct RecentSession: Identifiable {
+        let id: String  // session UUID
+        let title: String  // our generated title, or truncated first message (for display)
+        let fullTitle: String  // untruncated text (for tooltip)
+        let tool: SidebarTool
+        let projectPath: String  // the project directory
+        let timestamp: Date
+    }
+
+    /// Cached recent sessions per project root. Refreshed every 30 seconds in the background.
+    private var recentSessionsCache: [String: [RecentSession]] = [:]
+    private var recentSessionsCacheTime: Date = .distantPast
+    private static let recentSessionsCacheInterval: TimeInterval = 30.0
+
+    /// Returns cached recent sessions for a project. Triggers a background refresh if stale.
+    func cachedRecentSessions(forProjectRoot root: String?) -> [RecentSession] {
+        let key = root ?? "__other__"
+        if Date().timeIntervalSince(recentSessionsCacheTime) >= Self.recentSessionsCacheInterval {
+            recentSessionsCacheTime = Date()
+            // Refresh all project roots in the background
+            let roots = Set(projectGroups.compactMap(\.projectRoot))
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                var newCache: [String: [RecentSession]] = [:]
+                for r in roots {
+                    newCache[r] = self?.recentSessions(forProjectRoot: r) ?? []
+                }
+                DispatchQueue.main.async {
+                    self?.recentSessionsCache = newCache
+                }
+            }
+        }
+        return recentSessionsCache[key] ?? []
+    }
+
+    /// Scan Claude Code and Codex session files to find recent sessions for a project.
+    /// Returns up to `limit` sessions, most recent first.
+    /// NOTE: This does file I/O — call from a background thread or use cachedRecentSessions().
+    func recentSessions(forProjectRoot root: String?, limit: Int = 10) -> [RecentSession] {
+        var sessions: [RecentSession] = []
+        let fm = FileManager.default
+        let titleStoreBase = NSHomeDirectory() + "/Library/Application Support/com.mitchellh.ghostty"
+
+        // Scan Claude Code sessions
+        if let root {
+            let encodedPath = root.replacingOccurrences(of: "/", with: "-")
+            let claudeDir = NSHomeDirectory() + "/.claude/projects/" + encodedPath
+            let claudeTitleDir = titleStoreBase + "/claude-sessions"
+
+            if let files = try? fm.contentsOfDirectory(atPath: claudeDir) {
+                for file in files where file.hasSuffix(".jsonl") && !file.contains("subagents") {
+                    let sessionId = String(file.dropLast(6))  // remove .jsonl
+                    let filePath = (claudeDir as NSString).appendingPathComponent(file)
+
+                    // Get modification date as proxy for last activity
+                    guard let attrs = try? fm.attributesOfItem(atPath: filePath),
+                          let modDate = attrs[.modificationDate] as? Date else { continue }
+
+                    // Only include sessions from last 30 days
+                    guard Date().timeIntervalSince(modDate) < 30 * 24 * 3600 else { continue }
+
+                    // Check for our generated title first
+                    let titleFile = (claudeTitleDir as NSString).appendingPathComponent(sessionId + ".title")
+                    var title: String?
+                    if let savedTitle = try? String(contentsOfFile: titleFile, encoding: .utf8), !savedTitle.isEmpty {
+                        title = savedTitle
+                    }
+
+                    // Fall back to reading first user message from JSONL
+                    var fullText: String?
+                    if title == nil {
+                        fullText = Self.firstUserMessage(fromJSONL: filePath)
+                        if let ft = fullText {
+                            title = ft.count > 60 ? String(ft.prefix(57)) + "..." : ft
+                        }
+                    }
+
+                    guard let title, !title.isEmpty else { continue }
+                    // Skip title generation junk
+                    guard !title.contains("concise tab titles") && !title.contains("Return JSON") && !title.contains("Return ONLY") else { continue }
+
+                    sessions.append(RecentSession(
+                        id: sessionId, title: title, fullTitle: fullText ?? title,
+                        tool: .claudeCode, projectPath: root, timestamp: modDate
+                    ))
+                }
+            }
+        }
+
+        // Scan Codex sessions from SQLite database
+        if let root {
+            let codexDb = NSHomeDirectory() + "/.codex/state_5.sqlite"
+            let codexTitleDir = titleStoreBase + "/codex-sessions"
+            if fm.fileExists(atPath: codexDb) {
+                // Use sqlite3 CLI to query threads for this project
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+                process.arguments = [codexDb, "-json",
+                    "SELECT id, title, first_user_message, updated_at FROM threads WHERE cwd = '\(root.replacingOccurrences(of: "'", with: "''"))' AND archived = 0 ORDER BY updated_at DESC LIMIT \(limit)"]
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = Pipe()
+                if let _ = try? process.run() {
+                    process.waitUntilExit()
+                    if process.terminationStatus == 0,
+                       let data = try? pipe.fileHandleForReading.readDataToEndOfFile(),
+                       let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                        for row in rows {
+                            guard let sessionId = row["id"] as? String else { continue }
+                            let updatedAt = row["updated_at"] as? Double ?? 0
+                            let timestamp = Date(timeIntervalSince1970: updatedAt)
+                            guard Date().timeIntervalSince(timestamp) < 30 * 24 * 3600 else { continue }
+
+                            // Check for our generated title first
+                            let titleFile = (codexTitleDir as NSString).appendingPathComponent(sessionId + ".title")
+                            var title: String?
+                            var fullText: String?
+                            if let saved = try? String(contentsOfFile: titleFile, encoding: .utf8), !saved.isEmpty {
+                                title = saved
+                                fullText = saved
+                            }
+                            // Fall back to Codex's own title or first_user_message
+                            if title == nil {
+                                if let t = row["title"] as? String, !t.isEmpty {
+                                    fullText = t
+                                    title = t.count > 60 ? String(t.prefix(57)) + "..." : t
+                                } else if let msg = row["first_user_message"] as? String, !msg.isEmpty {
+                                    fullText = msg
+                                    title = msg.count > 60 ? String(msg.prefix(57)) + "..." : msg
+                                }
+                            }
+
+                            guard let title, !title.isEmpty else { continue }
+                            sessions.append(RecentSession(
+                                id: sessionId, title: title, fullTitle: fullText ?? title,
+                                tool: .codex, projectPath: root, timestamp: timestamp
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by most recent, take limit
+        sessions.sort { $0.timestamp > $1.timestamp }
+        return Array(sessions.prefix(limit))
+    }
+
+    /// Extract the first user message from a Claude Code JSONL session file.
+    /// Returns the full untruncated message text.
+    private static func firstUserMessage(fromJSONL path: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { handle.closeFile() }
+        // Read first 16KB to find the first user message
+        let data = handle.readData(ofLength: 16384)
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+
+        for line in text.components(separatedBy: "\n") {
+            guard !line.isEmpty else { continue }
+            guard let jsonData = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  obj["type"] as? String == "user" else { continue }
+
+            if let message = obj["message"] as? [String: Any],
+               let content = message["content"] as? String {
+                return content.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
+    }
+
+    /// Resume a specific session by creating a new tab and running the resume command.
+    func resumeSession(_ session: RecentSession, projectRoot: String?) {
+        guard let window,
+              let controller = window.windowController as? TerminalController else { return }
+
+        var config = Ghostty.SurfaceConfiguration()
+        if let root = projectRoot ?? session.projectPath as String? {
+            config.workingDirectory = root
+        }
+
+        let command: String
+        switch session.tool {
+        case .claudeCode:
+            command = "claude --resume \(session.id) --dangerously-skip-permissions"
+        case .codex:
+            command = "codex resume \(session.id) --dangerously-bypass-approvals-and-sandbox"
+        case .terminal:
+            return
+        }
+        config.initialInput = command + "\n"
+
+        _ = TerminalController.newTab(
+            controller.ghostty,
+            from: window,
+            withBaseConfig: config
+        )
     }
 
     // MARK: - Tab Actions

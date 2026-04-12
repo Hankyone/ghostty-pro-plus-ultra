@@ -1071,6 +1071,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         // Mark the window as using a sidebar so the native tab bar is hidden
+        // and the sidebar extends to the top of the window.
         if let terminalWindow = window as? TerminalWindow {
             terminalWindow.sidebarActive = true
         }
@@ -1118,8 +1119,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             sidebarHostingView.trailingAnchor.constraint(equalTo: sidebarEffectView.trailingAnchor),
         ])
 
-        // Build the split view: sidebar | terminal
-        let splitView = NSSplitView()
+        // Build the split view: sidebar | terminal.
+        // Uses a borderless split view so there's no visible divider line —
+        // the material contrast between the sidebar and terminal is sufficient.
+        let splitView = BorderlessSplitView()
         splitView.isVertical = true
         splitView.dividerStyle = .thin
         splitView.addSubview(sidebarEffectView)
@@ -1135,6 +1138,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         terminalContainer.frame = NSRect(x: sidebarWidth, y: 0, width: 600, height: 400)
 
         window.contentView = splitView
+        (window as? TerminalWindow)?.setSidebarTitlebarWidth(sidebarWidth)
 
         // If we have a default size, we want to apply it.
         if let defaultSize {
@@ -1232,6 +1236,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let width = sidebar.frame.width
         if width > 0 {
             UserDefaults.standard.set(width, forKey: "SidebarWidth")
+            (window as? TerminalWindow)?.setSidebarTitlebarWidth(width)
         }
     }
 
@@ -1306,6 +1311,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         if abs(sidebar.frame.width - targetWidth) > 1 {
             splitView.setPosition(targetWidth, ofDividerAt: 0)
         }
+        (window as? TerminalWindow)?.setSidebarTitlebarWidth(targetWidth)
     }
 
     override func windowDidResignKey(_ notification: Notification) {
@@ -1788,4 +1794,15 @@ extension TerminalController {
             return nil
         }
     }
+}
+
+// MARK: - BorderlessSplitView
+
+/// An NSSplitView subclass that draws no visible divider line.
+/// The sidebar's frosted glass material provides enough visual separation
+/// from the terminal pane, so no explicit divider is needed.
+/// The divider is still draggable for resizing — it's just invisible.
+private class BorderlessSplitView: NSSplitView {
+    override var dividerColor: NSColor { .clear }
+    override var dividerThickness: CGFloat { 1 }
 }

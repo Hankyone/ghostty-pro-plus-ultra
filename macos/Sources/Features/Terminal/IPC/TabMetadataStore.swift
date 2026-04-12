@@ -21,7 +21,7 @@ final class TabMetadataStore: ObservableObject {
     @Published private(set) var entries: [UUID: [String: StatusEntry]] = [:]
 
     /// Keys that are transient and should not be persisted to disk.
-    private static let transientKeys: Set<String> = ["claude-pid", "claude-active"]
+    private static let transientKeys: Set<String> = ["claude-pid", "claude-active", "codex-pid", "codex-active"]
 
     private var pendingSave: DispatchWorkItem?
 
@@ -59,25 +59,41 @@ final class TabMetadataStore: ObservableObject {
         scheduleSave()
     }
 
-    /// Sweep stale Claude sessions whose PIDs are no longer alive.
+    /// Sweep stale Claude and Codex sessions whose PIDs are no longer alive.
     /// Called periodically from SidebarTabManager.
-    func sweepStaleClaude() {
+    func sweepStaleSessions() {
         for (tabId, tabEntries) in entries {
-            guard let pidEntry = tabEntries["claude-pid"],
-                  let pid = Int32(pidEntry.value) else { continue }
-
-            // kill(pid, 0) checks if the process exists without sending a signal.
-            // Returns -1 with ESRCH if the process doesn't exist.
-            if kill(pid, 0) == -1 && errno == ESRCH {
-                // Process is dead — clean up all Claude-related entries
-                entries[tabId]?.removeValue(forKey: "claude")
-                entries[tabId]?.removeValue(forKey: "claude-active")
-                entries[tabId]?.removeValue(forKey: "claude-pid")
-                if entries[tabId]?.isEmpty == true {
-                    entries.removeValue(forKey: tabId)
+            // Sweep stale Claude sessions
+            if let pidEntry = tabEntries["claude-pid"],
+               let pid = Int32(pidEntry.value) {
+                // kill(pid, 0) checks if the process exists without sending a signal.
+                // Returns -1 with ESRCH if the process doesn't exist.
+                if kill(pid, 0) == -1 && errno == ESRCH {
+                    entries[tabId]?.removeValue(forKey: "claude")
+                    entries[tabId]?.removeValue(forKey: "claude-active")
+                    entries[tabId]?.removeValue(forKey: "claude-pid")
                 }
             }
+
+            // Sweep stale Codex sessions
+            if let pidEntry = tabEntries["codex-pid"],
+               let pid = Int32(pidEntry.value) {
+                if kill(pid, 0) == -1 && errno == ESRCH {
+                    entries[tabId]?.removeValue(forKey: "codex")
+                    entries[tabId]?.removeValue(forKey: "codex-active")
+                    entries[tabId]?.removeValue(forKey: "codex-pid")
+                }
+            }
+
+            if entries[tabId]?.isEmpty == true {
+                entries.removeValue(forKey: tabId)
+            }
         }
+    }
+
+    /// Legacy name — calls sweepStaleSessions().
+    func sweepStaleClaude() {
+        sweepStaleSessions()
     }
 
     /// Remove entries for surface UUIDs that no longer exist.

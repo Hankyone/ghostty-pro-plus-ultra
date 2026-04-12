@@ -144,9 +144,10 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
         completionHandler(window, nil)
 
-        // Auto-resume Claude Code sessions for all surfaces in this window.
+        // Auto-resume Claude Code and Codex sessions for all surfaces in this window.
         for surface in c.surfaceTree {
             attemptClaudeResume(for: surface)
+            attemptCodexResume(for: surface)
         }
 
         guard let mode = state.effectiveFullscreenMode, mode != .native else {
@@ -183,6 +184,30 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             surface.protectTitle()
             // Type the command but don't execute — let the user press Enter when ready.
             surface.sendText("claude --resume \(sessionId) --dangerously-skip-permissions")
+        }
+    }
+
+    /// Attempt to auto-resume a Codex session in a restored surface.
+    @MainActor
+    private static func attemptCodexResume(for surface: Ghostty.SurfaceView) {
+        let surfaceId = surface.id
+        let store = TabMetadataStore.shared
+
+        guard let sessionEntry = store.entries[surfaceId]?["codex-session"] else { return }
+        let sessionId = sessionEntry.value
+        guard !sessionId.isEmpty else { return }
+
+        // Validate session ID format
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
+
+        // Clear the entry so we don't retry on future restores.
+        store.clearStatus(tabId: surfaceId, key: "codex-session")
+
+        // Delay to let the shell initialize.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            surface.protectTitle()
+            surface.sendText("codex resume \(sessionId) --dangerously-bypass-approvals-and-sandbox")
         }
     }
 

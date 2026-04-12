@@ -58,110 +58,66 @@ enum SidebarField: String, Hashable {
 
 // MARK: - SidebarView
 
-/// A vertical sidebar that displays the list of tabs for the current window group.
+/// A vertical sidebar that displays tabs grouped by project, styled after T3 Code.
 struct SidebarView: View {
     @ObservedObject var tabManager: SidebarTabManager
     var theme: SidebarTheme
     var fields: Set<SidebarField> = SidebarField.defaultFields
 
-    @AppStorage("SidebarShowCardBorder") private var showCardBorder: Bool = true
     @State private var draggingTabID: ObjectIdentifier?
     @State private var dropTargetTabID: ObjectIdentifier?
     @State private var hoveredTabID: ObjectIdentifier?
+    @State private var hoveredGroupID: String?
     @State private var tabCardFrames: [ObjectIdentifier: CGRect] = [:]
+    @State private var draggingGroupID: String?
+    @State private var dropTargetGroupID: String?
     private static let scrollCoordinateSpace = "SidebarScrollCoordinateSpace"
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
-                ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                    SidebarTabCard(tab: tab, isSelected: tab.id == tabManager.selectedTabID, theme: theme, fields: fields, showCardBorder: showCardBorder, isHovered: hoveredTabID == tab.id)
-                        .contentShape(Rectangle())
-                        .onHover { isHovering in
-                            hoveredTabID = isHovering ? tab.id : nil
+            VStack(alignment: .leading, spacing: 0) {
+                // Top padding to clear the title bar / traffic lights area
+                Spacer().frame(height: 10)
+
+                // Sort control header
+                SidebarSortHeader(tabManager: tabManager, theme: theme)
+                    .padding(.bottom, 6)
+
+                ForEach(tabManager.projectGroups) { group in
+                    ProjectSection(
+                        group: group,
+                        tabManager: tabManager,
+                        theme: theme,
+                        fields: fields,
+                        draggingTabID: $draggingTabID,
+                        dropTargetTabID: $dropTargetTabID,
+                        hoveredTabID: $hoveredTabID,
+                        hoveredGroupID: $hoveredGroupID,
+                        tabCardFrames: $tabCardFrames,
+                        isCollapsed: tabManager.collapsedProjects.contains(group.id)
+                    )
+                    .opacity(draggingGroupID == group.id ? 0.4 : 1.0)
+                    .overlay(alignment: .top) {
+                        if dropTargetGroupID == group.id && draggingGroupID != group.id {
+                            Rectangle()
+                                .fill(Color.accentColor)
+                                .frame(height: 2)
+                                .offset(y: -1)
                         }
-                        .opacity(draggingTabID == tab.id ? 0.4 : 1.0)
-                        .overlay(alignment: .top) {
-                            if dropTargetTabID == tab.id && draggingTabID != tab.id {
-                                Rectangle()
-                                    .fill(Color.accentColor)
-                                    .frame(height: 2)
-                                    .offset(y: -3)
+                    }
+                    .if(tabManager.projectSortMode == .manual) { view in
+                        view
+                            .onDrag {
+                                draggingGroupID = group.id
+                                return NSItemProvider(object: group.id as NSString)
                             }
-                        }
-                        .onTapGesture {
-                            tabManager.selectTab(tab)
-                        }
-                        .background {
-                            GeometryReader { proxy in
-                                Color.clear.preference(
-                                    key: SidebarCardFramePreferenceKey.self,
-                                    value: [tab.id: proxy.frame(in: .named(Self.scrollCoordinateSpace))]
-                                )
-                            }
-                        }
-                        .overlay(MiddleClickOverlay {
-                            tabManager.closeTab(tab)
-                        })
-                        .onDrag {
-                            draggingTabID = tab.id
-                            return NSItemProvider(object: "\(index)" as NSString)
-                        }
-                        .onDrop(of: [UTType.text], delegate: TabDropDelegate(
-                            tabManager: tabManager,
-                            currentTab: tab,
-                            currentIndex: index,
-                            draggingTabID: $draggingTabID,
-                            dropTargetTabID: $dropTargetTabID
-                        ))
-                        .contextMenu {
-                            Button("Rename Tab...") {
-                                tabManager.promptRenameTab(tab)
-                            }
-
-                            Divider()
-
-                            Menu("Tab Color") {
-                                ForEach(TerminalTabColor.allCases, id: \.self) { color in
-                                    Button {
-                                        tabManager.setTabColor(color, for: tab)
-                                    } label: {
-                                        Label {
-                                            Text(color.localizedName)
-                                        } icon: {
-                                            Image(nsImage: color.swatchImage(selected: color == tab.tabColor))
-                                        }
-                                    }
-                                }
-                            }
-
-                            Toggle("Show Tab Border", isOn: $showCardBorder)
-
-                            if let pwd = tab.pwd {
-                                Button("Open in Finder") {
-                                    NSWorkspace.shared.open(URL(fileURLWithPath: pwd))
-                                }
-                            }
-
-                            Divider()
-
-                            Button("Close Tab") {
-                                tabManager.closeTab(tab)
-                            }
-
-                            Button("Close Other Tabs") {
-                                tabManager.closeOtherTabs(tab)
-                            }
-                            .disabled(tabManager.tabs.count <= 1)
-
-                            Button("Close Tabs to the Right") {
-                                tabManager.closeTabsToTheRight(of: tab)
-                            }
-                            .disabled({
-                                guard let idx = tabManager.tabs.firstIndex(where: { $0.id == tab.id }) else { return true }
-                                return idx >= tabManager.tabs.count - 1
-                            }())
-                        }
+                            .onDrop(of: [UTType.text], delegate: ProjectGroupDropDelegate(
+                                tabManager: tabManager,
+                                currentGroup: group,
+                                draggingGroupID: $draggingGroupID,
+                                dropTargetGroupID: $dropTargetGroupID
+                            ))
+                    }
                 }
             }
             .padding(.horizontal, 8)
@@ -180,6 +136,499 @@ struct SidebarView: View {
                 }
             }
         ))
+    }
+}
+
+// MARK: - ProjectSection
+
+/// A collapsible section for a project group with T3 Code-style vertical line indicator.
+private struct ProjectSection: View {
+    let group: SidebarTabManager.ProjectGroup
+    @ObservedObject var tabManager: SidebarTabManager
+    let theme: SidebarTheme
+    let fields: Set<SidebarField>
+    @Binding var draggingTabID: ObjectIdentifier?
+    @Binding var dropTargetTabID: ObjectIdentifier?
+    @Binding var hoveredTabID: ObjectIdentifier?
+    @Binding var hoveredGroupID: String?
+    @Binding var tabCardFrames: [ObjectIdentifier: CGRect]
+    let isCollapsed: Bool
+
+    /// The highest-priority status indicator across all tabs in this group.
+    private var aggregateStatus: AggregateGroupStatus? {
+        var hasPendingInput = false
+        var hasWorking = false
+        var hasDone = false
+        var hasAttention = false
+
+        for tab in group.tabs {
+            if let active = tab.statusEntries.first(where: { $0.key == "claude-active" || $0.key == "codex-active" }) {
+                switch active.value {
+                case "needs-input": hasPendingInput = true
+                case "done": hasDone = true
+                default: hasWorking = true
+                }
+            }
+            if tab.needsAttention { hasAttention = true }
+        }
+
+        if hasPendingInput { return .needsInput }
+        if hasWorking { return .working }
+        if hasAttention { return .attention }
+        if hasDone { return .done }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Project header
+            Button {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    tabManager.toggleProjectCollapsed(group.id)
+                }
+            } label: {
+                ProjectHeader(
+                    group: group,
+                    theme: theme,
+                    isCollapsed: isCollapsed,
+                    isHovered: hoveredGroupID == group.id,
+                    aggregateStatus: aggregateStatus,
+                    onNewTab: { tool in
+                        tabManager.createNewTab(tool: tool, projectRoot: group.projectRoot)
+                    },
+                    recentSessions: tabManager.cachedRecentSessions(forProjectRoot: group.projectRoot),
+                    onResumeSession: { session in
+                        tabManager.resumeSession(session, projectRoot: group.projectRoot)
+                    }
+                )
+            }
+            .buttonStyle(.plain)
+            .onHover { isHovering in
+                hoveredGroupID = isHovering ? group.id : nil
+            }
+
+            // Thread list with vertical line indicator
+            if !isCollapsed {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(group.tabs) { tab in
+                        threadRow(for: tab)
+                    }
+                }
+                .padding(.leading, 6)
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(theme.foreground.opacity(0.06))
+                        .frame(width: 1)
+                }
+                .padding(.leading, 4)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .padding(.bottom, 2)
+        .animation(.easeOut(duration: 0.18), value: isCollapsed)
+    }
+
+    @ViewBuilder
+    private func threadRow(for tab: SidebarTabManager.TabItem) -> some View {
+        let isSelected = tab.id == tabManager.selectedTabID
+        let isHovered = hoveredTabID == tab.id
+        let tabIndex = tabManager.tabs.firstIndex(where: { $0.id == tab.id }) ?? 0
+
+        let sessionTitleEntry = tab.statusEntries.first(where: { $0.key == "session-title" })
+        let sessionStatusEntry = tab.statusEntries.first(where: { $0.key == "claude" || $0.key == "codex" })
+        let activeEntry = tab.statusEntries.first(where: { $0.key == "claude-active" || $0.key == "codex-active" })
+        let titleColor = isSelected || isHovered ? theme.foreground : theme.secondaryText
+        let subtitleColor = isSelected || isHovered ? theme.foreground.opacity(0.7) : theme.secondaryText
+        let rowBackground = isSelected ? theme.foreground.opacity(0.06) : (isHovered ? theme.foreground.opacity(0.04) : Color.clear)
+
+        HStack(spacing: 0) {
+            // Tab color indicator — thin left bar
+            if let nsColor = tab.tabColor.displayColor {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color(nsColor: nsColor).opacity(isSelected ? 1.0 : 0.5))
+                    .frame(width: 3, height: 16)
+                    .padding(.trailing, 6)
+            }
+
+            // Title
+            let primaryTitle = sessionTitleEntry?.value ?? tab.displayTitle
+
+            Text(primaryTitle)
+                .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+                .foregroundColor(titleColor)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(primaryTitle)
+
+            // Relative time — "3m ago", "1h ago"
+            if let activity = tab.lastActivity {
+                Text(relativeTime(activity))
+                    .font(.system(size: 9))
+                    .foregroundColor(theme.secondaryText.opacity(0.5))
+                    .fixedSize()
+            }
+
+            // Status dot
+            if let activeEntry {
+                if activeEntry.value == "done" {
+                    Circle().fill(.green).frame(width: 6, height: 6)
+                } else if activeEntry.value == "needs-input" {
+                    PulsingDot(color: .orange, size: 6)
+                } else {
+                    PulsingDot(color: .accentColor, size: 6)
+                }
+            } else if tab.needsAttention && !isSelected {
+                Circle().fill(theme.attentionColor).frame(width: 6, height: 6)
+            }
+        }
+        .frame(height: 28)
+        .padding(.horizontal, 8)
+        .offset(x: -1)
+        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(rowBackground)
+        )
+        .onHover { hovering in
+            hoveredTabID = hovering ? tab.id : nil
+        }
+        .onTapGesture {
+            tabManager.selectTab(tab)
+        }
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: SidebarCardFramePreferenceKey.self,
+                    value: [tab.id: proxy.frame(in: .named("SidebarScrollCoordinateSpace"))]
+                )
+            }
+        }
+        .overlay(MiddleClickOverlay {
+            tabManager.closeTab(tab)
+        })
+        .onDrag {
+            draggingTabID = tab.id
+            return NSItemProvider(object: "\(tabIndex)" as NSString)
+        }
+        .onDrop(of: [UTType.text], delegate: TabDropDelegate(
+            tabManager: tabManager,
+            currentTab: tab,
+            currentIndex: tabIndex,
+            draggingTabID: $draggingTabID,
+            dropTargetTabID: $dropTargetTabID
+        ))
+        .opacity(draggingTabID == tab.id ? 0.4 : 1.0)
+        .overlay(alignment: .top) {
+            if dropTargetTabID == tab.id && draggingTabID != tab.id {
+                Rectangle()
+                    .fill(Color.accentColor)
+                    .frame(height: 2)
+                    .offset(y: -1)
+            }
+        }
+        .contextMenu {
+            Button("Rename Tab...") {
+                tabManager.promptRenameTab(tab)
+            }
+
+            Divider()
+
+            Menu("Tab Color") {
+                ForEach(TerminalTabColor.allCases, id: \.self) { color in
+                    Button {
+                        tabManager.setTabColor(color, for: tab)
+                    } label: {
+                        Label {
+                            Text(color.localizedName)
+                        } icon: {
+                            Image(nsImage: color.swatchImage(selected: color == tab.tabColor))
+                        }
+                    }
+                }
+            }
+
+            if let pwd = tab.pwd {
+                Button("Open in Finder") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: pwd))
+                }
+            }
+
+            Divider()
+
+            Button("Close Tab") {
+                tabManager.closeTab(tab)
+            }
+
+            Button("Close Other Tabs") {
+                tabManager.closeOtherTabs(tab)
+            }
+            .disabled(tabManager.tabs.count <= 1)
+
+            Button("Close Tabs to the Right") {
+                tabManager.closeTabsToTheRight(of: tab)
+            }
+            .disabled({
+                guard let idx = tabManager.tabs.firstIndex(where: { $0.id == tab.id }) else { return true }
+                return idx >= tabManager.tabs.count - 1
+            }())
+        }
+    }
+}
+
+// MARK: - AggregateGroupStatus
+
+private enum AggregateGroupStatus {
+    case needsInput
+    case working
+    case attention
+    case done
+
+    var color: Color {
+        switch self {
+        case .needsInput: return .orange
+        case .working: return .accentColor
+        case .attention: return .orange
+        case .done: return .green
+        }
+    }
+
+    var shouldPulse: Bool {
+        switch self {
+        case .working: return true
+        default: return false
+        }
+    }
+}
+
+// MARK: - ProjectHeader
+
+/// The header row for a project group — matches T3 Code's compact header style.
+private struct ProjectHeader: View {
+    let group: SidebarTabManager.ProjectGroup
+    let theme: SidebarTheme
+    let isCollapsed: Bool
+    let isHovered: Bool
+    let aggregateStatus: AggregateGroupStatus?
+    var onNewTab: ((SidebarTabManager.SidebarTool) -> Void)? = nil
+    var recentSessions: [SidebarTabManager.RecentSession] = []
+    var onResumeSession: ((SidebarTabManager.RecentSession) -> Void)? = nil
+    @State private var isNewTabHovered = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // Collapse chevron — 14px, rotates 90° on expand
+            Image(systemName: "chevron.right")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(theme.secondaryText.opacity(0.7))
+                .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                .animation(.easeInOut(duration: 0.15), value: isCollapsed)
+                .frame(width: 14, height: 14)
+
+            // Favicon or folder icon
+            if let favicon = group.faviconImage {
+                Image(nsImage: favicon)
+                    .resizable()
+                    .interpolation(.high)
+                    .antialiased(true)
+                    .frame(width: 16, height: 16)
+            } else if !group.isOtherGroup {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(theme.secondaryText)
+            } else {
+                Image(systemName: "terminal")
+                    .font(.system(size: 11))
+                    .foregroundColor(theme.secondaryText)
+            }
+
+            // Project name
+            Text(group.name)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(theme.foreground.opacity(0.9))
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            Spacer()
+
+            // Git diff stats
+            if let stats = group.gitDiffStats {
+                Text(stats)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(theme.secondaryText)
+            }
+
+            // Aggregate status indicator
+            if let status = aggregateStatus {
+                if status.shouldPulse {
+                    PulsingDot(color: status.color, size: 7)
+                } else {
+                    Circle()
+                        .fill(status.color)
+                        .frame(width: 7, height: 7)
+                }
+            }
+
+            if let onNewTab {
+                Menu {
+                    // New session options
+                    ForEach(SidebarTabManager.SidebarTool.allCases, id: \.self) { tool in
+                        Button {
+                            onNewTab(tool)
+                        } label: {
+                            HStack(spacing: 6) {
+                                SidebarToolMenuIcon(tool: tool)
+                                Text(tool.rawValue)
+                            }
+                        }
+                    }
+
+                    // Recent sessions to resume
+                    if !recentSessions.isEmpty, let onResumeSession {
+                        Divider()
+                        Text("Resume Session")
+                            .font(.caption)
+                        ForEach(recentSessions) { session in
+                            Button {
+                                onResumeSession(session)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    SidebarToolMenuIcon(tool: session.tool)
+                                    Text(session.title)
+                                        .lineLimit(1)
+                                        .help(session.fullTitle)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    ZStack {
+                        Color.clear
+                        Image(systemName: "square.and.pencil")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(isNewTabHovered ? theme.foreground : theme.foreground.opacity(0.7))
+                    }
+                    .frame(width: 20, height: 20)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .opacity(isHovered ? 1 : 0)
+                .allowsHitTesting(isHovered)
+                .animation(.easeInOut(duration: 0.15), value: isHovered)
+                .onHover { hovering in
+                    isNewTabHovered = hovering
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .frame(height: 28)
+        .padding(.horizontal, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isHovered ? theme.foreground.opacity(0.04) : Color.clear)
+        )
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
+    }
+}
+
+private struct SidebarToolMenuIcon: View {
+    let tool: SidebarTabManager.SidebarTool
+
+    var body: some View {
+        Group {
+            if tool.isCustomIcon {
+                Image(tool.icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 14, height: 14)
+            } else {
+                Image(systemName: tool.icon)
+                    .font(.system(size: 14, weight: .medium))
+            }
+        }
+    }
+}
+
+// MARK: - ProjectGroupDropDelegate
+
+private struct ProjectGroupDropDelegate: DropDelegate {
+    let tabManager: SidebarTabManager
+    let currentGroup: SidebarTabManager.ProjectGroup
+    @Binding var draggingGroupID: String?
+    @Binding var dropTargetGroupID: String?
+
+    func dropEntered(info: DropInfo) {
+        dropTargetGroupID = currentGroup.id
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetGroupID == currentGroup.id {
+            dropTargetGroupID = nil
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        draggingGroupID != nil && draggingGroupID != currentGroup.id
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let draggingGroupID else { return false }
+
+        // Switch to manual sort mode and perform the move
+        tabManager.setProjectSortMode(.manual)
+        tabManager.moveProjectGroup(fromId: draggingGroupID, toId: currentGroup.id)
+
+        self.draggingGroupID = nil
+        self.dropTargetGroupID = nil
+        return true
+    }
+}
+
+// MARK: - SidebarSortHeader
+
+/// A compact header row with sort controls.
+private struct SidebarSortHeader: View {
+    @ObservedObject var tabManager: SidebarTabManager
+    let theme: SidebarTheme
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text("PROJECTS")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(theme.secondaryText.opacity(0.6))
+                .tracking(0.5)
+
+            Spacer()
+
+            Menu {
+                ForEach(SidebarTabManager.SortMode.allCases, id: \.self) { mode in
+                    Button {
+                        tabManager.setProjectSortMode(mode)
+                    } label: {
+                        HStack {
+                            Text(mode.rawValue)
+                            if tabManager.projectSortMode == mode {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.system(size: 9))
+                    .foregroundColor(theme.secondaryText.opacity(0.6))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 2)
     }
 }
 
@@ -222,154 +671,31 @@ private struct TabDropDelegate: DropDelegate {
     }
 }
 
-// MARK: - SidebarTabCard
+// MARK: - Relative Time Helper
 
-private struct SidebarTabCard: View {
-    let tab: SidebarTabManager.TabItem
-    let isSelected: Bool
-    let theme: SidebarTheme
-    let fields: Set<SidebarField>
-    var showCardBorder: Bool = true
-    var isHovered: Bool = false
+/// Format a date as a relative time string: "now", "3m", "1h", "2d"
+private func relativeTime(_ date: Date) -> String {
+    let seconds = Int(Date().timeIntervalSince(date))
+    if seconds < 60 { return "now" }
+    let minutes = seconds / 60
+    if minutes < 60 { return "\(minutes)m" }
+    let hours = minutes / 60
+    if hours < 24 { return "\(hours)h" }
+    let days = hours / 24
+    return "\(days)d"
+}
 
-    private static let cardRadius: CGFloat = 8
+// MARK: - Conditional View Modifier
 
-    /// The accent color for the left border strip.
-    /// Full intensity for the selected tab, dimmed for inactive tabs.
-    private var accentColor: Color {
-        if let nsColor = tab.tabColor.displayColor {
-            let base = Color(nsColor: nsColor)
-            return isSelected ? base : base.opacity(0.4)
+private extension View {
+    /// Apply a modifier only when a condition is true.
+    @ViewBuilder
+    func `if`<Content: View>(_ condition: Bool, transform: (Self) -> Content) -> some View {
+        if condition {
+            transform(self)
+        } else {
+            self
         }
-        return Color(nsColor: .separatorColor).opacity(isSelected ? 0.3 : 0.15)
-    }
-
-    /// The border color for the thin card border — always neutral gray.
-    private var cardBorderColor: Color {
-        Color(nsColor: .separatorColor).opacity(0.3)
-    }
-
-    var body: some View {
-        HStack(spacing: 0) {
-            // Left color accent strip — uses UnevenRoundedRectangle so it
-            // follows the card's left-side rounding while staying flat on the right.
-            UnevenRoundedRectangle(
-                topLeadingRadius: Self.cardRadius,
-                bottomLeadingRadius: Self.cardRadius,
-                bottomTrailingRadius: 0,
-                topTrailingRadius: 0
-            )
-            .fill(accentColor)
-            .frame(width: 5)
-
-            VStack(alignment: .leading, spacing: 4) {
-                // Title (always shown — attention dot lives here)
-                if fields.contains(.title) {
-                    HStack(spacing: 6) {
-                        Text(tab.displayTitle)
-                            .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .foregroundColor(isSelected ? theme.foreground : theme.secondaryText)
-
-                        Spacer()
-
-                        if let activeEntry = tab.statusEntries.first(where: { $0.key == "claude-active" }) {
-                            if activeEntry.value == "done" {
-                                Circle()
-                                    .fill(.green)
-                                    .frame(width: 8, height: 8)
-                            } else if activeEntry.value == "needs-input" {
-                                PulsingDot(color: .orange)
-                            } else {
-                                PulsingDot(color: .accentColor)
-                            }
-                        } else if tab.needsAttention && !isSelected {
-                            Circle()
-                                .fill(theme.attentionColor)
-                                .frame(width: 8, height: 8)
-                        }
-                    }
-                }
-
-                // Directory name + git diff stats
-                if fields.contains(.directory), let dir = tab.directoryName {
-                    HStack(spacing: 4) {
-                        if let favicon = tab.faviconImage {
-                            Image(nsImage: favicon)
-                                .resizable()
-                                .interpolation(.high)
-                                .frame(width: 11, height: 11)
-                        } else {
-                            Image(systemName: "folder")
-                                .font(.system(size: 9))
-                                .foregroundColor(theme.secondaryText)
-                        }
-                        Text(dir)
-                            .font(.system(size: 10))
-                            .foregroundColor(theme.secondaryText)
-                            .lineLimit(1)
-
-                        if let stats = tab.gitDiffStats {
-                            Spacer()
-                            Text(stats)
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundColor(theme.secondaryText)
-                                .lineLimit(1)
-                        }
-                    }
-                }
-
-                // Claude session summary
-                if let claudeEntry = tab.statusEntries.first(where: { $0.key == "claude" }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: claudeEntry.icon ?? "bubble.left.fill")
-                            .font(.system(size: 9))
-                            .foregroundColor(theme.secondaryText)
-                        Text(claudeEntry.value)
-                            .font(.system(size: 10))
-                            .foregroundColor(theme.secondaryText)
-                            .lineLimit(2)
-                            .truncationMode(.tail)
-                    }
-                    .help(claudeEntry.value)
-                }
-
-                // Status entries (excluding "claude" which is shown in the branch slot)
-                if fields.contains(.status) {
-                    let filteredEntries = tab.statusEntries.filter { $0.key != "claude" && $0.key != "claude-active" && $0.key != "claude-pid" && $0.key != "claude-session" }
-                    ForEach(filteredEntries, id: \.key) { entry in
-                        HStack(spacing: 4) {
-                            if let icon = entry.icon {
-                                Image(systemName: icon)
-                                    .font(.system(size: 9))
-                                    .foregroundColor(theme.secondaryText)
-                            }
-                            Text(entry.value)
-                                .font(.system(size: 10))
-                                .foregroundColor(theme.secondaryText)
-                                .lineLimit(1)
-                        }
-                    }
-                }
-            }
-            .padding(.vertical, 8)
-            .padding(.leading, 8)
-            .padding(.trailing, 10)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: Self.cardRadius))
-        .background(
-            RoundedRectangle(cornerRadius: Self.cardRadius)
-                .fill(isSelected ? theme.activeTabBackground : (isHovered ? theme.foreground.opacity(0.06) : Color.clear))
-        )
-        .overlay(
-            Group {
-                if showCardBorder {
-                    RoundedRectangle(cornerRadius: Self.cardRadius)
-                        .strokeBorder(cardBorderColor, lineWidth: 1)
-                }
-            }
-        )
     }
 }
 
@@ -398,8 +724,6 @@ private struct MiddleClickOverlay: NSViewRepresentable {
         required init?(coder: NSCoder) { fatalError() }
 
         override func hitTest(_ point: NSPoint) -> NSView? {
-            // Only intercept middle-click events; pass everything else through
-            // so SwiftUI gestures (tap, hover, drag) work normally.
             if let event = NSApp.currentEvent,
                event.type == .otherMouseDown || event.type == .otherMouseUp {
                 return super.hitTest(point)
@@ -428,10 +752,7 @@ private struct SidebarCardFramePreferenceKey: PreferenceKey {
 // MARK: - DoubleClickOverlay
 
 /// Transparent NSView overlay that monitors double-click events via an event
-/// monitor, bypassing SwiftUI's gesture system entirely. The view itself is
-/// completely transparent (hitTest always returns nil), so it has zero impact
-/// on layout or rendering. Double-clicks on blank space create a new tab;
-/// double-clicks on a tab card trigger rename.
+/// monitor, bypassing SwiftUI's gesture system entirely.
 private struct DoubleClickOverlay: NSViewRepresentable {
     var tabCardFrames: [ObjectIdentifier: CGRect]
     var onBlankSpaceDoubleClick: () -> Void
@@ -491,7 +812,6 @@ private struct DoubleClickOverlay: NSViewRepresentable {
             let locationInView = convert(event.locationInWindow, from: nil)
             guard bounds.contains(locationInView) else { return }
 
-            // Check if the double-click landed on a tab card.
             if let (tabID, _) = tabCardFrames.first(where: { $0.value.contains(locationInView) }) {
                 onTabDoubleClick(tabID)
             } else {
@@ -500,7 +820,7 @@ private struct DoubleClickOverlay: NSViewRepresentable {
         }
 
         override func hitTest(_ point: NSPoint) -> NSView? {
-            return nil // Completely transparent
+            return nil
         }
 
         deinit {
@@ -513,16 +833,16 @@ private struct DoubleClickOverlay: NSViewRepresentable {
 
 // MARK: - PulsingDot
 
-/// Animated pulsing dot that indicates Claude Code is actively working.
-/// Runs as a SwiftUI animation, so it stays animated even when the tab is not focused.
-private struct PulsingDot: View {
+/// Animated pulsing dot indicator.
+struct PulsingDot: View {
     let color: Color
+    var size: CGFloat = 8
     @State private var isPulsing = false
 
     var body: some View {
         Circle()
             .fill(color)
-            .frame(width: 8, height: 8)
+            .frame(width: size, height: size)
             .opacity(isPulsing ? 0.3 : 1.0)
             .animation(
                 .easeInOut(duration: 0.8).repeatForever(autoreverses: true),
