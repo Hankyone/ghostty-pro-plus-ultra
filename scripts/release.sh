@@ -138,12 +138,14 @@ echo "==> Notarization complete."
 
 # --- Sparkle appcast ---
 echo "==> Generating Sparkle appcast..."
-if [ ! -x /tmp/sparkle/bin/sign_update ]; then
-    echo "ERROR: /tmp/sparkle/bin/sign_update not found. Install it:"
-    echo "  mkdir -p /tmp/sparkle/bin && cp ~/Library/Developer/Xcode/DerivedData/Ghostty-*/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update /tmp/sparkle/bin/"
+# Resolve sign_update from Xcode's SPM-managed Sparkle package (no temp files)
+SIGN_UPDATE=$(find ~/Library/Developer/Xcode/DerivedData/Ghostty-*/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update -maxdepth 0 2>/dev/null | head -1)
+if [ -z "$SIGN_UPDATE" ] || [ ! -x "$SIGN_UPDATE" ]; then
+    echo "ERROR: Sparkle sign_update not found in Xcode DerivedData."
+    echo "       Build the project in Xcode first so SPM resolves the Sparkle package."
     exit 1
 fi
-SPARKLE_SIG=$(/tmp/sparkle/bin/sign_update "$DMG_NAME")
+SPARKLE_SIG=$("$SIGN_UPDATE" "$DMG_NAME")
 if [ -z "$SPARKLE_SIG" ]; then
     echo "ERROR: sign_update returned empty signature"
     exit 1
