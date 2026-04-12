@@ -12,7 +12,7 @@
       <sparkle:shortVersionString>1.0.4</sparkle:shortVersionString>
       <enclosure
         url="https://github.com/Hankyone/ghostty-pro-plus-ultra/releases/download/ppu-v1.0.4/GhosttyProPlusUltra-1.0.4.dmg"
-        
+        sparkle:edSignature="dpzRYp+bkQKKiFWcaNyqwgIctVW8sI4J86ZtB7lD5CQPxwByuvZRTcY5sSh0hBNov10fHLJMTLIhdXyMhJk7Dg==" length="33899745"
         type="application/octet-stream" />
     </item>
   </channel>
