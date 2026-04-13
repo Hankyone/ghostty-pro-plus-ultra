@@ -442,13 +442,16 @@ class SidebarTabManager: ObservableObject {
                     let bTime = tabCreationTime[b.id] ?? .distantPast
                     return aTime < bTime
                 }
-            case .lastActivity, .manual:
+            case .lastActivity:
                 // Most recently active tab on top
                 rootTabs.sort { a, b in
                     let aTime = lastActivityTime[a.id] ?? .distantPast
                     let bTime = lastActivityTime[b.id] ?? .distantPast
                     return aTime > bTime
                 }
+            case .manual:
+                // Preserve tab strip order — no sorting
+                break
             }
 
             let name = (root as NSString).lastPathComponent
@@ -512,12 +515,14 @@ class SidebarTabManager: ObservableObject {
                     let bTime = tabCreationTime[b.id] ?? .distantPast
                     return aTime < bTime
                 }
-            case .lastActivity, .manual:
+            case .lastActivity:
                 otherTabs.sort { a, b in
                     let aTime = lastActivityTime[a.id] ?? .distantPast
                     let bTime = lastActivityTime[b.id] ?? .distantPast
                     return aTime > bTime
                 }
+            case .manual:
+                break
             }
             groups.append(ProjectGroup(
                 id: "__other__",
