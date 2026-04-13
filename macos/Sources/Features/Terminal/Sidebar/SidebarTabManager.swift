@@ -360,9 +360,23 @@ class SidebarTabManager: ObservableObject {
     private var tabCreationTime: [ObjectIdentifier: Date] = [:]
 
     /// Record creation time for a tab if not already tracked.
-    private func recordTabCreationTime(_ tabId: ObjectIdentifier) {
-        if tabCreationTime[tabId] == nil {
-            tabCreationTime[tabId] = Date()
+    /// Persists to TabMetadataStore so the timestamp survives app restarts.
+    private func recordTabCreationTime(_ tabId: ObjectIdentifier, surfaceId: UUID?) {
+        guard tabCreationTime[tabId] == nil else { return }
+        let store = TabMetadataStore.shared
+        // Try to restore a persisted creation time first
+        if let sid = surfaceId,
+           let entry = store.entries[sid]?["tab-created-at"],
+           let epoch = Double(entry.value) {
+            tabCreationTime[tabId] = Date(timeIntervalSince1970: epoch)
+        } else {
+            let now = Date()
+            tabCreationTime[tabId] = now
+            // Persist so it survives restart
+            if let sid = surfaceId {
+                store.setStatus(tabId: sid, key: "tab-created-at",
+                    value: String(Int(now.timeIntervalSince1970)))
+            }
         }
     }
 
@@ -404,7 +418,26 @@ class SidebarTabManager: ObservableObject {
 
         // Build groups in stable insertion order (avoids Dictionary random iteration)
         for root in projectOrder {
-            guard let rootTabs = projectTabs[root] else { continue }
+            guard var rootTabs = projectTabs[root] else { continue }
+
+            // Sort tabs within the group based on the selected sort mode.
+            switch projectSortMode {
+            case .createdAt:
+                // Stable creation order — oldest tab first (top)
+                rootTabs.sort { a, b in
+                    let aTime = tabCreationTime[a.id] ?? .distantPast
+                    let bTime = tabCreationTime[b.id] ?? .distantPast
+                    return aTime < bTime
+                }
+            case .lastActivity, .manual:
+                // Most recently active tab on top
+                rootTabs.sort { a, b in
+                    let aTime = lastActivityTime[a.id] ?? .distantPast
+                    let bTime = lastActivityTime[b.id] ?? .distantPast
+                    return aTime > bTime
+                }
+            }
+
             let name = (root as NSString).lastPathComponent
             let favicon = rootTabs.first?.faviconImage
             let stats = rootTabs.first(where: { $0.pwd == root })?.gitDiffStats ?? rootTabs.first?.gitDiffStats
@@ -428,11 +461,13 @@ class SidebarTabManager: ObservableObject {
                 return aTime > bTime
             }
         case .createdAt:
-            // Sort by newest tab creation time per project (most recently created first).
+            // Sort by earliest tab creation time per project (oldest project first).
+            // This produces a stable order — creating a new tab in an existing
+            // project does NOT change the project's position.
             groups.sort { a, b in
-                let aTime = a.tabs.compactMap({ tabCreationTime[$0.id] }).max() ?? .distantPast
-                let bTime = b.tabs.compactMap({ tabCreationTime[$0.id] }).max() ?? .distantPast
-                return aTime > bTime
+                let aTime = a.tabs.compactMap({ tabCreationTime[$0.id] }).min() ?? .distantPast
+                let bTime = b.tabs.compactMap({ tabCreationTime[$0.id] }).min() ?? .distantPast
+                return aTime < bTime
             }
         case .manual:
             // Ensure all current groups are in the persisted order
@@ -456,6 +491,21 @@ class SidebarTabManager: ObservableObject {
 
         // Add "Other" group at the end always
         if !otherTabs.isEmpty {
+            // Sort tabs in "Other" group using the same mode as project groups
+            switch projectSortMode {
+            case .createdAt:
+                otherTabs.sort { a, b in
+                    let aTime = tabCreationTime[a.id] ?? .distantPast
+                    let bTime = tabCreationTime[b.id] ?? .distantPast
+                    return aTime < bTime
+                }
+            case .lastActivity, .manual:
+                otherTabs.sort { a, b in
+                    let aTime = lastActivityTime[a.id] ?? .distantPast
+                    let bTime = lastActivityTime[b.id] ?? .distantPast
+                    return aTime > bTime
+                }
+            }
             groups.append(ProjectGroup(
                 id: "__other__",
                 name: "Other",
@@ -988,18 +1038,25 @@ class SidebarTabManager: ObservableObject {
             }
             // First time seeing a tab: load persisted activity time or use creation order
             if previousTabFingerprints[tab.id] == nil {
-                recordTabCreationTime(tab.id)
+                recordTabCreationTime(tab.id, surfaceId: tab.surfaceId)
                 if let sid = tab.surfaceId,
                    let entry = metadataStore.entries[sid]?["last-activity"],
                    let epoch = Double(entry.value) {
                     lastActivityTime[tab.id] = Date(timeIntervalSince1970: epoch)
                 } else {
-                    let idx = newTabs.firstIndex(where: { $0.id == tab.id }) ?? 0
-                    lastActivityTime[tab.id] = Date(timeIntervalSince1970: TimeInterval(idx))
+                    // No persisted activity time — use creation time as initial
+                    // activity so the tab sorts predictably without garbage dates.
+                    lastActivityTime[tab.id] = tabCreationTime[tab.id] ?? Date()
                 }
             }
             previousTabFingerprints[tab.id] = fp
         }
+
+        // Clean up in-memory timestamps for closed tabs
+        let currentTabIds = Set(newTabs.map(\.id))
+        lastActivityTime = lastActivityTime.filter { currentTabIds.contains($0.key) }
+        tabCreationTime = tabCreationTime.filter { currentTabIds.contains($0.key) }
+        previousTabFingerprints = previousTabFingerprints.filter { currentTabIds.contains($0.key) }
 
         // Sweep stale Claude sessions (every 30s) — detects crashed Claude processes
         if Date().timeIntervalSince(lastPidSweepTime) >= Self.pidSweepInterval {
@@ -1351,11 +1408,22 @@ class SidebarTabManager: ObservableObject {
         }
         config.initialInput = command + "\n"
 
-        _ = TerminalController.newTab(
+        let newController = TerminalController.newTab(
             controller.ghostty,
             from: window,
             withBaseConfig: config
         )
+
+        // Carry the session name to the new tab so it immediately shows
+        // the right title instead of waiting for hooks to regenerate it.
+        if let surface = newController?.focusedSurface {
+            TabMetadataStore.shared.setStatus(
+                tabId: surface.id,
+                key: "session-title",
+                value: session.fullTitle,
+                icon: "text.bubble"
+            )
+        }
     }
 
     // MARK: - Tab Actions

@@ -144,10 +144,12 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
         completionHandler(window, nil)
 
-        // Auto-resume Claude Code and Codex sessions for all surfaces in this window.
+        // Auto-resume Claude Code or Codex sessions for all surfaces in this window.
+        // A surface can only have one active session type — if both keys exist
+        // (e.g. user switched from Claude to Codex), prefer the most recent by
+        // checking Codex first (later session overwrites earlier).
         for surface in c.surfaceTree {
-            attemptClaudeResume(for: surface)
-            attemptCodexResume(for: surface)
+            attemptSessionResume(for: surface)
         }
 
         guard let mode = state.effectiveFullscreenMode, mode != .native else {
@@ -159,55 +161,61 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         c.toggleFullscreen(mode: mode)
     }
 
-    /// Attempt to auto-resume a Claude Code session in a restored surface.
-    /// Looks up the persisted `claude-session` entry, validates it, and sends
-    /// `claude --resume <id>` after a delay to let the shell initialize.
+    /// Attempt to auto-resume a Claude Code or Codex session in a restored surface.
+    /// A surface can only resume ONE session type. If both keys exist (user switched
+    /// tools in the same tab), we pick the Codex session since it was set later.
     @MainActor
-    private static func attemptClaudeResume(for surface: Ghostty.SurfaceView) {
+    private static func attemptSessionResume(for surface: Ghostty.SurfaceView) {
         let surfaceId = surface.id
         let store = TabMetadataStore.shared
 
-        guard let sessionEntry = store.entries[surfaceId]?["claude-session"] else { return }
-        let sessionId = sessionEntry.value
-        guard !sessionId.isEmpty else { return }
+        let claudeEntry = store.entries[surfaceId]?["claude-session"]
+        let codexEntry = store.entries[surfaceId]?["codex-session"]
+
+        // Determine which session to resume. If both exist, prefer Codex
+        // (the later tool overwrites the earlier). Otherwise pick whichever exists.
+        let sessionId: String
+        let command: String
+        if let codex = codexEntry, !codex.value.isEmpty {
+            sessionId = codex.value
+            command = "codex resume \(sessionId) --dangerously-bypass-approvals-and-sandbox"
+        } else if let claude = claudeEntry, !claude.value.isEmpty {
+            sessionId = claude.value
+            command = "claude --resume \(sessionId) --dangerously-skip-permissions"
+        } else {
+            return
+        }
 
         // Validate session ID format (alphanumeric + hyphens only) to prevent injection.
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
         guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
 
-        // Clear the entry so we don't retry on future restores.
+        // Clear both entries so we don't retry on future restores.
         store.clearStatus(tabId: surfaceId, key: "claude-session")
+        store.clearStatus(tabId: surfaceId, key: "codex-session")
+
+        // Ensure the session title is set on this surface. It may already be
+        // persisted in TabMetadataStore from the previous run, but if not,
+        // look up the cached .title file so the name follows the session.
+        if store.entries[surfaceId]?["session-title"] == nil {
+            let titleStoreBase = NSHomeDirectory() + "/Library/Application Support/com.mitchellh.ghostty"
+            let isCodex = codexEntry != nil && !(codexEntry?.value.isEmpty ?? true)
+            let subdir = isCodex ? "codex-sessions" : "claude-sessions"
+            let titleFile = (titleStoreBase as NSString)
+                .appendingPathComponent(subdir)
+                .appending("/\(sessionId).title")
+            if let savedTitle = try? String(contentsOfFile: titleFile, encoding: .utf8),
+               !savedTitle.isEmpty {
+                store.setStatus(tabId: surfaceId, key: "session-title",
+                    value: savedTitle, icon: "text.bubble")
+            }
+        }
 
         // Delay to let the shell initialize and display its prompt.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            // Protect the tab title so Claude Code's session name doesn't overwrite it.
             surface.protectTitle()
             // Type the command but don't execute — let the user press Enter when ready.
-            surface.sendText("claude --resume \(sessionId) --dangerously-skip-permissions")
-        }
-    }
-
-    /// Attempt to auto-resume a Codex session in a restored surface.
-    @MainActor
-    private static func attemptCodexResume(for surface: Ghostty.SurfaceView) {
-        let surfaceId = surface.id
-        let store = TabMetadataStore.shared
-
-        guard let sessionEntry = store.entries[surfaceId]?["codex-session"] else { return }
-        let sessionId = sessionEntry.value
-        guard !sessionId.isEmpty else { return }
-
-        // Validate session ID format
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-        guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
-
-        // Clear the entry so we don't retry on future restores.
-        store.clearStatus(tabId: surfaceId, key: "codex-session")
-
-        // Delay to let the shell initialize.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            surface.protectTitle()
-            surface.sendText("codex resume \(sessionId) --dangerously-bypass-approvals-and-sandbox")
+            surface.sendText(command)
         }
     }
 

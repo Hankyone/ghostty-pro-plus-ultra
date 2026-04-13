@@ -148,6 +148,10 @@ class AppDelegate: NSObject,
     /// The observer for the app appearance.
     private var appearanceObserver: NSKeyValueObservation?
 
+    /// Periodic timer that flushes restorable state to disk so a force-kill
+    /// or crash doesn't lose all window state (browser-like crash recovery).
+    private var stateFlushTimer: Timer?
+
     /// Signals
     private var signals: [DispatchSourceSignal] = []
 
@@ -337,6 +341,16 @@ class AppDelegate: NSObject,
                 }
             }
             TabMetadataStore.shared.pruneOrphanedEntries(liveSurfaceIds: liveSurfaceIds)
+        }
+
+        // Periodically flush restorable state to disk so a force-kill or crash
+        // doesn't lose all window state. AppKit only encodes state during
+        // graceful quit — this timer ensures state is written every 30 seconds.
+        stateFlushTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in
+            NSApp.invalidateRestorableState()
+            for window in NSApp.windows {
+                window.invalidateRestorableState()
+            }
         }
 
         switch Ghostty.launchSource {

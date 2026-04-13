@@ -29,9 +29,20 @@ final class TabMetadataStore: ObservableObject {
         loadFromDisk()
     }
 
+    /// Session keys that are mutually exclusive — setting one clears the other.
+    private static let exclusiveSessionKeys: [String: String] = [
+        "claude-session": "codex-session",
+        "codex-session": "claude-session",
+    ]
+
     func setStatus(tabId: UUID, key: String, value: String, icon: String? = nil) {
         if entries[tabId] == nil {
             entries[tabId] = [:]
+        }
+        // Session keys are mutually exclusive: setting one clears the other
+        // so a tab is always either Claude or Codex, never both.
+        if let conflicting = Self.exclusiveSessionKeys[key] {
+            entries[tabId]?.removeValue(forKey: conflicting)
         }
         entries[tabId]?[key] = StatusEntry(key: key, value: value, icon: icon)
         if !Self.transientKeys.contains(key) {
