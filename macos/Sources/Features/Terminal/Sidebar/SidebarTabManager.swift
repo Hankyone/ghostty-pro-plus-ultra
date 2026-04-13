@@ -1248,6 +1248,10 @@ class SidebarTabManager: ObservableObject {
             projectGroups = buildProjectGroups(from: newTabs)
         }
 
+        // Eagerly populate the recent sessions cache so it's always warm
+        // by the time the user opens the new-session menu.
+        refreshRecentSessions()
+
         let currentSelectedID = ObjectIdentifier(selectedWindow)
         if selectedTabID != currentSelectedID {
             selectedTabID = currentSelectedID
@@ -1343,35 +1347,42 @@ class SidebarTabManager: ObservableObject {
         let timestamp: Date
     }
 
-    /// Cached recent sessions per project root. Refreshed every 30 seconds in the background.
+    /// Cached recent sessions per project root. Refreshed every 30 seconds
+    /// as part of the timer-based refresh() cycle.
     @Published private var recentSessionsCache: [String: [RecentSession]] = [:]
     private var recentSessionsCacheTime: Date = .distantPast
     private static let recentSessionsCacheInterval: TimeInterval = 30.0
 
-    /// Returns cached recent sessions for a project. Triggers a background refresh if stale.
+    /// Returns cached recent sessions for a project. The cache is populated
+    /// eagerly by refreshRecentSessions() during the timer-based refresh cycle,
+    /// so this always returns immediately from the cache.
     func cachedRecentSessions(forProjectRoot root: String?) -> [RecentSession] {
         let key = root ?? "__other__"
-        if Date().timeIntervalSince(recentSessionsCacheTime) >= Self.recentSessionsCacheInterval {
-            recentSessionsCacheTime = Date()
-            // Refresh all project roots in the background
-            let roots = Set(projectGroups.compactMap(\.projectRoot))
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                var newCache: [String: [RecentSession]] = [:]
-                for r in roots {
-                    newCache[r] = self?.recentSessions(forProjectRoot: r) ?? []
-                }
-                DispatchQueue.main.async {
-                    self?.recentSessionsCache = newCache
-                }
+        return recentSessionsCache[key] ?? []
+    }
+
+    /// Refresh the recent sessions cache if stale. Called from refresh() so
+    /// the cache is populated before the view ever reads it.
+    private func refreshRecentSessions() {
+        guard Date().timeIntervalSince(recentSessionsCacheTime) >= Self.recentSessionsCacheInterval else { return }
+        recentSessionsCacheTime = Date()
+        let roots = Set(projectGroups.compactMap(\.projectRoot))
+        guard !roots.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var newCache: [String: [RecentSession]] = [:]
+            for r in roots {
+                newCache[r] = Self.scanRecentSessions(forProjectRoot: r)
+            }
+            DispatchQueue.main.async {
+                self?.recentSessionsCache = newCache
             }
         }
-        return recentSessionsCache[key] ?? []
     }
 
     /// Scan Claude Code and Codex session files to find recent sessions for a project.
     /// Returns up to `limit` sessions, most recent first.
-    /// NOTE: This does file I/O — call from a background thread or use cachedRecentSessions().
-    func recentSessions(forProjectRoot root: String?, limit: Int = 10) -> [RecentSession] {
+    /// This is nonisolated/static so it can safely run on any thread.
+    nonisolated private static func scanRecentSessions(forProjectRoot root: String?, limit: Int = 10) -> [RecentSession] {
         var sessions: [RecentSession] = []
         let fm = FileManager.default
         let titleStoreBase = NSHomeDirectory() + "/Library/Application Support/com.mitchellh.ghostty"
@@ -1483,7 +1494,7 @@ class SidebarTabManager: ObservableObject {
 
     /// Extract the first user message from a Claude Code JSONL session file.
     /// Returns the full untruncated message text.
-    private static func firstUserMessage(fromJSONL path: String) -> String? {
+    nonisolated private static func firstUserMessage(fromJSONL path: String) -> String? {
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { handle.closeFile() }
         // Read first 16KB to find the first user message
