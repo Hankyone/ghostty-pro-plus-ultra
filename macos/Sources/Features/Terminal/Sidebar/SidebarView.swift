@@ -759,7 +759,9 @@ private struct DoubleClickOverlay: NSViewRepresentable {
 
         private func handleMouseDown(_ event: NSEvent) {
             guard event.clickCount == 2,
-                  self.window?.isKeyWindow == true else { return }
+                  let myWindow = self.window,
+                  myWindow.isKeyWindow,
+                  event.window === myWindow else { return }
             let locationInView = convert(event.locationInWindow, from: nil)
             guard bounds.contains(locationInView) else { return }
 
