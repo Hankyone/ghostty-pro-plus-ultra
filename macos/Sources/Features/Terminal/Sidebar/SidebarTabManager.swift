@@ -157,9 +157,29 @@ class SidebarTabManager: ObservableObject {
     }
 
     /// Returns the logical tab order for the current tab group.
-    /// `NSWindow.tabbedWindows` can shift when the selected tab changes, while
-    /// `NSWindowTabGroup.windows` tracks the actual strip order we want to show.
+    /// AppKit's live window arrays can shift when the selected tab changes,
+    /// so we resolve them through a persisted surface-ID order first.
     private func orderedTabWindows(for window: NSWindow) -> [NSWindow] {
+        let rawWindows = appKitTabWindows(for: window)
+        let persistedOrder = syncManualTabOrder(with: rawWindows)
+        guard !persistedOrder.isEmpty else { return rawWindows }
+
+        let orderIndex = Dictionary(
+            uniqueKeysWithValues: persistedOrder.enumerated().map { ($0.element, $0.offset) }
+        )
+
+        return rawWindows.enumerated().sorted { lhs, rhs in
+            let lhsIndex = tabOrderKey(for: lhs.element).flatMap { orderIndex[$0] } ?? Int.max
+            let rhsIndex = tabOrderKey(for: rhs.element).flatMap { orderIndex[$0] } ?? Int.max
+            if lhsIndex != rhsIndex {
+                return lhsIndex < rhsIndex
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+    }
+
+    /// Returns AppKit's current tab group windows without any sidebar-specific ordering.
+    private func appKitTabWindows(for window: NSWindow) -> [NSWindow] {
         if let groupWindows = window.tabGroup?.windows, !groupWindows.isEmpty {
             return groupWindows
         }
@@ -369,8 +389,100 @@ class SidebarTabManager: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "SidebarManualProjectOrder") }
     }
 
+    /// Persisted manual ordering of tabs by surface UUID string.
+    private var manualTabOrder: [String] {
+        get { UserDefaults.standard.stringArray(forKey: "SidebarManualTabOrder") ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: "SidebarManualTabOrder") }
+    }
+
     /// Tracks when each tab was first seen (created), for "Created at" sorting.
     private var tabCreationTime: [ObjectIdentifier: Date] = [:]
+
+    /// Surface UUID string used for persisted tab ordering.
+    private func tabOrderKey(for window: NSWindow) -> String? {
+        guard let controller = window.windowController as? BaseTerminalController,
+              let surfaceId = controller.focusedSurface?.id else { return nil }
+        return surfaceId.uuidString
+    }
+
+    /// All currently-live tab surface IDs across the app.
+    private func allLiveTabOrderKeys() -> Set<String> {
+        Set(NSApp.windows.compactMap { tabOrderKey(for: $0) })
+    }
+
+    /// Prune closed tabs, de-duplicate persisted entries, and append newly seen tabs.
+    @discardableResult
+    private func syncManualTabOrder(with windows: [NSWindow]) -> [String] {
+        let liveGroupIds = windows.compactMap { tabOrderKey(for: $0) }
+        let allLiveIds = allLiveTabOrderKeys()
+
+        var changed = false
+        var seen = Set<String>()
+        var order: [String] = []
+
+        for id in manualTabOrder where allLiveIds.contains(id) && seen.insert(id).inserted {
+            order.append(id)
+        }
+        if order != manualTabOrder {
+            changed = true
+        }
+
+        for id in liveGroupIds where seen.insert(id).inserted {
+            order.append(id)
+            changed = true
+        }
+
+        if changed {
+            manualTabOrder = order
+        }
+
+        return order
+    }
+
+    /// Replace this tab group's slice of the persisted order after a drag reorder.
+    private func persistTabOrder(_ reorderedGroupIds: [String], for windows: [NSWindow]) {
+        guard !reorderedGroupIds.isEmpty else { return }
+
+        var order = syncManualTabOrder(with: windows)
+        let groupIdSet = Set(windows.compactMap { tabOrderKey(for: $0) })
+        let insertionIndex = order.firstIndex(where: { groupIdSet.contains($0) }) ?? order.count
+
+        order.removeAll { groupIdSet.contains($0) }
+        order.insert(contentsOf: reorderedGroupIds, at: insertionIndex)
+        manualTabOrder = order
+    }
+
+    /// Remove closed tabs from the persisted order immediately.
+    private func removeTabsFromManualOrder(_ ids: [String]) {
+        let idSet = Set(ids)
+        guard !idSet.isEmpty else { return }
+        let filtered = manualTabOrder.filter { !idSet.contains($0) }
+        if filtered != manualTabOrder {
+            manualTabOrder = filtered
+        }
+    }
+
+    /// Timer fingerprint built from stable tab ordering and per-tab observable state.
+    private func refreshFingerprint(for tabWindows: [NSWindow], metadataStore: TabMetadataStore) -> Int {
+        var hasher = Hasher()
+        hasher.combine(tabWindows.count)
+        hasher.combine(attentionWindows.count)
+        for window in tabWindows {
+            hasher.combine(tabOrderKey(for: window) ?? "window-\(ObjectIdentifier(window).hashValue)")
+            hasher.combine(window.title)
+            if let ctrl = window.windowController as? BaseTerminalController,
+               let surface = ctrl.focusedSurface {
+                hasher.combine(surface.id)
+                hasher.combine(surface.pwd)
+                for entry in metadataStore.statusEntries(for: surface.id) {
+                    hasher.combine(entry.key)
+                    hasher.combine(entry.value)
+                    hasher.combine(entry.icon)
+                }
+            }
+        }
+        return hasher.finalize()
+    }
 
     /// Record creation time for a tab if not already tracked.
     /// Persists to TabMetadataStore so the timestamp survives app restarts.
@@ -963,24 +1075,7 @@ class SidebarTabManager: ObservableObject {
         // their own interval), so we check them before the early return.
         let timerFingerprint: Int?
         if reason == "timer" {
-            var hasher = Hasher()
-            hasher.combine(tabWindows.count)
-            hasher.combine(attentionWindows.count)
-            for w in tabWindows {
-                hasher.combine(ObjectIdentifier(w))
-                hasher.combine(w.title)
-                if let ctrl = w.windowController as? BaseTerminalController,
-                   let surface = ctrl.focusedSurface {
-                    hasher.combine(surface.pwd)
-                    hasher.combine(surface.id)
-                    for entry in metadataStore.statusEntries(for: surface.id) {
-                        hasher.combine(entry.key)
-                        hasher.combine(entry.value)
-                        hasher.combine(entry.icon)
-                    }
-                }
-            }
-            timerFingerprint = hasher.finalize()
+            timerFingerprint = refreshFingerprint(for: tabWindows, metadataStore: metadataStore)
         } else {
             timerFingerprint = nil
         }
@@ -1155,9 +1250,7 @@ class SidebarTabManager: ObservableObject {
         case lastActivity = "Last activity"
     }
 
-    @Published var projectSortMode: SortMode = {
-        SortMode(rawValue: UserDefaults.standard.string(forKey: "SidebarProjectSort") ?? "") ?? .lastActivity
-    }()
+    @Published var projectSortMode: SortMode = .manual
 
     func setProjectSortMode(_ mode: SortMode) {
         projectSortMode = mode
@@ -1480,6 +1573,9 @@ class SidebarTabManager: ObservableObject {
 
     func closeTab(_ tab: TabItem) {
         guard let controller = tab.window.windowController as? TerminalController else { return }
+        if let surfaceId = tab.surfaceId?.uuidString {
+            removeTabsFromManualOrder([surfaceId])
+        }
         controller.closeTab(nil)
     }
 
@@ -1498,6 +1594,10 @@ class SidebarTabManager: ObservableObject {
         guard let window else { return }
         let tabWindows = orderedTabWindows(for: window)
         guard tabWindows.count > 1 else { return }
+        let idsToRemove = tabWindows
+            .filter { ObjectIdentifier($0) != tab.id }
+            .compactMap { tabOrderKey(for: $0) }
+        removeTabsFromManualOrder(idsToRemove)
         for w in tabWindows where ObjectIdentifier(w) != tab.id {
             if let controller = w.windowController as? TerminalController {
                 controller.closeTab(nil)
@@ -1515,10 +1615,23 @@ class SidebarTabManager: ObservableObject {
         let movingWindow = tabbedWindows[sourceIndex]
         let targetWindow = tabbedWindows[destinationIndex]
 
+        let reorderedGroupIds: [String]? = {
+            let ids = tabbedWindows.compactMap { tabOrderKey(for: $0) }
+            guard ids.count == tabbedWindows.count else { return nil }
+            var reordered = ids
+            let moved = reordered.remove(at: sourceIndex)
+            reordered.insert(moved, at: destinationIndex)
+            return reordered
+        }()
+
         if sourceIndex > destinationIndex {
             targetWindow.addTabbedWindow(movingWindow, ordered: .below)
         } else {
             targetWindow.addTabbedWindow(movingWindow, ordered: .above)
+        }
+
+        if let reorderedGroupIds {
+            persistTabOrder(reorderedGroupIds, for: tabbedWindows)
         }
 
         if let selectedWindow = window.tabGroup?.selectedWindow {
@@ -1533,7 +1646,9 @@ class SidebarTabManager: ObservableObject {
         let tabWindows = orderedTabWindows(for: window)
         guard tabWindows.count > 1 else { return }
         guard let idx = tabWindows.firstIndex(where: { ObjectIdentifier($0) == tab.id }) else { return }
-        for w in tabWindows[(idx + 1)...] {
+        let tabsToClose = Array(tabWindows[(idx + 1)...])
+        removeTabsFromManualOrder(tabsToClose.compactMap { tabOrderKey(for: $0) })
+        for w in tabsToClose {
             if let controller = w.windowController as? TerminalController {
                 controller.closeTab(nil)
             }
