@@ -401,6 +401,10 @@ class SidebarTabManager: ObservableObject {
     /// Tracks when each tab was first seen (created), for "Created at" sorting.
     private var tabCreationTime: [ObjectIdentifier: Date] = [:]
 
+    /// Tracks when each tab was first seen THIS SESSION (not persisted).
+    /// Used to ignore fingerprint changes during tab initialization.
+    private var tabFirstSeenTime: [ObjectIdentifier: Date] = [:]
+
     /// Surface UUID string used for persisted tab ordering.
     private func tabOrderKey(for window: NSWindow) -> String? {
         guard let controller = window.windowController as? BaseTerminalController,
@@ -1139,11 +1143,11 @@ class SidebarTabManager: ObservableObject {
             let fp = hasher.finalize()
             if let prev = previousTabFingerprints[tab.id] {
                 // Skip fingerprint changes during the first 5 seconds after a
-                // tab is first seen. After a restore, tabs initialize (shell
-                // prompt, pwd) which looks like a fingerprint change but isn't
-                // real user activity. Without this grace period, the persisted
-                // last-activity timestamp gets immediately overwritten with now.
-                let firstSeen = tabCreationTime[tab.id] ?? .distantPast
+                // tab is first seen this session. After a restore, tabs
+                // initialize (shell prompt, pwd) which looks like a fingerprint
+                // change but isn't real user activity. Without this grace
+                // period, the persisted last-activity gets overwritten with now.
+                let firstSeen = tabFirstSeenTime[tab.id] ?? .distantPast
                 let isInitializing = now.timeIntervalSince(firstSeen) < 5.0
 
                 if prev != fp && !isInitializing {
@@ -1172,6 +1176,7 @@ class SidebarTabManager: ObservableObject {
             }
             // First time seeing a tab: load persisted activity time or use creation order
             if previousTabFingerprints[tab.id] == nil {
+                tabFirstSeenTime[tab.id] = now
                 recordTabCreationTime(tab.id, surfaceId: tab.surfaceId)
                 if let sid = tab.surfaceId,
                    let entry = metadataStore.entries[sid]?["last-activity"],
@@ -1190,6 +1195,7 @@ class SidebarTabManager: ObservableObject {
         let currentTabIds = Set(newTabs.map(\.id))
         lastActivityTime = lastActivityTime.filter { currentTabIds.contains($0.key) }
         tabCreationTime = tabCreationTime.filter { currentTabIds.contains($0.key) }
+        tabFirstSeenTime = tabFirstSeenTime.filter { currentTabIds.contains($0.key) }
         previousTabFingerprints = previousTabFingerprints.filter { currentTabIds.contains($0.key) }
 
         // Sweep stale Claude sessions (every 30s) — detects crashed Claude processes
