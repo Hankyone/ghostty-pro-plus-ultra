@@ -214,6 +214,10 @@ class TerminalWindow: NSWindow {
             return
         }
 
+        if tabTitleEditor.handleRightMouseDown(event) {
+            return
+        }
+
         super.sendEvent(event)
     }
 
