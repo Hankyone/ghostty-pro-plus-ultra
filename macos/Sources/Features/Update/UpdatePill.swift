@@ -111,10 +111,13 @@ struct UpdatePill: View {
         }
     }
 
-    /// Calculated width for the text to prevent resizing during progress updates
+    /// Calculated width for the text to prevent resizing during progress updates.
+    /// Uses the wider of maxWidthText and the actual pillText so that state-specific
+    /// overrides like "Relaunch to Update" are never truncated.
     private var textWidth: CGFloat? {
         let attributes: [NSAttributedString.Key: Any] = [.font: textFont]
-        let size = (model.maxWidthText as NSString).size(withAttributes: attributes)
-        return size.width
+        return [model.maxWidthText, pillText]
+            .map { ($0 as NSString).size(withAttributes: attributes).width }
+            .max()
     }
 }

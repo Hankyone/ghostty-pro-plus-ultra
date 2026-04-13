@@ -1235,10 +1235,13 @@ class BaseTerminalController: NSWindowController,
         // may now be resolved. We should verify that no memory leaks and we can remove this.
         window.contentView = nil
 
-        // Clean up metadata store entries for all surfaces in this window
-        for surface in surfaceTree {
-            TabMetadataStore.shared.removeAll(for: surface.id)
-        }
+        // NOTE: We intentionally do NOT remove tab metadata here.
+        // When the app is relaunching (e.g. Sparkle update), windowWillClose
+        // fires for every window before the app exits. Wiping metadata here
+        // destroys session-title, claude-session, codex-session, and
+        // tab-created-at entries that window restoration depends on.
+        // Orphaned entries are cleaned up by TabMetadataStore.pruneOrphanedEntries()
+        // which runs 2 seconds after each app launch.
 
         // Make sure we clean up all our undos
         window.undoManager?.removeAllActions(withTarget: self)

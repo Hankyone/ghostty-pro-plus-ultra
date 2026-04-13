@@ -1141,16 +1141,19 @@ class SidebarTabManager: ObservableObject {
                         metadataStore.setStatus(tabId: sid, key: "last-activity",
                             value: String(Int(now.timeIntervalSince1970)))
 
-                        // If the tab changed and no coding agent is active, the user
-                        // moved on from the session. Clear the session association so
-                        // the tab reverts to its natural name.
+                        // If the tab changed and no coding agent is active or
+                        // resuming, the user moved on from the session. Clear the
+                        // session association so the tab reverts to its natural name.
+                        // We must also check for session keys because there is a
+                        // timing gap between sending the resume command and the
+                        // hook setting the active marker.
                         let hasActiveAgent = tab.statusEntries.contains(where: {
                             $0.key == "claude-active" || $0.key == "codex-active"
                         })
-                        if !hasActiveAgent && metadataStore.entries[sid]?["session-title"] != nil {
+                        let hasSessionInProgress = metadataStore.entries[sid]?["claude-session"] != nil ||
+                            metadataStore.entries[sid]?["codex-session"] != nil
+                        if !hasActiveAgent && !hasSessionInProgress && metadataStore.entries[sid]?["session-title"] != nil {
                             metadataStore.clearStatus(tabId: sid, key: "session-title")
-                            metadataStore.clearStatus(tabId: sid, key: "claude-session")
-                            metadataStore.clearStatus(tabId: sid, key: "codex-session")
                         }
                     }
                 }
@@ -1163,9 +1166,9 @@ class SidebarTabManager: ObservableObject {
                    let epoch = Double(entry.value) {
                     lastActivityTime[tab.id] = Date(timeIntervalSince1970: epoch)
                 } else {
-                    // No persisted activity time — use creation time as initial
-                    // activity so the tab sorts predictably without garbage dates.
-                    lastActivityTime[tab.id] = tabCreationTime[tab.id] ?? Date()
+                    // No persisted activity time — use creation time so
+                    // restored tabs show their real age, not "now".
+                    lastActivityTime[tab.id] = tabCreationTime[tab.id]
                 }
             }
             previousTabFingerprints[tab.id] = fp
