@@ -25,7 +25,7 @@ A file for [guiding coding agents](https://agents.md/).
 
 ## Releasing
 
-- Releases are done locally via `scripts/release.sh` (auto-increments patch from last `ppu-v*` tag).
+- Releases are done locally via `scripts/release.sh` (auto-increments patch from last `ppu-v*` tag) — it builds Zig + Xcode, codesigns, creates a DMG, notarizes with Apple, tags, creates a GitHub release, and publishes the Sparkle appcast to gh-pages.
 
 ## Upstream Sync
 
