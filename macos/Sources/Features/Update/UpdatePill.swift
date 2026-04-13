@@ -1,12 +1,15 @@
 import SwiftUI
 
-/// A pill-shaped button that displays update status and provides access to update actions.
+/// A pill-shaped button that displays update status and acts directly on click.
+/// No popover — the pill itself is the action button:
+///   - "Update Available" → click to start install
+///   - "Downloading/Preparing" → shows progress (click to cancel)
+///   - "Install and Relaunch" → click to restart
+///   - "Update Failed" → click to retry
+///   - "No Updates" → auto-dismisses after 5s
 struct UpdatePill: View {
     /// The update view model that provides the current state and information
     @ObservedObject var model: UpdateViewModel
-
-    /// Whether the update popover is currently visible
-    @State private var showPopover = false
 
     /// Task for auto-dismissing the "No Updates" state
     @State private var resetTask: Task<Void, Never>?
@@ -17,9 +20,6 @@ struct UpdatePill: View {
     var body: some View {
         if !model.state.isIdle {
             pillButton
-                .popover(isPresented: $showPopover, arrowEdge: .bottom) {
-                    UpdatePopoverView(model: model)
-                }
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 .onChange(of: model.state) { newState in
                     resetTask?.cancel()
@@ -40,19 +40,12 @@ struct UpdatePill: View {
     /// The pill-shaped button view that displays the update badge and text
     @ViewBuilder
     private var pillButton: some View {
-        Button(action: {
-            if case .notFound(let notFound) = model.state {
-                model.state = .idle
-                notFound.acknowledgement()
-            } else {
-                showPopover.toggle()
-            }
-        }, label: {
+        Button(action: pillAction, label: {
             HStack(spacing: 6) {
                 UpdateBadge(model: model)
                     .frame(width: 14, height: 14)
 
-                Text(model.text)
+                Text(pillText)
                     .font(Font(textFont))
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -68,8 +61,54 @@ struct UpdatePill: View {
             .contentShape(Capsule())
         })
         .buttonStyle(.plain)
-        .help(model.text)
-        .accessibilityLabel(model.text)
+        .help(pillText)
+        .accessibilityLabel(pillText)
+    }
+
+    /// The text shown on the pill — changes based on state to indicate the action.
+    private var pillText: String {
+        switch model.state {
+        case .updateAvailable(let update):
+            return "Install \(update.appcastItem.displayVersionString)"
+        case .installing:
+            return "Relaunch to Update"
+        case .error:
+            return "Retry Update"
+        default:
+            return model.text
+        }
+    }
+
+    /// The action performed when the pill is clicked — depends on the current state.
+    private func pillAction() {
+        switch model.state {
+        case .notFound(let notFound):
+            model.state = .idle
+            notFound.acknowledgement()
+
+        case .updateAvailable(let update):
+            // Start the download and install
+            update.reply(.install)
+
+        case .installing(let installing):
+            // Restart the app to complete the update
+            installing.retryTerminatingApplication()
+
+        case .error(let error):
+            // Retry the update
+            error.retry()
+
+        case .checking(let checking):
+            // Cancel the check
+            checking.cancel()
+
+        case .downloading(let download):
+            // Cancel the download
+            download.cancel()
+
+        default:
+            break
+        }
     }
 
     /// Calculated width for the text to prevent resizing during progress updates
