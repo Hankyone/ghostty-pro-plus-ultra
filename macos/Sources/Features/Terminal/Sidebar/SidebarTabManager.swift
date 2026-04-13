@@ -365,6 +365,11 @@ class SidebarTabManager: ObservableObject {
     /// Used to ignore fingerprint changes during tab initialization.
     private var tabFirstSeenTime: [ObjectIdentifier: Date] = [:]
 
+    /// Last-known title per tab, for detecting command execution.
+    /// Compared by string equality so re-emission of the same title
+    /// (which happens on tab selection) is correctly ignored.
+    private var previousTabTitles: [ObjectIdentifier: String] = [:]
+
     /// Surface UUID string used for persisted tab ordering.
     private func tabOrderKey(for window: NSWindow) -> String? {
         guard let controller = window.windowController as? BaseTerminalController,
@@ -1084,11 +1089,11 @@ class SidebarTabManager: ObservableObject {
             )
         }
 
-        // Detect real activity by comparing per-tab fingerprints.
-        // Activity = pwd or status entries changed (not just tab selection).
-        // NOTE: tab.title is intentionally excluded — the shell re-emits the
-        // title when a tab is selected, which would cause false activity.
-        // Title changes are still picked up by the global refreshFingerprint.
+        // Detect real activity by comparing per-tab fingerprints (pwd +
+        // status entries) and title changes. Title is tracked separately via
+        // string equality (not hashed) so that re-emission of the same title
+        // on tab selection is correctly ignored — only actual value changes
+        // (e.g. a new command running) count as activity.
         let now = Date()
         for tab in newTabs {
             var hasher = Hasher()
@@ -1119,7 +1124,14 @@ class SidebarTabManager: ObservableObject {
                     return hasPid && !hasActive
                 }()
 
-                if prev != fp && !isShellInit && !isSessionResuming {
+                // Detect activity from title changes separately.
+                // Title is compared by string equality (not hashed) so that
+                // re-emission of the same title on tab selection is ignored.
+                // Running a command changes the title to the command name,
+                // which is a genuine activity signal.
+                let titleChanged = previousTabTitles[tab.id] != tab.title
+
+                if (prev != fp || titleChanged) && !isShellInit && !isSessionResuming {
                     lastActivityTime[tab.id] = now
                     // Persist to disk so it survives restart
                     if let sid = tab.surfaceId {
@@ -1158,6 +1170,7 @@ class SidebarTabManager: ObservableObject {
                 }
             }
             previousTabFingerprints[tab.id] = fp
+            previousTabTitles[tab.id] = tab.title
         }
 
         // Clean up in-memory timestamps for closed tabs
@@ -1166,6 +1179,7 @@ class SidebarTabManager: ObservableObject {
         tabCreationTime = tabCreationTime.filter { currentTabIds.contains($0.key) }
         tabFirstSeenTime = tabFirstSeenTime.filter { currentTabIds.contains($0.key) }
         previousTabFingerprints = previousTabFingerprints.filter { currentTabIds.contains($0.key) }
+        previousTabTitles = previousTabTitles.filter { currentTabIds.contains($0.key) }
 
         // Sweep stale Claude sessions (every 30s) — detects crashed Claude processes
         if Date().timeIntervalSince(lastPidSweepTime) >= Self.pidSweepInterval {
