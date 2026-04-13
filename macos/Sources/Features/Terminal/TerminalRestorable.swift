@@ -190,9 +190,9 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
         guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
 
-        // Clear both entries so we don't retry on future restores.
-        store.clearStatus(tabId: surfaceId, key: "claude-session")
-        store.clearStatus(tabId: surfaceId, key: "codex-session")
+        // Don't clear session keys here. They persist so that if the app is
+        // force-killed before the resume completes, the next restart will
+        // try again. The hooks will update them when the session actually starts.
 
         // Ensure the session title is set on this surface. It may already be
         // persisted in TabMetadataStore from the previous run, but if not,

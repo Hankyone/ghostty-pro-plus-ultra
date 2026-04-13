@@ -1140,6 +1140,18 @@ class SidebarTabManager: ObservableObject {
                     if let sid = tab.surfaceId {
                         metadataStore.setStatus(tabId: sid, key: "last-activity",
                             value: String(Int(now.timeIntervalSince1970)))
+
+                        // If the tab changed and no coding agent is active, the user
+                        // moved on from the session. Clear the session association so
+                        // the tab reverts to its natural name.
+                        let hasActiveAgent = tab.statusEntries.contains(where: {
+                            $0.key == "claude-active" || $0.key == "codex-active"
+                        })
+                        if !hasActiveAgent && metadataStore.entries[sid]?["session-title"] != nil {
+                            metadataStore.clearStatus(tabId: sid, key: "session-title")
+                            metadataStore.clearStatus(tabId: sid, key: "claude-session")
+                            metadataStore.clearStatus(tabId: sid, key: "codex-session")
+                        }
                     }
                 }
             }
