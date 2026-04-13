@@ -33,16 +33,6 @@ struct UpdatePill: View {
                     } else {
                         resetTask = nil
                     }
-
-                    // Auto-open the popover for states that need user action
-                    switch newState {
-                    case .updateAvailable, .installing, .error:
-                        showPopover = true
-                    case .idle:
-                        showPopover = false
-                    default:
-                        break
-                    }
                 }
         }
     }
