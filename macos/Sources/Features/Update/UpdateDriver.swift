@@ -183,7 +183,16 @@ class UpdateDriver: NSObject, SPUUserDriver {
         if !hasUnobtrusiveTarget {
             standard.showReady(toInstallAndRelaunch: reply)
         } else {
-            reply(.install)
+            // Show "Relaunch to Update" on the pill and let the user trigger
+            // the install. Auto-calling reply(.install) caused Sparkle to
+            // silently fail when the app couldn't quit cleanly.
+            setStateOnMain(.installing(.init(
+                retryTerminatingApplication: { reply(.install) },
+                dismiss: { [weak viewModel] in
+                    viewModel?.state = .idle
+                    reply(.dismiss)
+                }
+            )))
         }
     }
 
