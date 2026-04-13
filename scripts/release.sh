@@ -48,6 +48,44 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     exit 1
 fi
 
+# --- Pull latest from origin and upstream ---
+echo "==> Pulling latest from origin..."
+git pull origin main --ff-only 2>/dev/null || {
+    echo "Error: fast-forward pull from origin/main failed."
+    echo "       Your local branch has diverged. Merge or rebase manually first."
+    exit 1
+}
+
+echo "==> Fetching upstream..."
+git fetch upstream main 2>/dev/null || {
+    echo "Warning: could not fetch upstream (network issue?). Continuing with local state."
+}
+
+if [ "$(git rev-parse HEAD)" != "$(git merge-base HEAD upstream/main 2>/dev/null)" ] && \
+   git merge-base --is-ancestor HEAD upstream/main 2>/dev/null; then
+    # We're behind upstream — try a clean merge
+    echo "==> Merging upstream/main..."
+    if ! git merge upstream/main --no-edit; then
+        git merge --abort
+        echo "Error: upstream merge has conflicts. Resolve manually before releasing."
+        exit 1
+    fi
+    git push origin main
+    echo "==> Upstream merged and pushed."
+elif ! git merge-base --is-ancestor upstream/main HEAD 2>/dev/null; then
+    # We have diverged from upstream — try merge
+    echo "==> Merging upstream/main (diverged)..."
+    if ! git merge upstream/main --no-edit; then
+        git merge --abort
+        echo "Error: upstream merge has conflicts. Resolve manually before releasing."
+        exit 1
+    fi
+    git push origin main
+    echo "==> Upstream merged and pushed."
+else
+    echo "==> Already up to date with upstream."
+fi
+
 # Check if tag already exists
 if git rev-parse "$TAG" >/dev/null 2>&1; then
     echo "Error: tag ${TAG} already exists."
