@@ -118,6 +118,9 @@ case "$event" in
       if [ -n "$question" ]; then
         echo "$question" > "$QUESTION_FILE"
       fi
+    elif [ "$tool_name" = "ExitPlanMode" ]; then
+      # Claude is presenting a plan for approval — set needs-input
+      "$GHOSTTYCTL" set-status claude-active "needs-input" 2>/dev/null || true
     else
       # Claude is actively working — ensure status reflects "working"
       "$GHOSTTYCTL" set-status claude-active "working" 2>/dev/null || true
