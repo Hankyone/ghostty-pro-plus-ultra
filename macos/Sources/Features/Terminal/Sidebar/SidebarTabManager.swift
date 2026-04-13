@@ -123,10 +123,9 @@ class SidebarTabManager: ObservableObject {
     /// Pwds currently being detected in the background, to avoid duplicate work.
     private static var faviconDetectionInFlight: Set<String> = []
 
-    /// Cache for git diff stats to avoid spawning git every 0.5s.
-    private var gitStatsCache: [String: String?] = [:]
-    private var gitStatsCacheTime: Date = .distantPast
-    private static let gitStatsCacheInterval: TimeInterval = 5.0
+    /// FSEvents-based git stats watcher — per-project isolation with 2s debounce
+    /// and 30s fallback poll. Replaces the old 5-second polling approach.
+    private let gitStatsWatcher = GitStatsWatcher()
 
     /// Throttle for stale Claude PID sweeping (every 30s).
     private var lastPidSweepTime: Date = .distantPast
@@ -149,12 +148,16 @@ class SidebarTabManager: ObservableObject {
     init(window: NSWindow, bellTriggersAttention: Bool = true) {
         self.window = window
         self.bellTriggersAttention = bellTriggersAttention
+        gitStatsWatcher.onChange = { [weak self] in
+            self?.refresh(reason: "git stats changed")
+        }
         setupObservers()
         refresh(reason: "init")
     }
 
     deinit {
         timer?.invalidate()
+        gitStatsWatcher.stopAll()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
@@ -296,49 +299,6 @@ class SidebarTabManager: ObservableObject {
                 createdAt: old.createdAt
             )
         }
-    }
-
-    // MARK: - Git Diff Stats
-
-    /// Run `git diff --shortstat HEAD` and return a compact "+N -N" string,
-    /// or nil if there are no uncommitted changes or the directory is not a git repo.
-    private func gitDiffStats(at pwd: String) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["diff", "--shortstat", "HEAD"]
-        process.currentDirectoryURL = URL(fileURLWithPath: pwd)
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return nil
-        }
-
-        guard process.terminationStatus == 0 else { return nil }
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !output.isEmpty else { return nil }
-
-        // Parse: " 3 files changed, 12 insertions(+), 5 deletions(-)"
-        var insertions = 0
-        var deletions = 0
-
-        if let range = output.range(of: #"\d+ insertion"#, options: .regularExpression) {
-            insertions = Int(output[range].split(separator: " ")[0]) ?? 0
-        }
-        if let range = output.range(of: #"\d+ deletion"#, options: .regularExpression) {
-            deletions = Int(output[range].split(separator: " ")[0]) ?? 0
-        }
-
-        if insertions == 0 && deletions == 0 { return nil }
-        return "+\(insertions) -\(deletions)"
     }
 
     // MARK: - Project Root Detection
@@ -575,7 +535,7 @@ class SidebarTabManager: ObservableObject {
 
             let name = (root as NSString).lastPathComponent
             let favicon = rootTabs.first?.faviconImage
-            let stats = rootTabs.first(where: { $0.pwd == root })?.gitDiffStats ?? rootTabs.first?.gitDiffStats
+            let stats = gitStatsWatcher.stats[root]
 
             groups.append(ProjectGroup(
                 id: root,
@@ -1087,8 +1047,6 @@ class SidebarTabManager: ObservableObject {
             timerFingerprint = nil
         }
 
-        // Collect pwds for background git refresh
-        var tabPwds: [String] = []
         var faviconCacheMisses = 0
 
         let newTabs = tabWindows.map { w -> TabItem in
@@ -1098,8 +1056,9 @@ class SidebarTabManager: ObservableObject {
             let sid = surface?.id
             let pwd = surface?.pwd
             let entries = sid.map { metadataStore.statusEntries(for: $0) } ?? []
-            // Always use cached git stats (never block the main thread)
-            let diffStats = pwd.flatMap { gitStatsCache[$0] ?? nil }
+            let projectRoot = pwd.flatMap { detectProjectRoot(at: $0) }
+            // Look up git stats by project root (from FSEvents watcher)
+            let diffStats = projectRoot.flatMap { gitStatsWatcher.stats[$0] }
             let favicon = pwd.flatMap { pwd -> NSImage? in
                 if Self.faviconCache.index(forKey: pwd) == nil {
                     faviconCacheMisses += 1
@@ -1107,9 +1066,6 @@ class SidebarTabManager: ObservableObject {
                 return detectFavicon(at: pwd)
             }
             let color = (w as? TerminalWindow)?.tabColor ?? .none
-            let projectRoot = pwd.flatMap { detectProjectRoot(at: $0) }
-
-            if let p = pwd { tabPwds.append(p) }
 
             return TabItem(
                 id: wid,
@@ -1217,55 +1173,6 @@ class SidebarTabManager: ObservableObject {
             metadataStore.sweepStaleClaude()
         }
 
-        // Refresh git stats in the background periodically (runs independently of
-        // the fingerprint gate so stats don't stall when nothing else changes).
-        let isWindowActive = window.isKeyWindow || NSApp.isActive
-        let shouldRefreshGitStats = isWindowActive && Date().timeIntervalSince(gitStatsCacheTime) >= Self.gitStatsCacheInterval
-        if shouldRefreshGitStats {
-            gitStatsCacheTime = Date()
-            let pwds = tabPwds
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                var newStats: [String: String?] = [:]
-                for pwd in pwds {
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-                    process.arguments = ["diff", "--shortstat", "HEAD"]
-                    process.currentDirectoryURL = URL(fileURLWithPath: pwd)
-                    let pipe = Pipe()
-                    process.standardOutput = pipe
-                    process.standardError = Pipe()
-                    guard (try? process.run()) != nil else { newStats[pwd] = nil; continue }
-                    process.waitUntilExit()
-                    guard process.terminationStatus == 0 else { newStats[pwd] = nil; continue }
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    guard let output = String(data: data, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines),
-                        !output.isEmpty else { newStats[pwd] = nil; continue }
-                    var ins = 0, del = 0
-                    if let r = output.range(of: #"\d+ insertion"#, options: .regularExpression) {
-                        ins = Int(output[r].split(separator: " ")[0]) ?? 0
-                    }
-                    if let r = output.range(of: #"\d+ deletion"#, options: .regularExpression) {
-                        del = Int(output[r].split(separator: " ")[0]) ?? 0
-                    }
-                    newStats[pwd] = (ins == 0 && del == 0) ? nil : "+\(ins) -\(del)"
-                }
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    // Clear all checked pwds first — assigning nil to a
-                    // [String: String?] dict removes the key rather than
-                    // storing nil, so stale entries would never be cleared.
-                    for pwd in pwds {
-                        self.gitStatsCache.removeValue(forKey: pwd)
-                    }
-                    for (pwd, stats) in newStats {
-                        self.gitStatsCache[pwd] = stats
-                    }
-                    self.refresh(reason: "git stats completed")
-                }
-            }
-        }
-
         // Now apply the fingerprint gate: if nothing observable changed on a
         // timer tick, skip the (relatively expensive) tabs/groups rebuild.
         if let fp = timerFingerprint, fp == lastRefreshFingerprint {
@@ -1281,6 +1188,10 @@ class SidebarTabManager: ObservableObject {
             // Rebuild project groups whenever tabs change
             projectGroups = buildProjectGroups(from: newTabs)
         }
+
+        // Sync the FSEvents git watcher with current project roots.
+        let activeRoots = Set(newTabs.compactMap(\.projectRoot))
+        gitStatsWatcher.sync(projectRoots: activeRoots)
 
         // Refresh recent sessions cache in the background. The cache is
         // @Published so changes trigger a view re-render.

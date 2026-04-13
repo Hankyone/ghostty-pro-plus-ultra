@@ -252,7 +252,7 @@ private struct ProjectSection: View {
             let primaryTitle = sessionTitleEntry?.value ?? tab.displayTitle
 
             Text(primaryTitle)
-                .font(.system(size: 11).width(.condensed))
+                .font(.system(size: 11))
                 .foregroundColor(titleColor)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -403,7 +403,7 @@ private struct ProjectHeader: View {
 
             // Project name
             Text(group.name)
-                .font(.system(size: 11, weight: .medium).width(.condensed))
+                .font(.system(size: 12, weight: .medium))
                 .foregroundColor(theme.foreground.opacity(0.9))
                 .lineLimit(1)
                 .truncationMode(.tail)
