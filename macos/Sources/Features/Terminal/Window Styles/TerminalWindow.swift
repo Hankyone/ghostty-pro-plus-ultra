@@ -44,10 +44,12 @@ class TerminalWindow: NSWindow {
     )
 
     /// Whether this window supports the update accessory. If this is false, then views within this
-    /// window should determine how to show update notifications.
+    /// window should determine how to show update notifications via the content overlay instead.
     var supportsUpdateAccessory: Bool {
-        // Native window supports it.
-        true
+        // Disabled: SwiftUI popovers in titlebar accessories are unreliable
+        // when the window has a sidebar, causing unresponsive buttons.
+        // The content overlay (UpdateOverlay in TerminalView) works correctly.
+        false
     }
 
     /// Glass effect view for liquid glass background when transparency is enabled
