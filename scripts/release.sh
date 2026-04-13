@@ -15,12 +15,21 @@ LAST_TAG=$(git tag --list 'ppu-v*' | sort -V | tail -1)
 if [ -z "$LAST_TAG" ]; then
     VERSION="0.1.0"
 else
-    # Auto-increment patch version
+    # Auto-increment version: patch 0-9, then bump minor and reset patch.
+    # e.g. 1.3.9 → 1.4.0, 1.9.9 → 2.0.0
     LAST_VERSION="${LAST_TAG#ppu-v}"
     MAJOR=$(echo "$LAST_VERSION" | cut -d. -f1)
     MINOR=$(echo "$LAST_VERSION" | cut -d. -f2)
     PATCH=$(echo "$LAST_VERSION" | cut -d. -f3)
     PATCH=$((PATCH + 1))
+    if [ "$PATCH" -gt 9 ]; then
+        PATCH=0
+        MINOR=$((MINOR + 1))
+    fi
+    if [ "$MINOR" -gt 9 ]; then
+        MINOR=0
+        MAJOR=$((MAJOR + 1))
+    fi
     VERSION="${MAJOR}.${MINOR}.${PATCH}"
 fi
 
