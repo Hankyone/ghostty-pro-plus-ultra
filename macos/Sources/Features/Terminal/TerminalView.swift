@@ -117,10 +117,8 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                     }
                 }
 
-                // Show update information above all else.
-                if viewModel.updateOverlayIsVisible {
-                    UpdateOverlay()
-                }
+                // Update pill is shown in the sidebar (SidebarView) instead
+                // of overlaying the terminal content.
             }
             .frame(maxWidth: .greatestFiniteMagnitude, maxHeight: .greatestFiniteMagnitude)
         }

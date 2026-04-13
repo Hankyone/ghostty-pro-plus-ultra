@@ -127,6 +127,17 @@ struct SidebarView: View {
         .onPreferenceChange(SidebarCardFramePreferenceKey.self) { tabCardFrames = $0 }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.clear)
+        .safeAreaInset(edge: .bottom) {
+            if let appDelegate = NSApp.delegate as? AppDelegate,
+               !appDelegate.updateViewModel.state.isIdle {
+                HStack {
+                    Spacer()
+                    UpdatePill(model: appDelegate.updateViewModel)
+                    Spacer()
+                }
+                .padding(.vertical, 8)
+            }
+        }
         .overlay(DoubleClickOverlay(
             tabCardFrames: tabCardFrames,
             onBlankSpaceDoubleClick: { tabManager.createNewTab(projectRoot: NSHomeDirectory()) },
