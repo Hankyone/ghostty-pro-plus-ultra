@@ -61,6 +61,7 @@ enum SidebarField: String, Hashable {
 /// A vertical sidebar that displays tabs grouped by project, styled after T3 Code.
 struct SidebarView: View {
     @ObservedObject var tabManager: SidebarTabManager
+    @ObservedObject var updateViewModel: UpdateViewModel
     var theme: SidebarTheme
     var fields: Set<SidebarField> = SidebarField.defaultFields
 
@@ -125,11 +126,10 @@ struct SidebarView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.clear)
         .safeAreaInset(edge: .bottom) {
-            if let appDelegate = NSApp.delegate as? AppDelegate,
-               !appDelegate.updateViewModel.state.isIdle {
+            if !updateViewModel.state.isIdle {
                 HStack {
                     Spacer()
-                    UpdatePill(model: appDelegate.updateViewModel)
+                    UpdatePill(model: updateViewModel)
                     Spacer()
                 }
                 .padding(.vertical, 8)

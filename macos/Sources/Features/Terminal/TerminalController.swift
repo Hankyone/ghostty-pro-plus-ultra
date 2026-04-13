@@ -566,6 +566,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let newTheme = config.sidebarTheme
         sidebarHostingView.rootView = SidebarView(
             tabManager: sidebarTabManager,
+            updateViewModel: (NSApp.delegate as! AppDelegate).updateViewModel,
             theme: newTheme,
             fields: config.sidebarFields
         )
@@ -1097,6 +1098,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Create the sidebar hosting view
         let sidebarHostingView = NSHostingView(rootView: SidebarView(
             tabManager: tabManager,
+            updateViewModel: (NSApp.delegate as! AppDelegate).updateViewModel,
             theme: ghostty.config.sidebarTheme,
             fields: ghostty.config.sidebarFields
         ))
