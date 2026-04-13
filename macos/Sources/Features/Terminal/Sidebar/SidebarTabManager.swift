@@ -19,6 +19,8 @@ class SidebarTabManager: ObservableObject {
         let projectRoot: String?
         /// When this tab last had real activity (command execution, status change).
         var lastActivity: Date?
+        /// When this tab was first created (persisted across restarts).
+        var createdAt: Date?
 
         /// The last path component of the pwd, for compact display.
         var directoryName: String? {
@@ -290,7 +292,8 @@ class SidebarTabManager: ObservableObject {
                 statusEntries: old.statusEntries, needsAttention: false,
                 tabColor: old.tabColor, faviconImage: old.faviconImage,
                 window: old.window, projectRoot: old.projectRoot,
-                lastActivity: old.lastActivity
+                lastActivity: old.lastActivity,
+                createdAt: old.createdAt
             )
         }
     }
@@ -1116,7 +1119,8 @@ class SidebarTabManager: ObservableObject {
                 faviconImage: favicon,
                 window: w,
                 projectRoot: projectRoot,
-                lastActivity: lastActivityTime[wid]
+                lastActivity: lastActivityTime[wid],
+                createdAt: tabCreationTime[wid]
             )
         }
 
@@ -1134,7 +1138,15 @@ class SidebarTabManager: ObservableObject {
             }
             let fp = hasher.finalize()
             if let prev = previousTabFingerprints[tab.id] {
-                if prev != fp {
+                // Skip fingerprint changes during the first 5 seconds after a
+                // tab is first seen. After a restore, tabs initialize (shell
+                // prompt, pwd) which looks like a fingerprint change but isn't
+                // real user activity. Without this grace period, the persisted
+                // last-activity timestamp gets immediately overwritten with now.
+                let firstSeen = tabCreationTime[tab.id] ?? .distantPast
+                let isInitializing = now.timeIntervalSince(firstSeen) < 5.0
+
+                if prev != fp && !isInitializing {
                     lastActivityTime[tab.id] = now
                     // Persist to disk so it survives restart
                     if let sid = tab.surfaceId {

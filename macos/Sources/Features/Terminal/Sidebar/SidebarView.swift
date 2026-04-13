@@ -259,7 +259,7 @@ private struct ProjectSection: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .help(primaryTitle)
 
-            // Relative time — "3m ago", "1h ago"
+            // Relative time — "3m", "1h" (time since last real activity)
             if let activity = tab.lastActivity {
                 Text(relativeTime(activity))
                     .font(.system(size: 9))
