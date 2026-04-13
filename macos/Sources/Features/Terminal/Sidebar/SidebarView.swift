@@ -295,25 +295,28 @@ private struct ProjectSection: View {
         .overlay(MiddleClickOverlay {
             tabManager.closeTab(tab)
         })
-        .onDrag {
-            draggingTabID = tab.id
-            return NSItemProvider(object: "\(tabIndex)" as NSString)
-        }
-        .onDrop(of: [UTType.text], delegate: TabDropDelegate(
-            tabManager: tabManager,
-            currentTab: tab,
-            currentIndex: tabIndex,
-            draggingTabID: $draggingTabID,
-            dropTargetTabID: $dropTargetTabID
-        ))
-        .opacity(draggingTabID == tab.id ? 0.4 : 1.0)
-        .overlay(alignment: .top) {
-            if dropTargetTabID == tab.id && draggingTabID != tab.id {
-                Rectangle()
-                    .fill(Color.accentColor)
-                    .frame(height: 2)
-                    .offset(y: -1)
-            }
+        .if(tabManager.projectSortMode == .manual) { view in
+            view
+                .onDrag {
+                    draggingTabID = tab.id
+                    return NSItemProvider(object: "\(tabIndex)" as NSString)
+                }
+                .onDrop(of: [UTType.text], delegate: TabDropDelegate(
+                    tabManager: tabManager,
+                    currentTab: tab,
+                    currentIndex: tabIndex,
+                    draggingTabID: $draggingTabID,
+                    dropTargetTabID: $dropTargetTabID
+                ))
+                .opacity(draggingTabID == tab.id ? 0.4 : 1.0)
+                .overlay(alignment: .top) {
+                    if dropTargetTabID == tab.id && draggingTabID != tab.id {
+                        Rectangle()
+                            .fill(Color.accentColor)
+                            .frame(height: 2)
+                            .offset(y: -1)
+                    }
+                }
         }
         .contextMenu {
             Button("Rename Tab...") {
@@ -611,13 +614,14 @@ private struct TabDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        defer {
+            self.draggingTabID = nil
+            self.dropTargetTabID = nil
+        }
         guard let draggingTabID else { return false }
         guard let sourceIndex = tabManager.tabs.firstIndex(where: { $0.id == draggingTabID }) else { return false }
 
         tabManager.moveTab(from: sourceIndex, to: currentIndex)
-
-        self.draggingTabID = nil
-        self.dropTargetTabID = nil
         return true
     }
 }
