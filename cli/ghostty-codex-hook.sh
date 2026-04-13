@@ -53,6 +53,8 @@ case "$event" in
     echo "$PPID" > "$PID_FILE"
     "$GHOSTTYCTL" set-status codex-pid "$PPID" >/dev/null 2>&1 || true
     "$GHOSTTYCTL" set-status codex-session "$session_id" >/dev/null 2>&1 || true
+    # Agent is running but idle — show green dot until first prompt
+    "$GHOSTTYCTL" set-status codex-active "done" >/dev/null 2>&1 || true
 
     # Restore a previously generated title for this session (e.g. after resume).
     TITLE_STORE="$SESSIONS_DIR/$session_id.title"

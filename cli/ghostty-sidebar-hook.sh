@@ -57,6 +57,8 @@ case "$event" in
     echo "$PPID" > "$PID_FILE"
     "$GHOSTTYCTL" set-status claude-pid "$PPID" 2>/dev/null || true
     "$GHOSTTYCTL" set-status claude-session "$session_id" 2>/dev/null || true
+    # Agent is running but idle — show green dot until first prompt
+    "$GHOSTTYCTL" set-status claude-active "done" 2>/dev/null || true
 
     # Restore a previously generated title for this session (e.g. after /resume).
     TITLE_STORE="$SESSIONS_DIR/$session_id.title"
