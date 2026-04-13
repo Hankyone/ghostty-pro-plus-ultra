@@ -92,6 +92,7 @@ private final class ProjectWatcher {
     private var stream: FSEventStreamRef?
     private var debounceWorkItem: DispatchWorkItem?
     private var isRunningGit = false
+    private var needsRefreshAfterCurrentRun = false
 
     /// Context pointer passed to the FSEvents callback. Must be retained
     /// for the lifetime of the stream.
@@ -132,6 +133,7 @@ private final class ProjectWatcher {
                 kFSEventStreamCreateFlagUseCFTypes
                 | kFSEventStreamCreateFlagIgnoreSelf
                 | kFSEventStreamCreateFlagFileEvents
+                | kFSEventStreamCreateFlagWatchRoot
             )
         )
 
@@ -184,8 +186,14 @@ private final class ProjectWatcher {
 
     /// Run `git diff --shortstat HEAD` on a background thread.
     private func runGitDiff() {
-        guard !isRunningGit else { return } // Don't stack up concurrent runs
+        guard !isRunningGit else {
+            // A refresh was requested while git is running — remember it
+            // so we re-run when the current process finishes.
+            needsRefreshAfterCurrentRun = true
+            return
+        }
         isRunningGit = true
+        needsRefreshAfterCurrentRun = false
 
         let projectRoot = root
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -193,14 +201,30 @@ private final class ProjectWatcher {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isRunningGit = false
-                self.callback(self.root, result)
+
+                // Only update stats on success. On error/timeout, preserve
+                // the last known good value so we don't flash "clean" when
+                // git is just slow or temporarily unavailable.
+                if case .success(let stats) = result {
+                    self.callback(self.root, stats)
+                }
+
+                // If changes arrived while we were running, re-trigger.
+                if self.needsRefreshAfterCurrentRun {
+                    self.needsRefreshAfterCurrentRun = false
+                    self.runGitDiff()
+                }
             }
         }
     }
 
+    private enum GitResult {
+        case success(String?)  // nil = clean repo, String = "+N -N"
+        case error             // git failed, timed out, or not available
+    }
+
     /// Run `git diff --shortstat HEAD` synchronously (call from background thread).
-    /// Returns a compact "+N -N" string, or nil if clean/not a git repo.
-    private static func gitDiffStats(at dir: String) -> String? {
+    private static func gitDiffStats(at dir: String) -> GitResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = ["diff", "--shortstat", "HEAD"]
@@ -210,7 +234,7 @@ private final class ProjectWatcher {
         process.standardOutput = pipe
         process.standardError = Pipe()
 
-        guard (try? process.run()) != nil else { return nil }
+        guard (try? process.run()) != nil else { return .error }
 
         // Timeout: kill the process if it takes more than 10 seconds.
         let deadline = DispatchTime.now() + .seconds(10)
@@ -218,15 +242,15 @@ private final class ProjectWatcher {
         process.terminationHandler = { _ in done.signal() }
         if done.wait(timeout: deadline) == .timedOut {
             process.terminate()
-            return nil
+            return .error
         }
 
-        guard process.terminationStatus == 0 else { return nil }
+        guard process.terminationStatus == 0 else { return .error }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let output = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-            !output.isEmpty else { return nil }
+            !output.isEmpty else { return .success(nil) }
 
         var ins = 0, del = 0
         if let r = output.range(of: #"\d+ insertion"#, options: .regularExpression) {
@@ -235,7 +259,7 @@ private final class ProjectWatcher {
         if let r = output.range(of: #"\d+ deletion"#, options: .regularExpression) {
             del = Int(output[r].split(separator: " ")[0]) ?? 0
         }
-        return (ins == 0 && del == 0) ? nil : "+\(ins) -\(del)"
+        return .success((ins == 0 && del == 0) ? nil : "+\(ins) -\(del)")
     }
 }
 
@@ -252,10 +276,8 @@ private func fsEventsCallback(
     guard let info = clientCallBackInfo else { return }
     let watcher = Unmanaged<ProjectWatcher>.fromOpaque(info).takeUnretainedValue()
 
-    // Ignore changes inside .git directory itself (index, refs, etc. change
-    // as a RESULT of the operations we care about, but the working tree
-    // changes are what actually affect diff stats).
-    // We still trigger on .git changes because they indicate commits,
-    // checkouts, stashes, etc.
+    // Any file change in the project tree (working tree edits, .git index
+    // updates from commits/checkouts/stashes, etc.) triggers a debounced
+    // git diff refresh.
     watcher.scheduleRefresh()
 }
