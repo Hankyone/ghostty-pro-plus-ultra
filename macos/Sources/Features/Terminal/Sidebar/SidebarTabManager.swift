@@ -896,6 +896,9 @@ class SidebarTabManager: ObservableObject {
         let metadataStore = TabMetadataStore.shared
 
         // For timer-driven refreshes, skip if nothing observable has changed.
+        // Git stats are refreshed independently of the fingerprint (they run on
+        // their own interval), so we check them before the early return.
+        let timerFingerprint: Int?
         if reason == "timer" {
             var hasher = Hasher()
             hasher.combine(tabWindows.count)
@@ -915,11 +918,9 @@ class SidebarTabManager: ObservableObject {
                     }
                 }
             }
-            let fingerprint = hasher.finalize()
-            if fingerprint == lastRefreshFingerprint {
-                return
-            }
-            lastRefreshFingerprint = fingerprint
+            timerFingerprint = hasher.finalize()
+        } else {
+            timerFingerprint = nil
         }
 
         // Collect pwds for background git refresh
@@ -1006,7 +1007,8 @@ class SidebarTabManager: ObservableObject {
             metadataStore.sweepStaleClaude()
         }
 
-        // Refresh git stats in the background periodically
+        // Refresh git stats in the background periodically (runs independently of
+        // the fingerprint gate so stats don't stall when nothing else changes).
         let isWindowActive = window.isKeyWindow || NSApp.isActive
         let shouldRefreshGitStats = isWindowActive && Date().timeIntervalSince(gitStatsCacheTime) >= Self.gitStatsCacheInterval
         if shouldRefreshGitStats {
@@ -1052,6 +1054,15 @@ class SidebarTabManager: ObservableObject {
                     self.refresh(reason: "git stats completed")
                 }
             }
+        }
+
+        // Now apply the fingerprint gate: if nothing observable changed on a
+        // timer tick, skip the (relatively expensive) tabs/groups rebuild.
+        if let fp = timerFingerprint, fp == lastRefreshFingerprint {
+            return
+        }
+        if let fp = timerFingerprint {
+            lastRefreshFingerprint = fp
         }
 
         let tabsChanged = newTabs != tabs

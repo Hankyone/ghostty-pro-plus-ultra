@@ -4,6 +4,10 @@
 #
 # Hooks: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop
 # Requires: jq, ghosttyctl
+#
+# IMPORTANT: Codex parses hook stdout as JSON. Any stray output causes
+# "invalid … JSON output" errors, so all ghosttyctl calls redirect
+# stdout+stderr to /dev/null. Exit 0 with no output = success.
 
 set -euo pipefail
 
@@ -47,15 +51,15 @@ case "$event" in
 
     # Register Codex's PID for stale session detection.
     echo "$PPID" > "$PID_FILE"
-    "$GHOSTTYCTL" set-status codex-pid "$PPID" 2>/dev/null || true
-    "$GHOSTTYCTL" set-status codex-session "$session_id" 2>/dev/null || true
+    "$GHOSTTYCTL" set-status codex-pid "$PPID" >/dev/null 2>&1 || true
+    "$GHOSTTYCTL" set-status codex-session "$session_id" >/dev/null 2>&1 || true
 
     # Restore a previously generated title for this session (e.g. after resume).
     TITLE_STORE="$SESSIONS_DIR/$session_id.title"
     if [ -f "$TITLE_STORE" ]; then
       saved_title=$(cat "$TITLE_STORE")
       if [ -n "$saved_title" ]; then
-        "$GHOSTTYCTL" set-status session-title "$saved_title" --icon "text.bubble" 2>/dev/null || true
+        "$GHOSTTYCTL" set-status session-title "$saved_title" --icon "text.bubble" >/dev/null 2>&1 || true
       fi
     fi
     ;;
@@ -65,11 +69,11 @@ case "$event" in
     [ -z "$prompt" ] && exit 0
 
     # Mark tab as active (Codex is working)
-    "$GHOSTTYCTL" set-status codex-active "working" 2>/dev/null || true
+    "$GHOSTTYCTL" set-status codex-active "working" >/dev/null 2>&1 || true
 
     # Show truncated last prompt as the sidebar label
     short=$(echo "$prompt" | tr '\n' ' ' | head -c 120)
-    "$GHOSTTYCTL" set-status codex "$short" --icon "bubble.left.fill" 2>/dev/null || true
+    "$GHOSTTYCTL" set-status codex "$short" --icon "bubble.left.fill" >/dev/null 2>&1 || true
 
     # Generate a tab title on the first prompt only
     if [ ! -f "$TITLED_FILE" ]; then
@@ -77,14 +81,14 @@ case "$event" in
 
       # Set an immediate seed title from the prompt text
       seed=$(echo "$prompt" | tr '\n' ' ' | tr -s ' ' | head -c 50)
-      "$GHOSTTYCTL" set-status session-title "$seed" --icon "text.bubble" 2>/dev/null || true
+      "$GHOSTTYCTL" set-status session-title "$seed" --icon "text.bubble" >/dev/null 2>&1 || true
 
       # Launch LLM title generation fully detached so the hook returns immediately.
       TITLE_STORE="$SESSIONS_DIR/$session_id.title"
       nohup bash -c "
         title=\$(\"$GENERATE_TITLE\" \"\$1\" 2>/dev/null || echo \"\")
         if [ -n \"\$title\" ]; then
-          \"$GHOSTTYCTL\" set-status session-title \"\$title\" --icon \"text.bubble\" 2>/dev/null || true
+          \"$GHOSTTYCTL\" set-status session-title \"\$title\" --icon \"text.bubble\" >/dev/null 2>&1 || true
           printf '%s' \"\$title\" > \"\$2\"
         fi
       " -- "$prompt" "$TITLE_STORE" </dev/null >/dev/null 2>&1 &
@@ -94,22 +98,21 @@ case "$event" in
 
   PreToolUse)
     # Codex is about to use a tool — ensure status reflects "working"
-    "$GHOSTTYCTL" set-status codex-active "working" 2>/dev/null || true
+    "$GHOSTTYCTL" set-status codex-active "working" >/dev/null 2>&1 || true
     ;;
 
   PostToolUse)
     # Tool finished — still working (Codex continues processing)
-    "$GHOSTTYCTL" set-status codex-active "working" 2>/dev/null || true
+    "$GHOSTTYCTL" set-status codex-active "working" >/dev/null 2>&1 || true
     ;;
 
   Stop)
-    # Codex finished — mark as done and clean up transient state
-    "$GHOSTTYCTL" set-status codex-active "done" 2>/dev/null || true
+    # Codex finished — mark as done (keep codex-active so the green dot persists)
+    "$GHOSTTYCTL" set-status codex-active "done" >/dev/null 2>&1 || true
 
-    # Clean up transient metadata (preserve session-title for history)
-    "$GHOSTTYCTL" clear-status codex 2>/dev/null || true
-    "$GHOSTTYCTL" clear-status codex-active 2>/dev/null || true
-    "$GHOSTTYCTL" clear-status codex-pid 2>/dev/null || true
-    rm -f "$PID_FILE" "$TAB_ID_FILE"
+    # Clean up transient metadata (preserve session-title and codex-active)
+    "$GHOSTTYCTL" clear-status codex >/dev/null 2>&1 || true
+    "$GHOSTTYCTL" clear-status codex-pid >/dev/null 2>&1 || true
+    rm -f "$PID_FILE"
     ;;
 esac

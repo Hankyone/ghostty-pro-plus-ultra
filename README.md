@@ -28,7 +28,9 @@ Browser-like session persistence — quit and reopen, and everything comes back.
 
 ### Hook Setup
 
-The sidebar integration is powered by Claude Code hooks that push status updates via `ghosttyctl`.
+The sidebar integration is powered by hooks that push status updates via `ghosttyctl`. Requires `jq` in your PATH.
+
+**Claude Code:**
 
 ```bash
 # 1. Copy the hook script
@@ -48,7 +50,21 @@ print('Hooks installed.')
 "
 ```
 
-Requires `jq` in your PATH.
+**Codex:**
+
+```bash
+# Register hooks in Codex settings (merges with existing settings)
+python3 -c "
+import json, os
+p = os.path.expanduser('~/.codex/hooks.json')
+s = json.load(open(p)) if os.path.exists(p) else {}
+cmd = 'bash $(pwd)/cli/ghostty-codex-hook.sh'
+entry = [{'hooks': [{'type': 'command', 'command': cmd}]}]
+s['hooks'] = {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','PostToolUse','Stop']}
+json.dump(s, open(p, 'w'), indent=2)
+print('Hooks installed.')
+"
+```
 
 ### CLI
 
