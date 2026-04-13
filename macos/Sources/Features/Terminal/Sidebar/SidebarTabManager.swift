@@ -156,6 +156,19 @@ class SidebarTabManager: ObservableObject {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
+    /// Returns the logical tab order for the current tab group.
+    /// `NSWindow.tabbedWindows` can shift when the selected tab changes, while
+    /// `NSWindowTabGroup.windows` tracks the actual strip order we want to show.
+    private func orderedTabWindows(for window: NSWindow) -> [NSWindow] {
+        if let groupWindows = window.tabGroup?.windows, !groupWindows.isEmpty {
+            return groupWindows
+        }
+        if let tabbedWindows = window.tabbedWindows, !tabbedWindows.isEmpty {
+            return tabbedWindows
+        }
+        return [window]
+    }
+
     private func setupObservers() {
         let center = NotificationCenter.default
 
@@ -166,7 +179,7 @@ class SidebarTabManager: ObservableObject {
         ) { [weak self] notification in
             guard let self, let window = self.window,
                   let notifWindow = notification.object as? NSWindow,
-                  (window.tabbedWindows ?? [window]).contains(notifWindow)
+                  self.orderedTabWindows(for: window).contains(notifWindow)
             else { return }
             self.refreshSelection()
         }
@@ -179,7 +192,7 @@ class SidebarTabManager: ObservableObject {
         ) { [weak self] notification in
             guard let self, let window = self.window,
                   let notifWindow = notification.object as? NSWindow,
-                  (window.tabbedWindows ?? [window]).contains(notifWindow)
+                  self.orderedTabWindows(for: window).contains(notifWindow)
             else { return }
             self.refreshSelection()
         }
@@ -935,12 +948,7 @@ class SidebarTabManager: ObservableObject {
         // Keep collapsed state in sync across all tab managers
         syncCollapsedProjects()
 
-        let tabWindows: [NSWindow]
-        if let tabbedWindows = window.tabbedWindows, !tabbedWindows.isEmpty {
-            tabWindows = tabbedWindows
-        } else {
-            tabWindows = [window]
-        }
+        let tabWindows = orderedTabWindows(for: window)
 
         let selectedWindow = window.tabGroup?.selectedWindow ?? window
         let metadataStore = TabMetadataStore.shared
@@ -952,7 +960,6 @@ class SidebarTabManager: ObservableObject {
         if reason == "timer" {
             var hasher = Hasher()
             hasher.combine(tabWindows.count)
-            hasher.combine(ObjectIdentifier(selectedWindow))
             hasher.combine(attentionWindows.count)
             for w in tabWindows {
                 hasher.combine(ObjectIdentifier(w))
@@ -1484,12 +1491,8 @@ class SidebarTabManager: ObservableObject {
 
     func closeOtherTabs(_ tab: TabItem) {
         guard let window else { return }
-        let tabWindows: [NSWindow]
-        if let tabbedWindows = window.tabbedWindows, !tabbedWindows.isEmpty {
-            tabWindows = tabbedWindows
-        } else {
-            return
-        }
+        let tabWindows = orderedTabWindows(for: window)
+        guard tabWindows.count > 1 else { return }
         for w in tabWindows where ObjectIdentifier(w) != tab.id {
             if let controller = w.windowController as? TerminalController {
                 controller.closeTab(nil)
@@ -1499,7 +1502,7 @@ class SidebarTabManager: ObservableObject {
 
     func moveTab(from sourceIndex: Int, to destinationIndex: Int) {
         guard let window else { return }
-        guard let tabbedWindows = window.tabbedWindows, !tabbedWindows.isEmpty else { return }
+        let tabbedWindows = orderedTabWindows(for: window)
         guard sourceIndex != destinationIndex,
               sourceIndex >= 0, sourceIndex < tabbedWindows.count,
               destinationIndex >= 0, destinationIndex < tabbedWindows.count else { return }
@@ -1522,12 +1525,8 @@ class SidebarTabManager: ObservableObject {
 
     func closeTabsToTheRight(of tab: TabItem) {
         guard let window else { return }
-        let tabWindows: [NSWindow]
-        if let tabbedWindows = window.tabbedWindows, !tabbedWindows.isEmpty {
-            tabWindows = tabbedWindows
-        } else {
-            return
-        }
+        let tabWindows = orderedTabWindows(for: window)
+        guard tabWindows.count > 1 else { return }
         guard let idx = tabWindows.firstIndex(where: { ObjectIdentifier($0) == tab.id }) else { return }
         for w in tabWindows[(idx + 1)...] {
             if let controller = w.windowController as? TerminalController {
