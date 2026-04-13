@@ -458,6 +458,7 @@ private struct ProjectHeader: View {
                     }
                     .frame(width: 20, height: 20)
                 }
+                .id(recentSessions.count)
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .fixedSize()

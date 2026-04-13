@@ -1251,6 +1251,10 @@ class SidebarTabManager: ObservableObject {
             projectGroups = buildProjectGroups(from: newTabs)
         }
 
+        // Refresh recent sessions cache in the background. The cache is
+        // @Published so changes trigger a view re-render.
+        refreshRecentSessions()
+
         let currentSelectedID = ObjectIdentifier(selectedWindow)
         if selectedTabID != currentSelectedID {
             selectedTabID = currentSelectedID
@@ -1352,22 +1356,28 @@ class SidebarTabManager: ObservableObject {
     private var recentSessionsCacheTime: Date = .distantPast
     private static let recentSessionsCacheInterval: TimeInterval = 30.0
 
-    /// Returns recent sessions for a project. Populates the cache synchronously
-    /// on the first call (or when stale) so the data is always available when
-    /// SwiftUI builds the Menu content — avoids relying on @Published re-renders
-    /// which don't reliably propagate into Menu view builders on macOS.
+    /// Returns cached recent sessions for a project.
     func cachedRecentSessions(forProjectRoot root: String?) -> [RecentSession] {
         let key = root ?? "__other__"
-        if Date().timeIntervalSince(recentSessionsCacheTime) >= Self.recentSessionsCacheInterval {
-            recentSessionsCacheTime = Date()
-            let roots = Set(projectGroups.compactMap(\.projectRoot))
+        return recentSessionsCache[key] ?? []
+    }
+
+    /// Refresh the recent sessions cache if stale. Called from refresh() so
+    /// the cache is populated before the view ever reads it.
+    private func refreshRecentSessions() {
+        guard Date().timeIntervalSince(recentSessionsCacheTime) >= Self.recentSessionsCacheInterval else { return }
+        recentSessionsCacheTime = Date()
+        let roots = Set(projectGroups.compactMap(\.projectRoot))
+        guard !roots.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             var newCache: [String: [RecentSession]] = [:]
             for r in roots {
                 newCache[r] = Self.scanRecentSessions(forProjectRoot: r)
             }
-            recentSessionsCache = newCache
+            DispatchQueue.main.async {
+                self?.recentSessionsCache = newCache
+            }
         }
-        return recentSessionsCache[key] ?? []
     }
 
     /// Scan Claude Code and Codex session files to find recent sessions for a project.
