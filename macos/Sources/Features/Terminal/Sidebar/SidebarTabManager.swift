@@ -1129,12 +1129,13 @@ class SidebarTabManager: ObservableObject {
         }
 
         // Detect real activity by comparing per-tab fingerprints.
-        // Activity = title, pwd, or status entries changed (not just tab selection).
-        // Persists to TabMetadataStore so timestamps survive app restarts.
+        // Activity = pwd or status entries changed (not just tab selection).
+        // NOTE: tab.title is intentionally excluded — the shell re-emits the
+        // title when a tab is selected, which would cause false activity.
+        // Title changes are still picked up by the global refreshFingerprint.
         let now = Date()
         for tab in newTabs {
             var hasher = Hasher()
-            hasher.combine(tab.title)
             hasher.combine(tab.pwd)
             for entry in tab.statusEntries where entry.key != "last-activity" {
                 hasher.combine(entry.key)
@@ -1142,15 +1143,27 @@ class SidebarTabManager: ObservableObject {
             }
             let fp = hasher.finalize()
             if let prev = previousTabFingerprints[tab.id] {
-                // Skip fingerprint changes during the first 5 seconds after a
-                // tab is first seen this session. After a restore, tabs
-                // initialize (shell prompt, pwd) which looks like a fingerprint
-                // change but isn't real user activity. Without this grace
-                // period, the persisted last-activity gets overwritten with now.
+                // Skip fingerprint changes that aren't real user activity:
+                // 1. First 5 seconds after a tab appears (shell initialization)
+                // 2. Session resuming: claude-pid/codex-pid is set (SessionStart
+                //    hook fired) but claude-active/codex-active hasn't appeared
+                //    yet (user hasn't submitted a prompt). This covers pressing
+                //    Enter on the pre-filled resume command without counting it
+                //    as activity. If the user deletes the command and runs
+                //    something else, no pid is set so activity is tracked normally.
                 let firstSeen = tabFirstSeenTime[tab.id] ?? .distantPast
-                let isInitializing = now.timeIntervalSince(firstSeen) < 5.0
+                let isShellInit = now.timeIntervalSince(firstSeen) < 5.0
+                let isSessionResuming: Bool = {
+                    let hasPid = tab.statusEntries.contains(where: {
+                        $0.key == "claude-pid" || $0.key == "codex-pid"
+                    })
+                    let hasActive = tab.statusEntries.contains(where: {
+                        $0.key == "claude-active" || $0.key == "codex-active"
+                    })
+                    return hasPid && !hasActive
+                }()
 
-                if prev != fp && !isInitializing {
+                if prev != fp && !isShellInit && !isSessionResuming {
                     lastActivityTime[tab.id] = now
                     // Persist to disk so it survives restart
                     if let sid = tab.surfaceId {
