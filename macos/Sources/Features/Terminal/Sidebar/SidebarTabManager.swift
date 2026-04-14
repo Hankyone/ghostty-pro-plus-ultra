@@ -1,6 +1,5 @@
 import Cocoa
 import Combine
-import UserNotifications
 
 /// Observes the tab group of a window and publishes tab metadata for the sidebar.
 @MainActor
@@ -1323,71 +1322,108 @@ class SidebarTabManager: ObservableObject {
 
     // MARK: - Git Actions
 
-    /// Whether a git action (commit/push) is currently in progress for a project.
-    @Published private var gitActionInProgress: Set<String> = []
+    enum GitActionStatus: Equatable {
+        case inProgress
+        case error(String)
+    }
+
+    /// Per-project git action state — `.inProgress` while running, `.error` on failure.
+    /// Absent key = idle.
+    @Published private(set) var gitActionState: [String: GitActionStatus] = [:]
+
+    /// Timers that auto-dismiss error states after 5 seconds.
+    private var gitErrorDismissTimers: [String: DispatchWorkItem] = [:]
+
+    private func scheduleErrorDismiss(forProjectRoot root: String) {
+        gitErrorDismissTimers[root]?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.gitActionState.removeValue(forKey: root)
+            self?.gitErrorDismissTimers.removeValue(forKey: root)
+        }
+        gitErrorDismissTimers[root] = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: item)
+    }
 
     /// Run git commit with an AI-generated commit message for a project.
     func gitCommit(projectRoot: String) {
-        guard !gitActionInProgress.contains(projectRoot) else { return }
-        gitActionInProgress.insert(projectRoot)
+        guard gitActionState[projectRoot] != .inProgress else { return }
+        gitErrorDismissTimers[projectRoot]?.cancel()
+        gitErrorDismissTimers.removeValue(forKey: projectRoot)
+        gitActionState[projectRoot] = .inProgress
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = Self.performGitCommit(at: projectRoot)
             DispatchQueue.main.async {
-                self?.gitActionInProgress.remove(projectRoot)
                 self?.gitStatsWatcher.refreshAll()
-                Self.showGitNotification(result: result, action: "Commit")
+                switch result {
+                case .success:
+                    self?.gitActionState.removeValue(forKey: projectRoot)
+                case .error(let message):
+                    self?.gitActionState[projectRoot] = .error(message)
+                    self?.scheduleErrorDismiss(forProjectRoot: projectRoot)
+                }
             }
         }
     }
 
     /// Push the current branch to remote for a project.
     func gitPush(projectRoot: String) {
-        guard !gitActionInProgress.contains(projectRoot) else { return }
-        gitActionInProgress.insert(projectRoot)
+        guard gitActionState[projectRoot] != .inProgress else { return }
+        gitErrorDismissTimers[projectRoot]?.cancel()
+        gitErrorDismissTimers.removeValue(forKey: projectRoot)
+        gitActionState[projectRoot] = .inProgress
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = Self.performGitPush(at: projectRoot)
             DispatchQueue.main.async {
-                self?.gitActionInProgress.remove(projectRoot)
-                Self.showGitNotification(result: result, action: "Push")
+                switch result {
+                case .success:
+                    self?.gitActionState.removeValue(forKey: projectRoot)
+                case .error(let message):
+                    self?.gitActionState[projectRoot] = .error(message)
+                    self?.scheduleErrorDismiss(forProjectRoot: projectRoot)
+                }
             }
         }
     }
 
     /// Commit all changes and push in one action.
     func gitCommitAndPush(projectRoot: String) {
-        guard !gitActionInProgress.contains(projectRoot) else { return }
-        gitActionInProgress.insert(projectRoot)
+        guard gitActionState[projectRoot] != .inProgress else { return }
+        gitErrorDismissTimers[projectRoot]?.cancel()
+        gitErrorDismissTimers.removeValue(forKey: projectRoot)
+        gitActionState[projectRoot] = .inProgress
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let commitResult = Self.performGitCommit(at: projectRoot)
             guard case .success = commitResult else {
                 DispatchQueue.main.async {
-                    self?.gitActionInProgress.remove(projectRoot)
                     self?.gitStatsWatcher.refreshAll()
-                    Self.showGitNotification(result: commitResult, action: "Commit")
+                    if case .error(let message) = commitResult {
+                        self?.gitActionState[projectRoot] = .error(message)
+                        self?.scheduleErrorDismiss(forProjectRoot: projectRoot)
+                    }
                 }
                 return
             }
             let pushResult = Self.performGitPush(at: projectRoot)
             DispatchQueue.main.async {
-                self?.gitActionInProgress.remove(projectRoot)
                 self?.gitStatsWatcher.refreshAll()
-                if case .success = pushResult {
-                    Self.showGitNotification(result: .success("Committed and pushed"), action: "Commit & Push")
-                } else {
-                    // Commit succeeded but push failed
-                    Self.showGitNotification(result: pushResult, action: "Push")
+                switch pushResult {
+                case .success:
+                    self?.gitActionState.removeValue(forKey: projectRoot)
+                case .error(let message):
+                    self?.gitActionState[projectRoot] = .error(message)
+                    self?.scheduleErrorDismiss(forProjectRoot: projectRoot)
                 }
             }
         }
     }
 
-    /// Check whether a git action is in progress for a project root.
-    func isGitActionInProgress(forProjectRoot root: String?) -> Bool {
-        guard let root else { return false }
-        return gitActionInProgress.contains(root)
+    /// Return the current git action status for a project root, if any.
+    func gitActionStatus(forProjectRoot root: String?) -> GitActionStatus? {
+        guard let root else { return nil }
+        return gitActionState[root]
     }
 
     private enum GitActionResult {
@@ -1409,11 +1445,12 @@ class SidebarTabManager: ObservableObject {
         }
 
         // Generate commit message via LLM
-        let message = generateCommitMessage(at: projectRoot)
-        guard let message, !message.isEmpty else {
-            // Unstage so we don't leave things in a weird state
-            _ = runGit(["reset", "HEAD"], at: projectRoot)
-            return .error("Failed to generate commit message")
+        let result = generateCommitMessage(at: projectRoot)
+        guard let message = result.message, !message.isEmpty else {
+            // Leave files staged — git add -A already ran, and unstaging
+            // would silently discard any pre-existing staging the user had.
+            let detail = result.stderr.flatMap { ": \($0)" } ?? ""
+            return .error("Failed to generate commit message\(detail)")
         }
 
         guard runGit(["commit", "-m", message], at: projectRoot) else {
@@ -1433,12 +1470,39 @@ class SidebarTabManager: ObservableObject {
         }
     }
 
+    /// Result from `generateCommitMessage` — carries the parsed message on
+    /// success and stderr on failure so the caller can surface the real reason.
+    private struct CommitMessageResult {
+        let message: String?
+        let stderr: String?
+    }
+
+    /// Resolve the absolute path to the `claude` CLI by asking the user's login
+    /// shell. Cached after first resolution so we only shell out once.
+    nonisolated private static let resolvedClaudePath: String? = {
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: shell)
+        process.arguments = ["-l", "-c", "which claude"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        guard (try? process.run()) != nil else { return nil }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }()
+
     /// Generate a commit message by calling `claude -p` with the staged diff.
     /// Uses the same approach as ghostty-generate-title.sh — fast Haiku model, no project context.
-    nonisolated private static func generateCommitMessage(at projectRoot: String) -> String? {
+    nonisolated private static func generateCommitMessage(at projectRoot: String) -> CommitMessageResult {
         // Get staged diff (truncated to keep request small)
         let diffResult = runGitOutput(["diff", "--cached"], at: projectRoot)
-        guard diffResult.status == 0, !diffResult.output.isEmpty else { return nil }
+        guard diffResult.status == 0, !diffResult.output.isEmpty else {
+            return CommitMessageResult(message: nil, stderr: nil)
+        }
         let diff = String(diffResult.output.prefix(8000))
 
         // Get changed file names for context
@@ -1453,11 +1517,15 @@ class SidebarTabManager: ObservableObject {
         Files changed: \(files)\n\nDiff:\n\(diff)
         """
 
+        guard let claudePath = resolvedClaudePath else {
+            return CommitMessageResult(message: nil, stderr: "claude CLI not found in PATH")
+        }
+
         // Run claude -p from /tmp to avoid loading project context
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.executableURL = URL(fileURLWithPath: claudePath)
         process.arguments = [
-            "claude", "-p",
+            "-p",
             "--no-session-persistence",
             "--output-format", "json",
             "--model", "claude-haiku-4-5",
@@ -1466,34 +1534,52 @@ class SidebarTabManager: ObservableObject {
         ]
         process.currentDirectoryURL = URL(fileURLWithPath: "/tmp")
 
-        // Don't let this process touch the sidebar
+        // Don't let this process touch the sidebar.
         var env = ProcessInfo.processInfo.environment
         env.removeValue(forKey: "GHOSTTY_TAB_ID")
         env.removeValue(forKey: "GHOSTTY_SOCKET")
         process.environment = env
 
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
 
-        guard (try? process.run()) != nil else { return nil }
+        guard (try? process.run()) != nil else {
+            return CommitMessageResult(message: nil, stderr: "Failed to launch claude")
+        }
 
         // 30-second timeout for LLM call
         let done = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in done.signal() }
         if done.wait(timeout: .now() + .seconds(30)) == .timedOut {
             process.terminate()
-            return nil
+            return CommitMessageResult(message: nil, stderr: "claude timed out (30s)")
         }
 
-        guard process.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let errStr = String(data: errData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let stderrMsg = (errStr?.isEmpty == false) ? errStr : nil
+
+        guard process.terminationStatus == 0 else {
+            return CommitMessageResult(
+                message: nil,
+                stderr: stderrMsg ?? "claude exited with status \(process.terminationStatus)"
+            )
+        }
+
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
         guard let responseStr = String(data: data, encoding: .utf8),
-              !responseStr.isEmpty else { return nil }
+              !responseStr.isEmpty else {
+            return CommitMessageResult(message: nil, stderr: stderrMsg ?? "Empty response from claude")
+        }
 
         // Parse JSON response: first try { result: { message: "..." } } then { message: "..." }
         guard let responseData = responseStr.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else { return nil }
+              let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
+            return CommitMessageResult(message: nil, stderr: "Failed to parse claude JSON response")
+        }
 
         var message: String?
 
@@ -1521,14 +1607,16 @@ class SidebarTabManager: ObservableObject {
             message = json["message"] as? String
         }
 
-        guard var msg = message, !msg.isEmpty else { return nil }
+        guard var msg = message, !msg.isEmpty else {
+            return CommitMessageResult(message: nil, stderr: "No message field in claude response")
+        }
 
         // Sanitize: strip outer quotes
         if msg.hasPrefix("\"") { msg = String(msg.dropFirst()) }
         if msg.hasSuffix("\"") { msg = String(msg.dropLast()) }
         msg = msg.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        return msg.isEmpty ? nil : msg
+        return CommitMessageResult(message: msg.isEmpty ? nil : msg, stderr: nil)
     }
 
     /// Run a git command and return success/failure.
@@ -1566,26 +1654,6 @@ class SidebarTabManager: ObservableObject {
     }
 
     /// Show a macOS notification for git action results.
-    private static func showGitNotification(result: GitActionResult, action: String) {
-        let content = UNMutableNotificationContent()
-        switch result {
-        case .success(let message):
-            content.title = "\(action) Succeeded"
-            content.body = message
-        case .error(let message):
-            content.title = "\(action) Failed"
-            content.body = message
-        }
-        content.sound = .default
-
-        let request = UNNotificationRequest(
-            identifier: UUID().uuidString,
-            content: content,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request) { _ in }
-    }
-
     // MARK: - Tab Actions
 
     func createNewTab() {

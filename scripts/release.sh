@@ -86,6 +86,10 @@ else
     echo "==> Already up to date with upstream."
 fi
 
+# Push main to origin before building
+echo "==> Pushing main to origin..."
+git push origin main
+
 # Check if tag already exists
 if git rev-parse "$TAG" >/dev/null 2>&1; then
     echo "Error: tag ${TAG} already exists."

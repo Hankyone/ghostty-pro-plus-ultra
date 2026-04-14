@@ -187,7 +187,7 @@ private struct ProjectSection: View {
                     onGitCommitAndPush: group.projectRoot != nil ? {
                         tabManager.gitCommitAndPush(projectRoot: group.projectRoot!)
                     } : nil,
-                    gitActionInProgress: tabManager.isGitActionInProgress(forProjectRoot: group.projectRoot)
+                    gitActionStatus: tabManager.gitActionStatus(forProjectRoot: group.projectRoot)
                 )
             }
             .buttonStyle(.plain)
@@ -265,7 +265,7 @@ private struct ProjectSection: View {
             let primaryTitle = sessionTitleEntry?.value ?? tab.displayTitle
 
             Text(primaryTitle)
-                .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
+                .font(.system(size: 11))
                 .foregroundColor(titleColor)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -387,8 +387,12 @@ private struct ProjectHeader: View {
     var onGitCommit: (() -> Void)? = nil
     var onGitPush: (() -> Void)? = nil
     var onGitCommitAndPush: (() -> Void)? = nil
-    var gitActionInProgress: Bool = false
+    var gitActionStatus: SidebarTabManager.GitActionStatus? = nil
     @State private var isNewTabHovered = false
+
+    private var gitActionInProgress: Bool {
+        gitActionStatus == .inProgress
+    }
 
     var body: some View {
         HStack(spacing: 6) {
@@ -426,8 +430,21 @@ private struct ProjectHeader: View {
 
             Spacer()
 
+            // Git action status indicator (spinner / error)
+            if case .inProgress = gitActionStatus {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.6)
+                    .frame(width: 14, height: 14)
+            } else if case .error(let message) = gitActionStatus {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(.red)
+                    .help(message)
+            }
+
             // Git diff stats
-            if let stats = group.gitDiffStats {
+            if let stats = group.gitDiffStats, gitActionStatus != .inProgress {
                 Text(stats)
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundColor(theme.secondaryText)
@@ -492,7 +509,7 @@ private struct ProjectHeader: View {
                     }
                     .frame(width: 20, height: 20)
                 }
-                .id(gitActionInProgress)
+                .id(gitActionStatus == .inProgress)
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .fixedSize()
