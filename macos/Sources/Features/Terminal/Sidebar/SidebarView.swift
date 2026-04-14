@@ -300,6 +300,7 @@ private struct ProjectSection: View {
             tabManager: tabManager,
             currentTab: tab,
             currentIndex: tabIndex,
+            groupID: group.id,
             draggingTabID: $draggingTabID,
             dropTargetTabID: $dropTargetTabID
         ))
@@ -565,10 +566,19 @@ private struct TabDropDelegate: DropDelegate {
     let tabManager: SidebarTabManager
     let currentTab: SidebarTabManager.TabItem
     let currentIndex: Int
+    let groupID: String
     @Binding var draggingTabID: ObjectIdentifier?
     @Binding var dropTargetTabID: ObjectIdentifier?
 
+    /// The project root of the tab being dragged, or nil if not found.
+    private var draggingGroupID: String? {
+        guard let id = draggingTabID else { return nil }
+        return tabManager.tabs.first(where: { $0.id == id })?.projectRoot
+    }
+
     func dropEntered(info: DropInfo) {
+        // Only show the drop indicator if the tab belongs to the same project.
+        guard draggingGroupID == groupID else { return }
         dropTargetTabID = currentTab.id
     }
 
@@ -579,11 +589,15 @@ private struct TabDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
+        // Reject cross-project drops visually.
+        guard draggingGroupID == groupID else {
+            return DropProposal(operation: .forbidden)
+        }
+        return DropProposal(operation: .move)
     }
 
     func validateDrop(info: DropInfo) -> Bool {
-        draggingTabID != nil && draggingTabID != currentTab.id
+        draggingTabID != nil && draggingTabID != currentTab.id && draggingGroupID == groupID
     }
 
     func performDrop(info: DropInfo) -> Bool {
@@ -592,6 +606,7 @@ private struct TabDropDelegate: DropDelegate {
             self.dropTargetTabID = nil
         }
         guard let draggingTabID else { return false }
+        guard draggingGroupID == groupID else { return false }
         guard let sourceIndex = tabManager.tabs.firstIndex(where: { $0.id == draggingTabID }) else { return false }
 
         tabManager.moveTab(from: sourceIndex, to: currentIndex)

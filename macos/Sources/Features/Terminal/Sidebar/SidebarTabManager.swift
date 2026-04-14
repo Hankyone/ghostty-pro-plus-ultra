@@ -1187,6 +1187,14 @@ class SidebarTabManager: ObservableObject {
             metadataStore.sweepStaleClaude()
         }
 
+        // Refresh recent sessions cache independently of the fingerprint gate.
+        // This must run on every timer tick (throttled internally to 30s) so the
+        // cache is populated even when nothing else changes.
+        let sessionRoots = Set(newTabs.compactMap(\.projectRoot))
+        if !sessionRoots.isEmpty {
+            refreshRecentSessions(roots: sessionRoots)
+        }
+
         // Now apply the fingerprint gate: if nothing observable changed on a
         // timer tick, skip the (relatively expensive) tabs/groups rebuild.
         if let fp = timerFingerprint, fp == lastRefreshFingerprint {
@@ -1206,10 +1214,6 @@ class SidebarTabManager: ObservableObject {
         // Sync the FSEvents git watcher with current project roots.
         let activeRoots = Set(newTabs.compactMap(\.projectRoot))
         gitStatsWatcher.sync(projectRoots: activeRoots)
-
-        // Refresh recent sessions cache in the background. The cache is
-        // @Published so changes trigger a view re-render.
-        refreshRecentSessions()
 
         let currentSelectedID = ObjectIdentifier(selectedWindow)
         if selectedTabID != currentSelectedID {
@@ -1318,20 +1322,22 @@ class SidebarTabManager: ObservableObject {
         return recentSessionsCache[key] ?? []
     }
 
-    /// Refresh the recent sessions cache if stale. Called from refresh() so
-    /// the cache is populated before the view ever reads it.
-    private func refreshRecentSessions() {
+    /// Refresh the recent sessions cache if stale. Called from refresh()
+    /// BEFORE the fingerprint gate so it runs on every timer tick.
+    /// Internally throttled to 30-second intervals.
+    private func refreshRecentSessions(roots: Set<String>) {
         guard Date().timeIntervalSince(recentSessionsCacheTime) >= Self.recentSessionsCacheInterval else { return }
         recentSessionsCacheTime = Date()
-        let roots = Set(projectGroups.compactMap(\.projectRoot))
-        guard !roots.isEmpty else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var newCache: [String: [RecentSession]] = [:]
             for r in roots {
                 newCache[r] = Self.scanRecentSessions(forProjectRoot: r)
             }
             DispatchQueue.main.async {
-                self?.recentSessionsCache = newCache
+                guard let self else { return }
+                self.recentSessionsCache = newCache
+                // Force a view rebuild so the Menu picks up the new sessions.
+                self.projectGroups = self.buildProjectGroups(from: self.tabs)
             }
         }
     }
