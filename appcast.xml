@@ -6,13 +6,13 @@
     <description>Updates for Ghostty Pro Plus Ultra</description>
     <language>en</language>
     <item>
-      <title>Version 1.1.6</title>
-      <pubDate>Tue, 14 Apr 2026 00:02:05 +0000</pubDate>
-      <sparkle:version>15995</sparkle:version>
-      <sparkle:shortVersionString>1.1.6</sparkle:shortVersionString>
+      <title>Version 1.1.7</title>
+      <pubDate>Tue, 14 Apr 2026 01:16:47 +0000</pubDate>
+      <sparkle:version>15996</sparkle:version>
+      <sparkle:shortVersionString>1.1.7</sparkle:shortVersionString>
       <enclosure
-        url="https://github.com/Hankyone/ghostty-pro-plus-ultra/releases/download/ppu-v1.1.6/GhosttyProPlusUltra-1.1.6.dmg"
-        sparkle:edSignature="C5Atw5uhz0aG2UrbS1eP9QQqNjmCNkbaE01ek2LbIOd1QheCM7QorEh7JsuRRjaC5awr8+t22HXQkKcu76E2Bg==" length="33907439"
+        url="https://github.com/Hankyone/ghostty-pro-plus-ultra/releases/download/ppu-v1.1.7/GhosttyProPlusUltra-1.1.7.dmg"
+        sparkle:edSignature="gKMUENVHRq0wKCl6PDsrOsKCeZn+aDlImBccDmz7My3F1yrPMGjErSI7V+LhmVXt6ZHZhB/JY1HoyvmKzwhXAg==" length="33908239"
         type="application/octet-stream" />
     </item>
   </channel>
