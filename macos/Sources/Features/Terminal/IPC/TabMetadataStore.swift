@@ -20,6 +20,11 @@ final class TabMetadataStore: ObservableObject {
     /// Status entries keyed by tab UUID, then by status key
     @Published private(set) var entries: [UUID: [String: StatusEntry]] = [:]
 
+    /// Tracks the last-acknowledged completion token per surface UUID.
+    /// Shared across all SidebarTabManager instances so tab switching
+    /// doesn't lose acknowledgment state.
+    var acknowledgedDoneToken: [UUID: String] = [:]
+
     /// Keys that are transient and should not be persisted to disk.
     private static let transientKeys: Set<String> = ["claude-pid", "claude-active", "claude-done-at", "codex-pid", "codex-active", "codex-done-at"]
 
@@ -127,7 +132,8 @@ final class TabMetadataStore: ObservableObject {
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first else { return nil }
-        let dir = appSupport.appendingPathComponent("com.mitchellh.ghostty")
+        let bundleId = Bundle.main.bundleIdentifier ?? "com.mitchellh.ghostty"
+        let dir = appSupport.appendingPathComponent(bundleId)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("tab-metadata.json")
     }

@@ -111,11 +111,6 @@ class SidebarTabManager: ObservableObject {
     /// Windows that need attention, cleared when the tab is selected.
     private var attentionWindows: Set<ObjectIdentifier> = []
 
-    /// Tracks the last-acknowledged completion token per surface UUID.
-    /// When a tab's current done-at token differs from the acknowledged one,
-    /// the green dot pulses to indicate an unread completion.
-    private var acknowledgedDoneToken: [UUID: String] = [:]
-
     /// Whether bells should trigger the sidebar attention indicator.
     /// Derived from `bell-features` containing `attention`.
     private let bellTriggersAttention: Bool
@@ -317,7 +312,7 @@ class SidebarTabManager: ObservableObject {
         let isClaudeSession = tab.statusEntries.contains(where: { $0.key == "claude-session" })
         let doneAtKey = isClaudeSession ? "claude-done-at" : "codex-done-at"
         guard let token = tab.statusEntries.first(where: { $0.key == doneAtKey })?.value else { return }
-        acknowledgedDoneToken[sid] = token
+        TabMetadataStore.shared.acknowledgedDoneToken[sid] = token
     }
 
     // MARK: - Project Root Detection
@@ -1098,7 +1093,13 @@ class SidebarTabManager: ObservableObject {
             let doneToken = entries.first(where: { $0.key == doneAtKey })?.value
             var unread = false
             if let sid, let token = doneToken {
-                unread = acknowledgedDoneToken[sid] != token
+                let isSelected = (w == selectedWindow)
+                if isSelected {
+                    // Auto-acknowledge: user is already looking at this tab
+                    metadataStore.acknowledgedDoneToken[sid] = token
+                } else {
+                    unread = metadataStore.acknowledgedDoneToken[sid] != token
+                }
             }
 
             return TabItem(
@@ -1251,7 +1252,7 @@ class SidebarTabManager: ObservableObject {
         case lastActivity = "Last activity"
     }
 
-    @Published var projectSortMode: SortMode = .manual
+    @Published var projectSortMode: SortMode = SortMode(rawValue: UserDefaults.standard.string(forKey: "SidebarProjectSort") ?? "") ?? .manual
 
     func setProjectSortMode(_ mode: SortMode) {
         projectSortMode = mode

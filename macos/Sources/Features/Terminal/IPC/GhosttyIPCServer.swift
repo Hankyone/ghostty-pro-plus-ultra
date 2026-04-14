@@ -482,5 +482,11 @@ final class GhosttyIPCServer {
                 written += n
             }
         }
+        // Close the connection after sending the response so `nc` (the IPC
+        // client) sees EOF and exits immediately. Without this, `nc -U`
+        // hangs waiting for more data, which can block sequential hook calls.
+        close(client.fd)
+        disconnectClient(client)
+        clients.removeValue(forKey: client.fd)
     }
 }
