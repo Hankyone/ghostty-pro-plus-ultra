@@ -223,8 +223,11 @@ private struct ProjectSection: View {
         let tabIndex = tabManager.tabs.firstIndex(where: { $0.id == tab.id }) ?? 0
 
         let sessionTitleEntry = tab.statusEntries.first(where: { $0.key == "session-title" })
-        let sessionStatusEntry = tab.statusEntries.first(where: { $0.key == "claude" || $0.key == "codex" })
-        let activeEntry = tab.statusEntries.first(where: { $0.key == "claude-active" || $0.key == "codex-active" })
+        // Determine the current agent from the mutually-exclusive session key,
+        // then scope all agent-specific lookups to avoid stale cross-agent state.
+        let isClaudeSession = tab.statusEntries.contains(where: { $0.key == "claude-session" })
+        let sessionStatusEntry = tab.statusEntries.first(where: { $0.key == (isClaudeSession ? "claude" : "codex") })
+        let activeEntry = tab.statusEntries.first(where: { $0.key == (isClaudeSession ? "claude-active" : "codex-active") })
         let titleColor = isSelected || isHovered ? theme.foreground : theme.secondaryText
         let subtitleColor = isSelected || isHovered ? theme.foreground.opacity(0.7) : theme.secondaryText
         // Tab color tint — subtle background wash instead of a left bar

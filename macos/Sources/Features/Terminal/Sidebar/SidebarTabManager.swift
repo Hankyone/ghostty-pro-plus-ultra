@@ -315,8 +315,9 @@ class SidebarTabManager: ObservableObject {
     /// Acknowledge the current completion token for a tab so its green dot stops pulsing.
     private func acknowledgeCompletion(for tab: TabItem) {
         guard let sid = tab.surfaceId else { return }
-        let token = tab.statusEntries.first(where: { $0.key == "claude-done-at" || $0.key == "codex-done-at" })?.value
-        guard let token else { return }
+        let isClaudeSession = tab.statusEntries.contains(where: { $0.key == "claude-session" })
+        let doneAtKey = isClaudeSession ? "claude-done-at" : "codex-done-at"
+        guard let token = tab.statusEntries.first(where: { $0.key == doneAtKey })?.value else { return }
         acknowledgedDoneToken[sid] = token
     }
 
@@ -1092,16 +1093,13 @@ class SidebarTabManager: ObservableObject {
             let color = (w as? TerminalWindow)?.tabColor ?? .none
 
             // Determine whether this tab has an unread completion.
-            let doneToken = entries.first(where: { $0.key == "claude-done-at" || $0.key == "codex-done-at" })?.value
-            let isCurrentTab = wid == selectedTabID
+            // Scope to the current agent via the mutually-exclusive session key.
+            let isClaudeSession = entries.contains(where: { $0.key == "claude-session" })
+            let doneAtKey = isClaudeSession ? "claude-done-at" : "codex-done-at"
+            let doneToken = entries.first(where: { $0.key == doneAtKey })?.value
             var unread = false
             if let sid, let token = doneToken {
-                if isCurrentTab {
-                    // Auto-ack: tab is frontmost, so mark as read immediately
-                    acknowledgedDoneToken[sid] = token
-                } else {
-                    unread = acknowledgedDoneToken[sid] != token
-                }
+                unread = acknowledgedDoneToken[sid] != token
             }
 
             return TabItem(

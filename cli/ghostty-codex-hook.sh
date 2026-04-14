@@ -111,6 +111,8 @@ case "$event" in
   Stop)
     # Codex finished — mark as done (keep codex-active so the green dot persists)
     "$GHOSTTYCTL" set-status codex-active "done" >/dev/null 2>&1 || true
+    # Emit a completion token so the sidebar can track unread completions
+    "$GHOSTTYCTL" set-status codex-done-at "$(uuidgen)" >/dev/null 2>&1 || true
 
     # Clean up transient metadata (preserve session-title and codex-active)
     "$GHOSTTYCTL" clear-status codex >/dev/null 2>&1 || true

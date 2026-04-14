@@ -147,6 +147,8 @@ case "$event" in
   Stop|StopFailure)
     # Claude finished responding (or hit an API error) — show "done" indicator
     "$GHOSTTYCTL" set-status claude-active "done" 2>/dev/null || true
+    # Emit a completion token so the sidebar can track unread completions
+    "$GHOSTTYCTL" set-status claude-done-at "$(uuidgen)" 2>/dev/null || true
     # Clean up any leftover question file
     rm -f "$QUESTION_FILE"
     ;;
@@ -155,6 +157,7 @@ case "$event" in
     # Clear transient status but preserve session-title for session history
     "$GHOSTTYCTL" clear-status claude 2>/dev/null || true
     "$GHOSTTYCTL" clear-status claude-active 2>/dev/null || true
+    "$GHOSTTYCTL" clear-status claude-done-at 2>/dev/null || true
     "$GHOSTTYCTL" clear-status claude-pid 2>/dev/null || true
     rm -f "$PID_FILE" "$QUESTION_FILE" "$TAB_ID_FILE"
     ;;
