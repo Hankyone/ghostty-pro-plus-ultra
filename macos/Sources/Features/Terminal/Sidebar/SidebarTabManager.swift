@@ -1,5 +1,6 @@
 import Cocoa
 import Combine
+import UserNotifications
 
 /// Observes the tab group of a window and publishes tab metadata for the sidebar.
 @MainActor
@@ -12,6 +13,8 @@ class SidebarTabManager: ObservableObject {
         let surfaceId: UUID?
         let statusEntries: [TabMetadataStore.StatusEntry]
         let needsAttention: Bool
+        /// True when the tab has a completion that hasn't been viewed yet.
+        let hasUnreadCompletion: Bool
         let tabColor: TerminalTabColor
         let faviconImage: NSImage?
         let window: NSWindow
@@ -48,6 +51,7 @@ class SidebarTabManager: ObservableObject {
                 && lhs.surfaceId == rhs.surfaceId
                 && lhs.statusEntries == rhs.statusEntries
                 && lhs.needsAttention == rhs.needsAttention
+                && lhs.hasUnreadCompletion == rhs.hasUnreadCompletion
                 && lhs.tabColor == rhs.tabColor
                 && lhs.faviconImage === rhs.faviconImage
                 && lhs.projectRoot == rhs.projectRoot
@@ -108,6 +112,11 @@ class SidebarTabManager: ObservableObject {
     /// Windows that need attention, cleared when the tab is selected.
     private var attentionWindows: Set<ObjectIdentifier> = []
 
+    /// Tracks the last-acknowledged completion token per surface UUID.
+    /// When a tab's current done-at token differs from the acknowledged one,
+    /// the green dot pulses to indicate an unread completion.
+    private var acknowledgedDoneToken: [UUID: String] = [:]
+
     /// Whether bells should trigger the sidebar attention indicator.
     /// Derived from `bell-features` containing `attention`.
     private let bellTriggersAttention: Bool
@@ -123,9 +132,9 @@ class SidebarTabManager: ObservableObject {
     /// Pwds currently being detected in the background, to avoid duplicate work.
     private static var faviconDetectionInFlight: Set<String> = []
 
-    /// FSEvents-based git stats watcher — per-project isolation with 2s debounce
-    /// and 30s fallback poll. Replaces the old 5-second polling approach.
-    private let gitStatsWatcher = GitStatsWatcher()
+    /// Shared FSEvents-based git stats watcher — all tab managers read from the
+    /// same store so switching tabs never loses project-level stats.
+    private var gitStatsWatcher: GitStatsWatcher { GitStatsWatcher.shared }
 
     /// Throttle for stale Claude PID sweeping (every 30s).
     private var lastPidSweepTime: Date = .distantPast
@@ -148,7 +157,8 @@ class SidebarTabManager: ObservableObject {
     init(window: NSWindow, bellTriggersAttention: Bool = true) {
         self.window = window
         self.bellTriggersAttention = bellTriggersAttention
-        gitStatsWatcher.onChange = { [weak self] in
+        let observerId = ObjectIdentifier(self)
+        gitStatsWatcher.addChangeObserver(id: observerId) { [weak self] in
             self?.refresh(reason: "git stats changed")
         }
         setupObservers()
@@ -157,7 +167,7 @@ class SidebarTabManager: ObservableObject {
 
     deinit {
         timer?.invalidate()
-        gitStatsWatcher.stopAll()
+        GitStatsWatcher.shared.removeChangeObserver(id: ObjectIdentifier(self))
         observers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
@@ -293,12 +303,21 @@ class SidebarTabManager: ObservableObject {
                 id: old.id, title: old.title, pwd: old.pwd,
                 gitDiffStats: old.gitDiffStats, surfaceId: old.surfaceId,
                 statusEntries: old.statusEntries, needsAttention: false,
+                hasUnreadCompletion: old.hasUnreadCompletion,
                 tabColor: old.tabColor, faviconImage: old.faviconImage,
                 window: old.window, projectRoot: old.projectRoot,
                 lastActivity: old.lastActivity,
                 createdAt: old.createdAt
             )
         }
+    }
+
+    /// Acknowledge the current completion token for a tab so its green dot stops pulsing.
+    private func acknowledgeCompletion(for tab: TabItem) {
+        guard let sid = tab.surfaceId else { return }
+        let token = tab.statusEntries.first(where: { $0.key == "claude-done-at" || $0.key == "codex-done-at" })?.value
+        guard let token else { return }
+        acknowledgedDoneToken[sid] = token
     }
 
     // MARK: - Project Root Detection
@@ -1072,6 +1091,19 @@ class SidebarTabManager: ObservableObject {
             }
             let color = (w as? TerminalWindow)?.tabColor ?? .none
 
+            // Determine whether this tab has an unread completion.
+            let doneToken = entries.first(where: { $0.key == "claude-done-at" || $0.key == "codex-done-at" })?.value
+            let isCurrentTab = wid == selectedTabID
+            var unread = false
+            if let sid, let token = doneToken {
+                if isCurrentTab {
+                    // Auto-ack: tab is frontmost, so mark as read immediately
+                    acknowledgedDoneToken[sid] = token
+                } else {
+                    unread = acknowledgedDoneToken[sid] != token
+                }
+            }
+
             return TabItem(
                 id: wid,
                 title: w.title,
@@ -1080,6 +1112,7 @@ class SidebarTabManager: ObservableObject {
                 surfaceId: sid,
                 statusEntries: entries,
                 needsAttention: attentionWindows.contains(wid),
+                hasUnreadCompletion: unread,
                 tabColor: color,
                 faviconImage: favicon,
                 window: w,
@@ -1187,14 +1220,6 @@ class SidebarTabManager: ObservableObject {
             metadataStore.sweepStaleClaude()
         }
 
-        // Refresh recent sessions cache independently of the fingerprint gate.
-        // This must run on every timer tick (throttled internally to 30s) so the
-        // cache is populated even when nothing else changes.
-        let sessionRoots = Set(newTabs.compactMap(\.projectRoot))
-        if !sessionRoots.isEmpty {
-            refreshRecentSessions(roots: sessionRoots)
-        }
-
         // Now apply the fingerprint gate: if nothing observable changed on a
         // timer tick, skip the (relatively expensive) tabs/groups rebuild.
         if let fp = timerFingerprint, fp == lastRefreshFingerprint {
@@ -1298,223 +1323,269 @@ class SidebarTabManager: ObservableObject {
         )
     }
 
-    // MARK: - Session History
+    // MARK: - Git Actions
 
-    /// A recent session from Claude Code or Codex that can be resumed.
-    struct RecentSession: Identifiable {
-        let id: String  // session UUID
-        let title: String  // our generated title, or truncated first message (for display)
-        let fullTitle: String  // untruncated text (for tooltip)
-        let tool: SidebarTool
-        let projectPath: String  // the project directory
-        let timestamp: Date
-    }
+    /// Whether a git action (commit/push) is currently in progress for a project.
+    @Published private var gitActionInProgress: Set<String> = []
 
-    /// Cached recent sessions per project root. Refreshed every 30 seconds
-    /// as part of the timer-based refresh() cycle.
-    @Published private var recentSessionsCache: [String: [RecentSession]] = [:]
-    private var recentSessionsCacheTime: Date = .distantPast
-    private static let recentSessionsCacheInterval: TimeInterval = 30.0
+    /// Run git commit with an AI-generated commit message for a project.
+    func gitCommit(projectRoot: String) {
+        guard !gitActionInProgress.contains(projectRoot) else { return }
+        gitActionInProgress.insert(projectRoot)
 
-    /// Returns cached recent sessions for a project.
-    func cachedRecentSessions(forProjectRoot root: String?) -> [RecentSession] {
-        let key = root ?? "__other__"
-        return recentSessionsCache[key] ?? []
-    }
-
-    /// Refresh the recent sessions cache if stale. Called from refresh()
-    /// BEFORE the fingerprint gate so it runs on every timer tick.
-    /// Internally throttled to 30-second intervals.
-    private func refreshRecentSessions(roots: Set<String>) {
-        guard Date().timeIntervalSince(recentSessionsCacheTime) >= Self.recentSessionsCacheInterval else { return }
-        recentSessionsCacheTime = Date()
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            var newCache: [String: [RecentSession]] = [:]
-            for r in roots {
-                newCache[r] = Self.scanRecentSessions(forProjectRoot: r)
-            }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.performGitCommit(at: projectRoot)
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.recentSessionsCache = newCache
-                // Force a view rebuild so the Menu picks up the new sessions.
-                self.projectGroups = self.buildProjectGroups(from: self.tabs)
+                self?.gitActionInProgress.remove(projectRoot)
+                self?.gitStatsWatcher.refreshAll()
+                Self.showGitNotification(result: result, action: "Commit")
             }
         }
     }
 
-    /// Scan Claude Code and Codex session files to find recent sessions for a project.
-    /// Returns up to `limit` sessions, most recent first.
-    /// This is nonisolated/static so it can safely run on any thread.
-    nonisolated private static func scanRecentSessions(forProjectRoot root: String?, limit: Int = 10) -> [RecentSession] {
-        var sessions: [RecentSession] = []
-        let fm = FileManager.default
-        let titleStoreBase = NSHomeDirectory() + "/Library/Application Support/com.mitchellh.ghostty"
+    /// Push the current branch to remote for a project.
+    func gitPush(projectRoot: String) {
+        guard !gitActionInProgress.contains(projectRoot) else { return }
+        gitActionInProgress.insert(projectRoot)
 
-        // Scan Claude Code sessions
-        if let root {
-            let encodedPath = root.replacingOccurrences(of: "/", with: "-")
-            let claudeDir = NSHomeDirectory() + "/.claude/projects/" + encodedPath
-            let claudeTitleDir = titleStoreBase + "/claude-sessions"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.performGitPush(at: projectRoot)
+            DispatchQueue.main.async {
+                self?.gitActionInProgress.remove(projectRoot)
+                Self.showGitNotification(result: result, action: "Push")
+            }
+        }
+    }
 
-            if let files = try? fm.contentsOfDirectory(atPath: claudeDir) {
-                for file in files where file.hasSuffix(".jsonl") && !file.contains("subagents") {
-                    let sessionId = String(file.dropLast(6))  // remove .jsonl
-                    let filePath = (claudeDir as NSString).appendingPathComponent(file)
+    /// Commit all changes and push in one action.
+    func gitCommitAndPush(projectRoot: String) {
+        guard !gitActionInProgress.contains(projectRoot) else { return }
+        gitActionInProgress.insert(projectRoot)
 
-                    // Get modification date as proxy for last activity
-                    guard let attrs = try? fm.attributesOfItem(atPath: filePath),
-                          let modDate = attrs[.modificationDate] as? Date else { continue }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let commitResult = Self.performGitCommit(at: projectRoot)
+            guard case .success = commitResult else {
+                DispatchQueue.main.async {
+                    self?.gitActionInProgress.remove(projectRoot)
+                    self?.gitStatsWatcher.refreshAll()
+                    Self.showGitNotification(result: commitResult, action: "Commit")
+                }
+                return
+            }
+            let pushResult = Self.performGitPush(at: projectRoot)
+            DispatchQueue.main.async {
+                self?.gitActionInProgress.remove(projectRoot)
+                self?.gitStatsWatcher.refreshAll()
+                if case .success = pushResult {
+                    Self.showGitNotification(result: .success("Committed and pushed"), action: "Commit & Push")
+                } else {
+                    // Commit succeeded but push failed
+                    Self.showGitNotification(result: pushResult, action: "Push")
+                }
+            }
+        }
+    }
 
-                    // Only include sessions from last 30 days
-                    guard Date().timeIntervalSince(modDate) < 30 * 24 * 3600 else { continue }
+    /// Check whether a git action is in progress for a project root.
+    func isGitActionInProgress(forProjectRoot root: String?) -> Bool {
+        guard let root else { return false }
+        return gitActionInProgress.contains(root)
+    }
 
-                    // Check for our generated title first
-                    let titleFile = (claudeTitleDir as NSString).appendingPathComponent(sessionId + ".title")
-                    var title: String?
-                    if let savedTitle = try? String(contentsOfFile: titleFile, encoding: .utf8), !savedTitle.isEmpty {
-                        title = savedTitle
-                    }
+    private enum GitActionResult {
+        case success(String)
+        case error(String)
+    }
 
-                    // Fall back to reading first user message from JSONL
-                    var fullText: String?
-                    if title == nil {
-                        fullText = Self.firstUserMessage(fromJSONL: filePath)
-                        if let ft = fullText {
-                            title = ft.count > 60 ? String(ft.prefix(57)) + "..." : ft
-                        }
-                    }
+    /// Stage all changes, generate a commit message, and commit. Runs on background thread.
+    nonisolated private static func performGitCommit(at projectRoot: String) -> GitActionResult {
+        // Stage all changes
+        guard runGit(["add", "-A"], at: projectRoot) else {
+            return .error("Failed to stage changes")
+        }
 
-                    guard let title, !title.isEmpty else { continue }
-                    // Skip title generation junk
-                    guard !title.contains("concise tab titles") && !title.contains("Return JSON") && !title.contains("Return ONLY") else { continue }
+        // Check if there's anything staged
+        let diffCheck = runGitOutput(["diff", "--cached", "--quiet"], at: projectRoot)
+        if diffCheck.status == 0 {
+            return .error("No changes to commit")
+        }
 
-                    sessions.append(RecentSession(
-                        id: sessionId, title: title, fullTitle: fullText ?? title,
-                        tool: .claudeCode, projectPath: root, timestamp: modDate
-                    ))
+        // Generate commit message via LLM
+        let message = generateCommitMessage(at: projectRoot)
+        guard let message, !message.isEmpty else {
+            // Unstage so we don't leave things in a weird state
+            _ = runGit(["reset", "HEAD"], at: projectRoot)
+            return .error("Failed to generate commit message")
+        }
+
+        guard runGit(["commit", "-m", message], at: projectRoot) else {
+            return .error("Failed to commit")
+        }
+        return .success(message)
+    }
+
+    /// Push the current branch to its remote. Runs on background thread.
+    nonisolated private static func performGitPush(at projectRoot: String) -> GitActionResult {
+        let result = runGitOutput(["push"], at: projectRoot)
+        if result.status == 0 {
+            return .success("Pushed successfully")
+        } else {
+            let errMsg = result.output.isEmpty ? "Push failed" : result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .error(errMsg)
+        }
+    }
+
+    /// Generate a commit message by calling `claude -p` with the staged diff.
+    /// Uses the same approach as ghostty-generate-title.sh — fast Haiku model, no project context.
+    nonisolated private static func generateCommitMessage(at projectRoot: String) -> String? {
+        // Get staged diff (truncated to keep request small)
+        let diffResult = runGitOutput(["diff", "--cached"], at: projectRoot)
+        guard diffResult.status == 0, !diffResult.output.isEmpty else { return nil }
+        let diff = String(diffResult.output.prefix(8000))
+
+        // Get changed file names for context
+        let filesResult = runGitOutput(["diff", "--cached", "--name-only"], at: projectRoot)
+        let files = filesResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let prompt = """
+        Return ONLY a JSON object {"message":"..."} with a good git commit message. \
+        Use lowercase, imperative mood. If you can identify the subsystem from \
+        file paths, prefix the subject with it (e.g. 'macos: fix tab rendering'). \
+        Include a body after a blank line if the changes warrant explanation. \
+        Files changed: \(files)\n\nDiff:\n\(diff)
+        """
+
+        // Run claude -p from /tmp to avoid loading project context
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [
+            "claude", "-p",
+            "--no-session-persistence",
+            "--output-format", "json",
+            "--model", "claude-haiku-4-5",
+            "--dangerously-skip-permissions",
+            prompt,
+        ]
+        process.currentDirectoryURL = URL(fileURLWithPath: "/tmp")
+
+        // Don't let this process touch the sidebar
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "GHOSTTY_TAB_ID")
+        env.removeValue(forKey: "GHOSTTY_SOCKET")
+        process.environment = env
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        guard (try? process.run()) != nil else { return nil }
+
+        // 30-second timeout for LLM call
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        if done.wait(timeout: .now() + .seconds(30)) == .timedOut {
+            process.terminate()
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let responseStr = String(data: data, encoding: .utf8),
+              !responseStr.isEmpty else { return nil }
+
+        // Parse JSON response: first try { result: { message: "..." } } then { message: "..." }
+        guard let responseData = responseStr.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else { return nil }
+
+        var message: String?
+
+        // Try nested: { result: "{ \"message\": ... }" } (claude -p --output-format json wraps in result)
+        if let inner = json["result"] as? String {
+            if let innerData = inner.data(using: .utf8),
+               let innerJson = try? JSONSerialization.jsonObject(with: innerData) as? [String: Any] {
+                message = innerJson["message"] as? String
+            }
+            // Try stripping markdown code fences
+            if message == nil {
+                let stripped = inner
+                    .replacingOccurrences(of: "```json", with: "")
+                    .replacingOccurrences(of: "```", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let d = stripped.data(using: .utf8),
+                   let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                    message = j["message"] as? String
                 }
             }
         }
 
-        // Scan Codex sessions from SQLite database
-        if let root {
-            let codexDb = NSHomeDirectory() + "/.codex/state_5.sqlite"
-            let codexTitleDir = titleStoreBase + "/codex-sessions"
-            if fm.fileExists(atPath: codexDb) {
-                // Use sqlite3 CLI to query threads for this project
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-                process.arguments = [codexDb, "-json",
-                    "SELECT id, title, first_user_message, updated_at FROM threads WHERE cwd = '\(root.replacingOccurrences(of: "'", with: "''"))' AND archived = 0 ORDER BY updated_at DESC LIMIT \(limit)"]
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = Pipe()
-                if let _ = try? process.run() {
-                    process.waitUntilExit()
-                    if process.terminationStatus == 0,
-                       let data = try? pipe.fileHandleForReading.readDataToEndOfFile(),
-                       let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                        for row in rows {
-                            guard let sessionId = row["id"] as? String else { continue }
-                            let updatedAt = row["updated_at"] as? Double ?? 0
-                            let timestamp = Date(timeIntervalSince1970: updatedAt)
-                            guard Date().timeIntervalSince(timestamp) < 30 * 24 * 3600 else { continue }
-
-                            // Check for our generated title first
-                            let titleFile = (codexTitleDir as NSString).appendingPathComponent(sessionId + ".title")
-                            var title: String?
-                            var fullText: String?
-                            if let saved = try? String(contentsOfFile: titleFile, encoding: .utf8), !saved.isEmpty {
-                                title = saved
-                                fullText = saved
-                            }
-                            // Fall back to Codex's own title or first_user_message
-                            if title == nil {
-                                if let t = row["title"] as? String, !t.isEmpty {
-                                    fullText = t
-                                    title = t.count > 60 ? String(t.prefix(57)) + "..." : t
-                                } else if let msg = row["first_user_message"] as? String, !msg.isEmpty {
-                                    fullText = msg
-                                    title = msg.count > 60 ? String(msg.prefix(57)) + "..." : msg
-                                }
-                            }
-
-                            guard let title, !title.isEmpty else { continue }
-                            sessions.append(RecentSession(
-                                id: sessionId, title: title, fullTitle: fullText ?? title,
-                                tool: .codex, projectPath: root, timestamp: timestamp
-                            ))
-                        }
-                    }
-                }
-            }
+        // Direct top-level
+        if message == nil {
+            message = json["message"] as? String
         }
 
-        // Sort by most recent, take limit
-        sessions.sort { $0.timestamp > $1.timestamp }
-        return Array(sessions.prefix(limit))
+        guard var msg = message, !msg.isEmpty else { return nil }
+
+        // Sanitize: strip outer quotes
+        if msg.hasPrefix("\"") { msg = String(msg.dropFirst()) }
+        if msg.hasSuffix("\"") { msg = String(msg.dropLast()) }
+        msg = msg.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return msg.isEmpty ? nil : msg
     }
 
-    /// Extract the first user message from a Claude Code JSONL session file.
-    /// Returns the full untruncated message text.
-    nonisolated private static func firstUserMessage(fromJSONL path: String) -> String? {
-        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
-        defer { handle.closeFile() }
-        // Read first 16KB to find the first user message
-        let data = handle.readData(ofLength: 16384)
-        guard let text = String(data: data, encoding: .utf8) else { return nil }
-
-        for line in text.components(separatedBy: "\n") {
-            guard !line.isEmpty else { continue }
-            guard let jsonData = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
-                  obj["type"] as? String == "user" else { continue }
-
-            if let message = obj["message"] as? [String: Any],
-               let content = message["content"] as? String {
-                return content.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-        }
-        return nil
+    /// Run a git command and return success/failure.
+    nonisolated private static func runGit(_ args: [String], at dir: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = args
+        process.currentDirectoryURL = URL(fileURLWithPath: dir)
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        guard (try? process.run()) != nil else { return false }
+        process.waitUntilExit()
+        return process.terminationStatus == 0
     }
 
-    /// Resume a specific session by creating a new tab and running the resume command.
-    func resumeSession(_ session: RecentSession, projectRoot: String?) {
-        guard let window,
-              let controller = window.windowController as? TerminalController else { return }
+    /// Run a command and return its output + exit status.
+    nonisolated private static func runGitOutput(
+        _ args: [String], at dir: String, executable: String = "/usr/bin/git"
+    ) -> (output: String, status: Int32) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = args
+        process.currentDirectoryURL = URL(fileURLWithPath: dir)
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        guard (try? process.run()) != nil else { return ("", 1) }
+        process.waitUntilExit()
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: outData, encoding: .utf8) ?? ""
+        let errOutput = String(data: errData, encoding: .utf8) ?? ""
+        return (output.isEmpty ? errOutput : output, process.terminationStatus)
+    }
 
-        var config = Ghostty.SurfaceConfiguration()
-        if let root = projectRoot ?? session.projectPath as String? {
-            config.workingDirectory = root
+    /// Show a macOS notification for git action results.
+    private static func showGitNotification(result: GitActionResult, action: String) {
+        let content = UNMutableNotificationContent()
+        switch result {
+        case .success(let message):
+            content.title = "\(action) Succeeded"
+            content.body = message
+        case .error(let message):
+            content.title = "\(action) Failed"
+            content.body = message
         }
+        content.sound = .default
 
-        let command: String
-        switch session.tool {
-        case .claudeCode:
-            command = "claude --resume \(session.id) --dangerously-skip-permissions"
-        case .codex:
-            command = "codex resume \(session.id) --dangerously-bypass-approvals-and-sandbox"
-        case .terminal:
-            return
-        }
-        config.initialInput = command + "\n"
-
-        let newController = TerminalController.newTab(
-            controller.ghostty,
-            from: window,
-            withBaseConfig: config
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
         )
-
-        // Carry the session name to the new tab so it immediately shows
-        // the right title instead of waiting for hooks to regenerate it.
-        if let surface = newController?.focusedSurface {
-            TabMetadataStore.shared.setStatus(
-                tabId: surface.id,
-                key: "session-title",
-                value: session.fullTitle,
-                icon: "text.bubble"
-            )
-        }
+        UNUserNotificationCenter.current().add(request) { _ in }
     }
 
     // MARK: - Tab Actions
@@ -1528,6 +1599,7 @@ class SidebarTabManager: ObservableObject {
         // The source sidebar is about to become invisible anyway, and the next
         // timer-driven refresh() will rebuild tabs with needsAttention=false.
         attentionWindows.remove(tab.id)
+        acknowledgeCompletion(for: tab)
         selectedTabID = tab.id
         // Guard against notification-driven refreshSelection() calls that fire
         // synchronously during the tabGroup.selectedWindow setter. Without this,

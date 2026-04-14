@@ -10,25 +10,39 @@ import CoreServices
 /// that FSEvents might miss.
 final class GitStatsWatcher {
 
+    /// Shared instance — all SidebarTabManager instances read from the same
+    /// stats store so switching tabs never loses project-level git stats.
+    static let shared = GitStatsWatcher()
+
     /// Current stats keyed by project root path. `nil` value = no changes.
     private(set) var stats: [String: String] = [:]
 
     /// Called on the main thread whenever stats change.
-    var onChange: (() -> Void)?
+    /// Multiple managers can register; all are notified.
+    private var changeCallbacks: [ObjectIdentifier: () -> Void] = [:]
+
+    func addChangeObserver(id: ObjectIdentifier, callback: @escaping () -> Void) {
+        changeCallbacks[id] = callback
+    }
+
+    func removeChangeObserver(id: ObjectIdentifier) {
+        changeCallbacks.removeValue(forKey: id)
+    }
+
+    private func notifyObservers() {
+        for callback in changeCallbacks.values {
+            callback()
+        }
+    }
 
     private var watchers: [String: ProjectWatcher] = [:]
     private var fallbackTimer: Timer?
 
-    init() {
+    private init() {
         // 30-second fallback poll to self-correct if FSEvents misses something.
         fallbackTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
             self?.refreshAll()
         }
-    }
-
-    deinit {
-        fallbackTimer?.invalidate()
-        stopAll()
     }
 
     // MARK: - Public API
@@ -57,7 +71,7 @@ final class GitStatsWatcher {
                         } else {
                             self.stats.removeValue(forKey: root)
                         }
-                        self.onChange?()
+                        self.notifyObservers()
                     }
                 }
             }

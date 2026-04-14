@@ -178,10 +178,16 @@ private struct ProjectSection: View {
                     onNewTab: { tool in
                         tabManager.createNewTab(tool: tool, projectRoot: group.projectRoot)
                     },
-                    recentSessions: tabManager.cachedRecentSessions(forProjectRoot: group.projectRoot),
-                    onResumeSession: { session in
-                        tabManager.resumeSession(session, projectRoot: group.projectRoot)
-                    }
+                    onGitCommit: group.projectRoot != nil ? {
+                        tabManager.gitCommit(projectRoot: group.projectRoot!)
+                    } : nil,
+                    onGitPush: group.projectRoot != nil ? {
+                        tabManager.gitPush(projectRoot: group.projectRoot!)
+                    } : nil,
+                    onGitCommitAndPush: group.projectRoot != nil ? {
+                        tabManager.gitCommitAndPush(projectRoot: group.projectRoot!)
+                    } : nil,
+                    gitActionInProgress: tabManager.isGitActionInProgress(forProjectRoot: group.projectRoot)
                 )
             }
             .buttonStyle(.plain)
@@ -238,7 +244,11 @@ private struct ProjectSection: View {
             // Status dot — leading position
             if let activeEntry {
                 if activeEntry.value == "done" {
-                    Circle().fill(.green).frame(width: 6, height: 6).padding(.trailing, 6)
+                    if tab.hasUnreadCompletion {
+                        PulsingDot(color: .green, size: 6).padding(.trailing, 6)
+                    } else {
+                        Circle().fill(.green).frame(width: 6, height: 6).padding(.trailing, 6)
+                    }
                 } else if activeEntry.value == "needs-input" {
                     PulsingDot(color: .orange, size: 6).padding(.trailing, 6)
                 } else {
@@ -371,8 +381,10 @@ private struct ProjectHeader: View {
     let isCollapsed: Bool
     let isHovered: Bool
     var onNewTab: ((SidebarTabManager.SidebarTool) -> Void)? = nil
-    var recentSessions: [SidebarTabManager.RecentSession] = []
-    var onResumeSession: ((SidebarTabManager.RecentSession) -> Void)? = nil
+    var onGitCommit: (() -> Void)? = nil
+    var onGitPush: (() -> Void)? = nil
+    var onGitCommitAndPush: (() -> Void)? = nil
+    var gitActionInProgress: Bool = false
     @State private var isNewTabHovered = false
 
     var body: some View {
@@ -432,23 +444,41 @@ private struct ProjectHeader: View {
                         }
                     }
 
-                    // Recent sessions to resume
-                    if !recentSessions.isEmpty, let onResumeSession {
+                    // Git actions (only for real project groups)
+                    if let onGitCommit, let onGitPush, let onGitCommitAndPush {
                         Divider()
-                        Text("Resume Session")
-                            .font(.caption)
-                        ForEach(recentSessions) { session in
-                            Button {
-                                onResumeSession(session)
-                            } label: {
-                                HStack(spacing: 6) {
-                                    SidebarToolMenuIcon(tool: session.tool)
-                                    Text(session.title)
-                                        .lineLimit(1)
-                                        .help(session.fullTitle)
-                                }
+                        Button {
+                            onGitCommit()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "checkmark.circle")
+                                    .font(.system(size: 14, weight: .medium))
+                                Text(gitActionInProgress ? "Working..." : "Commit")
                             }
                         }
+                        .disabled(gitActionInProgress || group.gitDiffStats == nil)
+
+                        Button {
+                            onGitPush()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.up.circle")
+                                    .font(.system(size: 14, weight: .medium))
+                                Text(gitActionInProgress ? "Working..." : "Push")
+                            }
+                        }
+                        .disabled(gitActionInProgress)
+
+                        Button {
+                            onGitCommitAndPush()
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.up.circle.fill")
+                                    .font(.system(size: 14, weight: .medium))
+                                Text(gitActionInProgress ? "Working..." : "Commit & Push")
+                            }
+                        }
+                        .disabled(gitActionInProgress || group.gitDiffStats == nil)
                     }
                 } label: {
                     ZStack {
@@ -459,7 +489,7 @@ private struct ProjectHeader: View {
                     }
                     .frame(width: 20, height: 20)
                 }
-                .id(recentSessions.count)
+                .id(gitActionInProgress)
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .fixedSize()
