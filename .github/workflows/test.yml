@@ -419,8 +419,14 @@ jobs:
           echo "Libs:   $(pkg-config --libs libghostty-vt)"
           echo "Static: $(pkg-config --libs --static libghostty-vt)"
 
-          # Libs.private must include the C++ standard library
-          pkg-config --libs --static libghostty-vt | grep -q -- '-lc++'
+          # Libs.private must NOT include the C++ runtime libraries (all
+          # vendored C++ deps are built in no-libcxx mode).
+          ! pkg-config --libs --static libghostty-vt | grep -qE -- '-lc\+\+|-lc\+\+abi'
+
+      - name: Verify shared library has no libc++ dependency
+        run: |
+          ldd zig-out/lib/libghostty-vt.so.0.1.0
+          ! ldd zig-out/lib/libghostty-vt.so.0.1.0 2>/dev/null | grep -qE 'libc\+\+|libc\+\+abi'
 
       - name: Verify static archive contains SIMD deps
         run: |
@@ -452,16 +458,15 @@ jobs:
       - name: Test static link via pkg-config
         run: |
           export PKG_CONFIG_PATH="$PWD/zig-out/share/pkgconfig"
-          # The static library is compiled with LLVM libc++ (not GNU
-          # libstdc++), so linking requires a libc++-compatible toolchain.
-          # zig cc, clang, or gcc with libc++-dev installed all work.
-          nix develop -c zig cc -o /tmp/test_static /tmp/test_libghostty_vt.c \
+          # The static archive must link cleanly into a plain C program
+          # without any extra C++ runtime flags.
+          nix develop -c cc -o /tmp/test_static /tmp/test_libghostty_vt.c \
             $(pkg-config --cflags libghostty-vt) \
             "$PWD/zig-out/lib/libghostty-vt.a" \
             $(pkg-config --libs-only-l --static libghostty-vt | sed 's/-lghostty-vt//')
           /tmp/test_static
-          # Verify it's truly statically linked (no libghostty-vt.so dependency)
-          ! ldd /tmp/test_static 2>/dev/null | grep -q libghostty-vt
+          # Verify it doesn't depend on the shared lib or a C++ runtime.
+          ! ldd /tmp/test_static 2>/dev/null | grep -qE 'libghostty-vt|libc\+\+|libc\+\+abi'
 
       # Test system integration: rebuild with -Dsystem-simdutf=true so
       # simdutf comes from the system instead of being vendored. This
