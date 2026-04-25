@@ -28,6 +28,7 @@ adrum
 aindriu80
 alaasdk
 alanmoyano
+alaviss
 alexfeijoo44
 alexjuca
 alosarjos
@@ -200,6 +201,7 @@ rpfaeffle
 sandydoo
 secrus
 seruman
+seyoungjeong
 silveirapf
 slsrepo
 sunshine-syz
