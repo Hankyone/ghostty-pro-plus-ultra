@@ -247,6 +247,7 @@ tweedbeetle
 uhojin
 unphased
 uzaaft
+vancluever
 vaughanandrews
 viruslobster
 vlsi
@@ -255,6 +256,7 @@ wyounas
 yabbal
 yamshta
 ydah
+-zaviro
 zenyr
 zeshi09
 zubb
