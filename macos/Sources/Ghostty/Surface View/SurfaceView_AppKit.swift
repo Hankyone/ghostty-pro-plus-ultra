@@ -747,8 +747,7 @@ extension Ghostty {
                 // cached value is restored next time the terminal emits a
                 // color_change.
                 if let cached = self.backgroundColor,
-                   cached != self.derivedConfig.backgroundColor
-                {
+                   cached != self.derivedConfig.backgroundColor {
                     self.backgroundColor = nil
                 }
             }
