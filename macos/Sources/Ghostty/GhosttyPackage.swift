@@ -360,11 +360,16 @@ extension Notification.Name {
     /// Ring the bell
     static let ghosttyBellDidRing = Notification.Name("com.mitchellh.ghostty.ghosttyBellDidRing")
 
+<<<<<<< HEAD
     /// A desktop notification was fired for a surface (OSC 9/99 or command completion)
     static let ghosttyDesktopNotificationDidFire = Notification.Name("com.mitchellh.ghostty.desktopNotificationDidFire")
 
     /// An IPC notification was received (tab.notify command). Object is the target NSWindow.
     static let ghosttyIPCNotification = Notification.Name("com.mitchellh.ghostty.ipcNotification")
+=======
+    /// The active selection changed
+    static let ghosttySelectionDidChange = Notification.Name("com.mitchellh.ghostty.ghosttySelectionDidChange")
+>>>>>>> upstream/main
 
     /// Readonly mode changed
     static let ghosttyDidChangeReadonly = Notification.Name("com.mitchellh.ghostty.didChangeReadonly")
