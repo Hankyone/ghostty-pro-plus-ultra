@@ -1267,8 +1267,8 @@ class BaseTerminalController: NSWindowController,
         // NOTE: We intentionally do NOT remove tab metadata here.
         // When the app is relaunching (e.g. Sparkle update), windowWillClose
         // fires for every window before the app exits. Wiping metadata here
-        // destroys session-title, claude-session, codex-session, and
-        // tab-created-at entries that window restoration depends on.
+        // destroys claude-session, codex-session, and tab-created-at
+        // entries that window restoration depends on.
         // Orphaned entries are cleaned up by TabMetadataStore.pruneOrphanedEntries()
         // which runs 2 seconds after each app launch.
 

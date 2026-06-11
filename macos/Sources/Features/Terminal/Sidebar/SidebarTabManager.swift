@@ -1182,21 +1182,6 @@ class SidebarTabManager: ObservableObject {
                     if let sid = tab.surfaceId {
                         metadataStore.setStatus(tabId: sid, key: "last-activity",
                             value: String(Int(now.timeIntervalSince1970)))
-
-                        // If the tab changed and no coding agent is active or
-                        // resuming, the user moved on from the session. Clear the
-                        // session association so the tab reverts to its natural name.
-                        // We must also check for session keys because there is a
-                        // timing gap between sending the resume command and the
-                        // hook setting the active marker.
-                        let hasActiveAgent = tab.statusEntries.contains(where: {
-                            $0.key == "claude-active" || $0.key == "codex-active"
-                        })
-                        let hasSessionInProgress = metadataStore.entries[sid]?["claude-session"] != nil ||
-                            metadataStore.entries[sid]?["codex-session"] != nil
-                        if !hasActiveAgent && !hasSessionInProgress && metadataStore.entries[sid]?["session-title"] != nil {
-                            metadataStore.clearStatus(tabId: sid, key: "session-title")
-                        }
                     }
                 }
             }
@@ -1518,7 +1503,7 @@ class SidebarTabManager: ObservableObject {
     }()
 
     /// Generate a commit message by calling `claude -p` with the staged diff.
-    /// Uses the same approach as ghostty-generate-title.sh — fast Haiku model, no project context.
+    /// Fast Haiku model with no project context to keep it quick.
     nonisolated private static func generateCommitMessage(at projectRoot: String) -> CommitMessageResult {
         // Get staged diff (truncated to keep request small)
         let diffResult = runGitOutput(["diff", "--cached"], at: projectRoot)

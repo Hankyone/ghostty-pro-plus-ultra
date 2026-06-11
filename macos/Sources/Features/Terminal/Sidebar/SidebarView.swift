@@ -318,14 +318,11 @@ private struct ProjectSection: View {
         let isSelected = tab.id == tabManager.selectedTabID
         let isHovered = hoveredTabID == tab.id
 
-        let sessionTitleEntry = tab.statusEntries.first(where: { $0.key == "session-title" })
         // Determine the current agent from the mutually-exclusive session key,
         // then scope all agent-specific lookups to avoid stale cross-agent state.
         let isClaudeSession = tab.statusEntries.contains(where: { $0.key == "claude-session" })
-        let sessionStatusEntry = tab.statusEntries.first(where: { $0.key == (isClaudeSession ? "claude" : "codex") })
         let activeEntry = tab.statusEntries.first(where: { $0.key == (isClaudeSession ? "claude-active" : "codex-active") })
         let titleColor = isSelected || isHovered ? theme.foreground : theme.secondaryText
-        let subtitleColor = isSelected || isHovered ? theme.foreground.opacity(0.7) : theme.secondaryText
         // Tab color tint — subtle background wash instead of a left bar
         let tabTint: Color? = tab.tabColor.displayColor.map { Color(nsColor: $0) }
         let rowBackground: Color = {
@@ -358,7 +355,7 @@ private struct ProjectSection: View {
             }
 
             // Title
-            let primaryTitle = sessionTitleEntry?.value ?? tab.displayTitle
+            let primaryTitle = tab.displayTitle
 
             Text(primaryTitle)
                 .font(.system(size: 11))

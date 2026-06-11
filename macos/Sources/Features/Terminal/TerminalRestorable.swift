@@ -238,26 +238,8 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // force-killed before the resume completes, the next restart will
         // try again. The hooks will update them when the session actually starts.
 
-        // Ensure the session title is set on this surface. It may already be
-        // persisted in TabMetadataStore from the previous run, but if not,
-        // look up the cached .title file so the name follows the session.
-        if store.entries[surfaceId]?["session-title"] == nil {
-            let titleStoreBase = NSHomeDirectory() + "/Library/Application Support/com.mitchellh.ghostty"
-            let isCodex = codexEntry != nil && !(codexEntry?.value.isEmpty ?? true)
-            let subdir = isCodex ? "codex-sessions" : "claude-sessions"
-            let titleFile = (titleStoreBase as NSString)
-                .appendingPathComponent(subdir)
-                .appending("/\(sessionId).title")
-            if let savedTitle = try? String(contentsOfFile: titleFile, encoding: .utf8),
-               !savedTitle.isEmpty {
-                store.setStatus(tabId: surfaceId, key: "session-title",
-                    value: savedTitle, icon: "text.bubble")
-            }
-        }
-
         // Delay to let the shell initialize and display its prompt.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            surface.protectTitle()
             // Type the command but don't execute — let the user press Enter when ready.
             surface.sendText(command)
         }

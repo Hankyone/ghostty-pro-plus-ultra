@@ -12,7 +12,6 @@
 set -euo pipefail
 
 GHOSTTYCTL="$(dirname "$0")/ghosttyctl"
-GENERATE_TITLE="$(dirname "$0")/ghostty-generate-title.sh"
 SOCKET_PATH="${GHOSTTY_SOCKET:-/tmp/ghostty-$(id -u).sock}"
 
 # Exit early if Ghostty isn't running (no IPC socket)
@@ -28,7 +27,6 @@ mkdir -p "$SESSIONS_DIR"
 
 PID_FILE="$SESSIONS_DIR/$session_id.pid"
 TAB_ID_FILE="$SESSIONS_DIR/$session_id.tabid"
-TITLED_FILE="$SESSIONS_DIR/$session_id.titled"
 
 # Pin all IPC calls to the tab where this session started.
 if [ -f "$TAB_ID_FILE" ]; then
@@ -55,15 +53,6 @@ case "$event" in
     "$GHOSTTYCTL" set-status codex-session "$session_id" >/dev/null 2>&1 || true
     # Agent is running but idle — show green dot until first prompt
     "$GHOSTTYCTL" set-status codex-active "done" >/dev/null 2>&1 || true
-
-    # Restore a previously generated title for this session (e.g. after resume).
-    TITLE_STORE="$SESSIONS_DIR/$session_id.title"
-    if [ -f "$TITLE_STORE" ]; then
-      saved_title=$(cat "$TITLE_STORE")
-      if [ -n "$saved_title" ]; then
-        "$GHOSTTYCTL" set-status session-title "$saved_title" --icon "text.bubble" >/dev/null 2>&1 || true
-      fi
-    fi
     ;;
 
   UserPromptSubmit)
@@ -76,26 +65,6 @@ case "$event" in
     # Show truncated last prompt as the sidebar label
     short=$(echo "$prompt" | tr '\n' ' ' | head -c 120)
     "$GHOSTTYCTL" set-status codex "$short" --icon "bubble.left.fill" >/dev/null 2>&1 || true
-
-    # Generate a tab title on the first prompt only
-    if [ ! -f "$TITLED_FILE" ]; then
-      touch "$TITLED_FILE"
-
-      # Set an immediate seed title from the prompt text
-      seed=$(echo "$prompt" | tr '\n' ' ' | tr -s ' ' | head -c 50)
-      "$GHOSTTYCTL" set-status session-title "$seed" --icon "text.bubble" >/dev/null 2>&1 || true
-
-      # Launch LLM title generation fully detached so the hook returns immediately.
-      TITLE_STORE="$SESSIONS_DIR/$session_id.title"
-      nohup bash -c "
-        title=\$(\"$GENERATE_TITLE\" \"\$1\" 2>/dev/null || echo \"\")
-        if [ -n \"\$title\" ]; then
-          \"$GHOSTTYCTL\" set-status session-title \"\$title\" --icon \"text.bubble\" >/dev/null 2>&1 || true
-          printf '%s' \"\$title\" > \"\$2\"
-        fi
-      " -- "$prompt" "$TITLE_STORE" </dev/null >/dev/null 2>&1 &
-      disown
-    fi
     ;;
 
   PreToolUse)
@@ -114,7 +83,7 @@ case "$event" in
     # Emit a completion token so the sidebar can track unread completions
     "$GHOSTTYCTL" set-status codex-done-at "$(uuidgen)" >/dev/null 2>&1 || true
 
-    # Clean up transient metadata (preserve session-title and codex-active)
+    # Clean up transient metadata (preserve codex-active)
     "$GHOSTTYCTL" clear-status codex >/dev/null 2>&1 || true
     "$GHOSTTYCTL" clear-status codex-pid >/dev/null 2>&1 || true
     rm -f "$PID_FILE"

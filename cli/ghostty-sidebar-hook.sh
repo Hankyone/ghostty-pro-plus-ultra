@@ -8,7 +8,6 @@
 set -euo pipefail
 
 GHOSTTYCTL="$(dirname "$0")/ghosttyctl"
-GENERATE_TITLE="$(dirname "$0")/ghostty-generate-title.sh"
 SOCKET_PATH="${GHOSTTY_SOCKET:-/tmp/ghostty-$(id -u).sock}"
 
 # Exit early if Ghostty isn't running (no IPC socket)
@@ -25,7 +24,6 @@ mkdir -p "$SESSIONS_DIR"
 PID_FILE="$SESSIONS_DIR/$session_id.pid"
 QUESTION_FILE="$SESSIONS_DIR/$session_id.question"
 TAB_ID_FILE="$SESSIONS_DIR/$session_id.tabid"
-TITLED_FILE="$SESSIONS_DIR/$session_id.titled"
 
 # Pin all IPC calls to the tab where this session started.
 # Without this, ghosttyctl falls back to NSApp.keyWindow which can be
@@ -59,15 +57,6 @@ case "$event" in
     "$GHOSTTYCTL" set-status claude-session "$session_id" 2>/dev/null || true
     # Agent is running but idle — show green dot until first prompt
     "$GHOSTTYCTL" set-status claude-active "done" 2>/dev/null || true
-
-    # Restore a previously generated title for this session (e.g. after /resume).
-    TITLE_STORE="$SESSIONS_DIR/$session_id.title"
-    if [ -f "$TITLE_STORE" ]; then
-      saved_title=$(cat "$TITLE_STORE")
-      if [ -n "$saved_title" ]; then
-        "$GHOSTTYCTL" set-status session-title "$saved_title" --icon "text.bubble" 2>/dev/null || true
-      fi
-    fi
     ;;
 
   UserPromptSubmit)
@@ -83,29 +72,6 @@ case "$event" in
     # Show truncated last prompt as the sidebar label
     short=$(echo "$prompt" | tr '\n' ' ' | head -c 120)
     "$GHOSTTYCTL" set-status claude "$short" --icon "bubble.left.fill" 2>/dev/null || true
-
-    # Generate a tab title on the first prompt only
-    if [ ! -f "$TITLED_FILE" ]; then
-      touch "$TITLED_FILE"
-
-      # Set an immediate seed title from the prompt text
-      seed=$(echo "$prompt" | tr '\n' ' ' | tr -s ' ' | head -c 50)
-      "$GHOSTTYCTL" set-status session-title "$seed" --icon "text.bubble" 2>/dev/null || true
-
-      # Launch LLM title generation fully detached so the hook returns
-      # immediately. Without nohup + fd redirection, Claude Code's hook
-      # runner waits for all child processes to exit, which blocked this
-      # hook for ~3 minutes while claude -p ran.
-      TITLE_STORE="$SESSIONS_DIR/$session_id.title"
-      nohup bash -c "
-        title=\$(\"$GENERATE_TITLE\" \"\$1\" 2>/dev/null || echo \"\")
-        if [ -n \"\$title\" ]; then
-          \"$GHOSTTYCTL\" set-status session-title \"\$title\" --icon \"text.bubble\" 2>/dev/null || true
-          printf '%s' \"\$title\" > \"\$2\"
-        fi
-      " -- "$prompt" "$TITLE_STORE" </dev/null >/dev/null 2>&1 &
-      disown
-    fi
     ;;
 
   PreToolUse)
@@ -154,7 +120,7 @@ case "$event" in
     ;;
 
   SessionEnd)
-    # Clear transient status but preserve session-title for session history
+    # Clear transient status
     "$GHOSTTYCTL" clear-status claude 2>/dev/null || true
     "$GHOSTTYCTL" clear-status claude-active 2>/dev/null || true
     "$GHOSTTYCTL" clear-status claude-done-at 2>/dev/null || true
