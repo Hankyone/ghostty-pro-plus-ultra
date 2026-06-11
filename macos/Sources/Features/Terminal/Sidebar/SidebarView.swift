@@ -56,6 +56,46 @@ enum SidebarField: String, Hashable {
     static let defaultFields: Set<SidebarField> = [.title, .directory, .gitBranch, .status]
 }
 
+// MARK: - Drag & Drop Support
+
+/// Where a dragged tab would be inserted: above or below a target row.
+private struct TabDropTarget: Equatable {
+    let id: ObjectIdentifier
+    let below: Bool
+}
+
+/// Where a dragged project group would be inserted: above or below a target group.
+private struct GroupDropTarget: Equatable {
+    let id: String
+    let below: Bool
+}
+
+/// An NSItemProvider that fires a callback when the drag session ends.
+/// SwiftUI has no drag-cancelled callback, so without this the
+/// "dragging" state (dimmed rows, insertion lines) sticks around forever
+/// when a drag is dropped outside any valid target or cancelled with Esc.
+/// The system releases the provider when the session ends, so deinit is
+/// the reliable end-of-session signal.
+private final class SidebarDragItemProvider: NSItemProvider {
+    var onSessionEnd: (() -> Void)?
+
+    deinit {
+        if let onSessionEnd {
+            DispatchQueue.main.async(execute: onSessionEnd)
+        }
+    }
+}
+
+/// The accent-colored insertion line shown while dragging.
+private struct DropIndicator: View {
+    var body: some View {
+        Capsule()
+            .fill(Color.accentColor)
+            .frame(height: 2)
+            .padding(.horizontal, 2)
+    }
+}
+
 // MARK: - SidebarView
 
 /// A vertical sidebar that displays tabs grouped by project, styled after T3 Code.
@@ -66,13 +106,17 @@ struct SidebarView: View {
     var fields: Set<SidebarField> = SidebarField.defaultFields
 
     @State private var draggingTabID: ObjectIdentifier?
-    @State private var dropTargetTabID: ObjectIdentifier?
+    @State private var draggingGroupID: String?
+    @State private var tabDropTarget: TabDropTarget?
+    @State private var groupDropTarget: GroupDropTarget?
     @State private var hoveredTabID: ObjectIdentifier?
     @State private var hoveredGroupID: String?
     @State private var tabCardFrames: [ObjectIdentifier: CGRect] = [:]
-    @State private var draggingGroupID: String?
-    @State private var dropTargetGroupID: String?
     private static let scrollCoordinateSpace = "SidebarScrollCoordinateSpace"
+
+    private var isDragActive: Bool {
+        draggingTabID != nil || draggingGroupID != nil
+    }
 
     var body: some View {
         ScrollView {
@@ -91,7 +135,9 @@ struct SidebarView: View {
                         theme: theme,
                         fields: fields,
                         draggingTabID: $draggingTabID,
-                        dropTargetTabID: $dropTargetTabID,
+                        draggingGroupID: $draggingGroupID,
+                        tabDropTarget: $tabDropTarget,
+                        groupDropTarget: $groupDropTarget,
                         hoveredTabID: $hoveredTabID,
                         hoveredGroupID: $hoveredGroupID,
                         tabCardFrames: $tabCardFrames,
@@ -99,22 +145,22 @@ struct SidebarView: View {
                     )
                     .opacity(draggingGroupID == group.id ? 0.4 : 1.0)
                     .overlay(alignment: .top) {
-                        if dropTargetGroupID == group.id && draggingGroupID != group.id {
-                            Rectangle()
-                                .fill(Color.accentColor)
-                                .frame(height: 2)
-                                .offset(y: -1)
+                        if groupDropTarget == GroupDropTarget(id: group.id, below: false) {
+                            DropIndicator().offset(y: -1)
                         }
                     }
-                    .onDrag {
-                        draggingGroupID = group.id
-                        return NSItemProvider(object: group.id as NSString)
+                    .overlay(alignment: .bottom) {
+                        if groupDropTarget == GroupDropTarget(id: group.id, below: true) {
+                            DropIndicator().offset(y: 1)
+                        }
                     }
                     .onDrop(of: [UTType.text], delegate: ProjectGroupDropDelegate(
                         tabManager: tabManager,
                         currentGroup: group,
+                        draggingTabID: $draggingTabID,
                         draggingGroupID: $draggingGroupID,
-                        dropTargetGroupID: $dropTargetGroupID
+                        tabDropTarget: $tabDropTarget,
+                        groupDropTarget: $groupDropTarget
                     ))
                 }
             }
@@ -122,6 +168,26 @@ struct SidebarView: View {
             .padding(.top, 8)
         }
         .coordinateSpace(name: Self.scrollCoordinateSpace)
+        .task(id: isDragActive) {
+            // Watchdog for drag state. The normal end-of-drag signal is the
+            // system releasing the drag's NSItemProvider, but the pasteboard
+            // can retain it long after the session ends, leaving rows dimmed.
+            // The mouse button is authoritative — a drag session cannot
+            // outlive it — so clear the state shortly after it's released.
+            guard isDragActive else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                if NSEvent.pressedMouseButtons == 0 {
+                    // Give a pending performDrop a moment to run first.
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    draggingTabID = nil
+                    draggingGroupID = nil
+                    tabDropTarget = nil
+                    groupDropTarget = nil
+                    return
+                }
+            }
+        }
         .onPreferenceChange(SidebarCardFramePreferenceKey.self) { tabCardFrames = $0 }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.clear)
@@ -156,11 +222,31 @@ private struct ProjectSection: View {
     let theme: SidebarTheme
     let fields: Set<SidebarField>
     @Binding var draggingTabID: ObjectIdentifier?
-    @Binding var dropTargetTabID: ObjectIdentifier?
+    @Binding var draggingGroupID: String?
+    @Binding var tabDropTarget: TabDropTarget?
+    @Binding var groupDropTarget: GroupDropTarget?
     @Binding var hoveredTabID: ObjectIdentifier?
     @Binding var hoveredGroupID: String?
     @Binding var tabCardFrames: [ObjectIdentifier: CGRect]
     let isCollapsed: Bool
+
+    /// Creates a drag item provider that resets all drag state when the
+    /// system drag session ends — including cancelled drags, for which
+    /// SwiftUI provides no other callback.
+    private func makeDragProvider(payload: String) -> NSItemProvider {
+        let provider = SidebarDragItemProvider(object: payload as NSString)
+        let draggingTab = $draggingTabID
+        let draggingGroup = $draggingGroupID
+        let tabTarget = $tabDropTarget
+        let groupTarget = $groupDropTarget
+        provider.onSessionEnd = {
+            draggingTab.wrappedValue = nil
+            draggingGroup.wrappedValue = nil
+            tabTarget.wrappedValue = nil
+            groupTarget.wrappedValue = nil
+        }
+        return provider
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -194,6 +280,17 @@ private struct ProjectSection: View {
             .onHover { isHovering in
                 hoveredGroupID = isHovering ? group.id : nil
             }
+            // The group drag handle is the header ONLY. Attaching .onDrag to
+            // the whole section nests it around the tab rows' own .onDrag,
+            // and the system may resolve that ambiguity to the outer (group)
+            // drag — making it impossible to drag individual tabs.
+            .contentShape(.dragPreview, RoundedRectangle(cornerRadius: 6))
+            .if(!group.isOtherGroup) { view in
+                view.onDrag {
+                    draggingGroupID = group.id
+                    return makeDragProvider(payload: group.id)
+                }
+            }
 
             // Thread list with vertical line indicator
             if !isCollapsed {
@@ -220,7 +317,6 @@ private struct ProjectSection: View {
     private func threadRow(for tab: SidebarTabManager.TabItem) -> some View {
         let isSelected = tab.id == tabManager.selectedTabID
         let isHovered = hoveredTabID == tab.id
-        let tabIndex = tabManager.tabs.firstIndex(where: { $0.id == tab.id }) ?? 0
 
         let sessionTitleEntry = tab.statusEntries.first(where: { $0.key == "session-title" })
         // Determine the current agent from the mutually-exclusive session key,
@@ -305,25 +401,29 @@ private struct ProjectSection: View {
         .overlay(MiddleClickOverlay {
             tabManager.closeTab(tab)
         })
+        .contentShape(.dragPreview, RoundedRectangle(cornerRadius: 6))
         .onDrag {
             draggingTabID = tab.id
-            return NSItemProvider(object: "\(tabIndex)" as NSString)
+            return makeDragProvider(payload: tab.surfaceId?.uuidString ?? "tab")
         }
         .onDrop(of: [UTType.text], delegate: TabDropDelegate(
             tabManager: tabManager,
             currentTab: tab,
-            currentIndex: tabIndex,
             groupID: group.id,
             draggingTabID: $draggingTabID,
-            dropTargetTabID: $dropTargetTabID
+            draggingGroupID: $draggingGroupID,
+            tabDropTarget: $tabDropTarget,
+            groupDropTarget: $groupDropTarget
         ))
         .opacity(draggingTabID == tab.id ? 0.4 : 1.0)
         .overlay(alignment: .top) {
-            if dropTargetTabID == tab.id && draggingTabID != tab.id {
-                Rectangle()
-                    .fill(Color.accentColor)
-                    .frame(height: 2)
-                    .offset(y: -1)
+            if tabDropTarget == TabDropTarget(id: tab.id, below: false) {
+                DropIndicator().offset(y: -1)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if tabDropTarget == TabDropTarget(id: tab.id, below: true) {
+                DropIndicator().offset(y: 1)
             }
         }
         .contextMenu {
@@ -552,39 +652,69 @@ private struct SidebarToolMenuIcon: View {
 
 // MARK: - ProjectGroupDropDelegate
 
+/// Handles drops on a whole project section: accepts group drags
+/// (reordering projects) and rejects everything else. Tab drags over the
+/// rows themselves are handled by the rows' own TabDropDelegate.
 private struct ProjectGroupDropDelegate: DropDelegate {
     let tabManager: SidebarTabManager
     let currentGroup: SidebarTabManager.ProjectGroup
+    @Binding var draggingTabID: ObjectIdentifier?
     @Binding var draggingGroupID: String?
-    @Binding var dropTargetGroupID: String?
+    @Binding var tabDropTarget: TabDropTarget?
+    @Binding var groupDropTarget: GroupDropTarget?
+
+    /// The "Other" group is always pinned last, so it can neither be moved
+    /// nor serve as a reorder target.
+    private var isValidGroupDrag: Bool {
+        guard let draggingGroupID else { return false }
+        return draggingGroupID != currentGroup.id && !currentGroup.isOtherGroup
+    }
+
+    /// Whether the move would land the dragged group below the target.
+    /// moveProjectGroup() inserts after the target when dragging down and
+    /// before it when dragging up, so the indicator must match.
+    private var insertsBelow: Bool {
+        guard let draggingGroupID else { return false }
+        let groups = tabManager.projectGroups
+        guard let from = groups.firstIndex(where: { $0.id == draggingGroupID }),
+              let to = groups.firstIndex(where: { $0.id == currentGroup.id })
+        else { return false }
+        return from < to
+    }
 
     func dropEntered(info: DropInfo) {
-        dropTargetGroupID = currentGroup.id
+        if isValidGroupDrag {
+            groupDropTarget = GroupDropTarget(id: currentGroup.id, below: insertsBelow)
+        }
     }
 
     func dropExited(info: DropInfo) {
-        if dropTargetGroupID == currentGroup.id {
-            dropTargetGroupID = nil
+        if groupDropTarget?.id == currentGroup.id {
+            groupDropTarget = nil
         }
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
+        guard isValidGroupDrag else { return DropProposal(operation: .forbidden) }
+        return DropProposal(operation: .move)
     }
 
     func validateDrop(info: DropInfo) -> Bool {
-        draggingGroupID != nil && draggingGroupID != currentGroup.id
+        isValidGroupDrag
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        guard let draggingGroupID else { return false }
+        defer {
+            draggingTabID = nil
+            draggingGroupID = nil
+            tabDropTarget = nil
+            groupDropTarget = nil
+        }
+        guard isValidGroupDrag, let draggingGroupID else { return false }
 
         // Switch to manual sort mode and perform the move
         tabManager.setProjectSortMode(.manual)
         tabManager.moveProjectGroup(fromId: draggingGroupID, toId: currentGroup.id)
-
-        self.draggingGroupID = nil
-        self.dropTargetGroupID = nil
         return true
     }
 }
@@ -612,54 +742,130 @@ private struct SidebarSortHeader: View {
 
 // MARK: - TabDropDelegate
 
+/// Handles drops on an individual tab row. Tab drags reorder within the
+/// same project (with above/below insertion based on cursor position).
+/// Group drags are forwarded to group-reorder semantics so that hovering
+/// anywhere over a section — header or rows — targets the whole group.
 private struct TabDropDelegate: DropDelegate {
+    /// Row height of a tab row; used to decide above/below insertion.
+    private static let rowHeight: CGFloat = 28
+
     let tabManager: SidebarTabManager
     let currentTab: SidebarTabManager.TabItem
-    let currentIndex: Int
     let groupID: String
     @Binding var draggingTabID: ObjectIdentifier?
-    @Binding var dropTargetTabID: ObjectIdentifier?
+    @Binding var draggingGroupID: String?
+    @Binding var tabDropTarget: TabDropTarget?
+    @Binding var groupDropTarget: GroupDropTarget?
 
-    /// The project root of the tab being dragged, or nil if not found.
-    private var draggingGroupID: String? {
-        guard let id = draggingTabID else { return nil }
-        return tabManager.tabs.first(where: { $0.id == id })?.projectRoot
+    private var isGroupDrag: Bool { draggingGroupID != nil }
+
+    /// The group ID of the tab being dragged ("__other__" for ungrouped tabs).
+    private var draggingTabGroupID: String? {
+        guard let id = draggingTabID,
+              let tab = tabManager.tabs.first(where: { $0.id == id })
+        else { return nil }
+        return tab.projectRoot ?? "__other__"
+    }
+
+    private var isValidGroupDrag: Bool {
+        guard let draggingGroupID else { return false }
+        return draggingGroupID != groupID && groupID != "__other__"
+    }
+
+    /// Tab drags are restricted to reordering within the same project.
+    private var isValidTabDrag: Bool {
+        draggingTabID != nil && draggingTabID != currentTab.id && draggingTabGroupID == groupID
+    }
+
+    /// See ProjectGroupDropDelegate.insertsBelow.
+    private var groupInsertsBelow: Bool {
+        guard let draggingGroupID else { return false }
+        let groups = tabManager.projectGroups
+        guard let from = groups.firstIndex(where: { $0.id == draggingGroupID }),
+              let to = groups.firstIndex(where: { $0.id == groupID })
+        else { return false }
+        return from < to
+    }
+
+    private func updateTarget(_ info: DropInfo) {
+        if isGroupDrag {
+            if isValidGroupDrag {
+                groupDropTarget = GroupDropTarget(id: groupID, below: groupInsertsBelow)
+            }
+        } else if isValidTabDrag {
+            tabDropTarget = TabDropTarget(
+                id: currentTab.id,
+                below: info.location.y >= Self.rowHeight / 2
+            )
+        }
     }
 
     func dropEntered(info: DropInfo) {
-        // Only show the drop indicator if the tab belongs to the same project.
-        guard draggingGroupID == groupID else { return }
-        dropTargetTabID = currentTab.id
+        updateTarget(info)
     }
 
     func dropExited(info: DropInfo) {
-        if dropTargetTabID == currentTab.id {
-            dropTargetTabID = nil
+        if tabDropTarget?.id == currentTab.id {
+            tabDropTarget = nil
+        }
+        if isGroupDrag, groupDropTarget?.id == groupID {
+            groupDropTarget = nil
         }
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        // Reject cross-project drops visually.
-        guard draggingGroupID == groupID else {
+        guard isValidGroupDrag || isValidTabDrag else {
             return DropProposal(operation: .forbidden)
         }
+        updateTarget(info)
         return DropProposal(operation: .move)
     }
 
     func validateDrop(info: DropInfo) -> Bool {
-        draggingTabID != nil && draggingTabID != currentTab.id && draggingGroupID == groupID
+        isValidGroupDrag || isValidTabDrag
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        let target = tabDropTarget
         defer {
-            self.draggingTabID = nil
-            self.dropTargetTabID = nil
+            draggingTabID = nil
+            draggingGroupID = nil
+            tabDropTarget = nil
+            groupDropTarget = nil
         }
-        guard let draggingTabID else { return false }
-        guard draggingGroupID == groupID else { return false }
-        guard let sourceIndex = tabManager.tabs.firstIndex(where: { $0.id == draggingTabID }) else { return false }
 
-        tabManager.moveTab(from: sourceIndex, to: currentIndex)
+        // Group drag dropped over a tab row: reorder the groups.
+        if isGroupDrag {
+            guard isValidGroupDrag, let draggingGroupID else { return false }
+            tabManager.setProjectSortMode(.manual)
+            tabManager.moveProjectGroup(fromId: draggingGroupID, toId: groupID)
+            return true
+        }
+
+        // Tab reorder. Resolve indices by ID at drop time — indices captured
+        // at drag start can go stale because the tab list refreshes during
+        // the drag.
+        guard isValidTabDrag,
+              let draggingTabID,
+              let source = tabManager.tabs.firstIndex(where: { $0.id == draggingTabID }),
+              let targetIndex = tabManager.tabs.firstIndex(where: { $0.id == currentTab.id })
+        else { return false }
+
+        let below = target?.below ?? false
+        let destination: Int = below
+            ? (source < targetIndex ? targetIndex : targetIndex + 1)
+            : (source < targetIndex ? targetIndex - 1 : targetIndex)
+
+        // Manual arrangement implies manual sort mode, same as group reorder —
+        // in the activity/creation sort modes the displayed order ignores the
+        // underlying tab order, so the drop would otherwise appear to do nothing.
+        if tabManager.projectSortMode != .manual {
+            tabManager.setProjectSortMode(.manual)
+        }
+        if destination != source {
+            tabManager.moveTab(from: source, to: destination)
+        }
         return true
     }
 }

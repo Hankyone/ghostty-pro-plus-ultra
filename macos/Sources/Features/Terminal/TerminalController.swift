@@ -1126,8 +1126,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // SwiftUI focus chain.
         terminalContainer.initialContentSize = focusedSurface?.initialSize
 
-        // Create the sidebar hosting view
-        let sidebarHostingView = NSHostingView(rootView: SidebarView(
+        // Create the sidebar hosting view. NonDraggableHostingView is required:
+        // the NSVisualEffectView wrapper makes the whole area window-draggable
+        // by default, so any click SwiftUI doesn't claim (or claims late, e.g.
+        // tap gestures on tab rows) would start dragging the window instead.
+        let sidebarHostingView = NonDraggableHostingView(rootView: SidebarView(
             tabManager: tabManager,
             updateViewModel: (NSApp.delegate as! AppDelegate).updateViewModel,
             theme: ghostty.config.sidebarTheme,

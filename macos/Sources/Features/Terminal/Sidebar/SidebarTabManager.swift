@@ -1,9 +1,18 @@
 import Cocoa
 import Combine
+import os.log
 
 /// Observes the tab group of a window and publishes tab metadata for the sidebar.
 @MainActor
 class SidebarTabManager: ObservableObject {
+    // TEMPORARY (sidebar drag diagnostics): remove after the click-reorder
+    // bug is confirmed fixed.
+    private static let orderLog = Logger(
+        subsystem: "com.hankyone.ghostty.sidebar", category: "order")
+
+    private var logPrefix: String {
+        "win#\(window?.windowNumber ?? -1)"
+    }
     struct TabItem: Identifiable, Equatable {
         let id: ObjectIdentifier
         let title: String
@@ -419,6 +428,11 @@ class SidebarTabManager: ObservableObject {
         }
 
         if changed {
+            // TEMPORARY (sidebar drag diagnostics)
+            let oldSuffixes = manualTabOrder.map { $0.suffix(4) }.joined(separator: ",")
+            let newSuffixes = order.map { $0.suffix(4) }.joined(separator: ",")
+            Self.orderLog.info("\(self.logPrefix, privacy: .public) manualTabOrder rewritten: [\(oldSuffixes, privacy: .public)] -> [\(newSuffixes, privacy: .public)]")
+
             manualTabOrder = order
         }
 
@@ -1229,6 +1243,13 @@ class SidebarTabManager: ObservableObject {
 
         let tabsChanged = newTabs != tabs
         if tabsChanged {
+            // TEMPORARY (sidebar drag diagnostics)
+            let oldOrder = tabs.map(\.displayTitle).joined(separator: " | ")
+            let newOrder = newTabs.map(\.displayTitle).joined(separator: " | ")
+            if oldOrder != newOrder {
+                Self.orderLog.info("\(self.logPrefix, privacy: .public) tab order changed [\(reason, privacy: .public)]: [\(oldOrder, privacy: .public)] -> [\(newOrder, privacy: .public)]")
+            }
+
             tabs = newTabs
             // Rebuild project groups whenever tabs change
             projectGroups = buildProjectGroups(from: newTabs)
@@ -1662,6 +1683,9 @@ class SidebarTabManager: ObservableObject {
     }
 
     func selectTab(_ tab: TabItem) {
+        // TEMPORARY (sidebar drag diagnostics)
+        Self.orderLog.info("\(self.logPrefix, privacy: .public) selectTab: \(tab.displayTitle, privacy: .public) win#\(tab.window.windowNumber)")
+
         // Only remove from the set — don't patch the @Published tabs array.
         // The source sidebar is about to become invisible anyway, and the next
         // timer-driven refresh() will rebuild tabs with needsAttention=false.
@@ -1731,6 +1755,9 @@ class SidebarTabManager: ObservableObject {
     }
 
     func moveTab(from sourceIndex: Int, to destinationIndex: Int) {
+        // TEMPORARY (sidebar drag diagnostics)
+        Self.orderLog.info("\(self.logPrefix, privacy: .public) moveTab from \(sourceIndex) to \(destinationIndex)")
+
         guard let window else { return }
         let tabbedWindows = orderedTabWindows(for: window)
         guard sourceIndex != destinationIndex,
