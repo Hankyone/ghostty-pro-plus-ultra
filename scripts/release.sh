@@ -97,6 +97,15 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
 fi
 
 # --- Build GhosttyKit (Zig) ---
+# zig 0.15.2's linker can't use the macOS 26.4+ SDK stubs (Apple dropped the
+# arm64-macos target from the .tbd files, leaving only arm64e), which makes
+# every libSystem symbol come up undefined. The shim answers zig's SDK query
+# with the older 15.4 SDK and passes all other xcrun calls through. Remove
+# once zig ships the fix (Codeberg ziglang/zig PR #31673).
+if [ -d "$HOME/.config/zig/sdk-shim" ]; then
+    export PATH="$HOME/.config/zig/sdk-shim:$PATH"
+fi
+
 echo "==> Building GhosttyKit..."
 zig build \
     -Doptimize=ReleaseFast \
