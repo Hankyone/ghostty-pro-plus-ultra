@@ -1501,6 +1501,30 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     @IBAction override func closeWindow(_ sender: Any?) {
         guard let window = window else { return }
 
+        // If this tab group is the last terminal window, closing it would
+        // permanently lose the tabs: macOS state restoration only saves
+        // windows that are still open when the app quits, so a closed
+        // window never comes back on relaunch. Convert the close into an
+        // app termination instead — the windows are still open while state
+        // is saved, so the next launch restores every tab (same path as
+        // quit/relaunch). This covers the red close button, the Close
+        // Window menu item, and the close_window keybind, all of which
+        // funnel through here. Quit confirmation for running processes
+        // still applies via applicationShouldTerminate.
+        //
+        // Undoing a "New Window" also routes through closeWindow — never
+        // convert that into a termination.
+        let isUndoRedo = (undoManager?.isUndoing ?? false) || (undoManager?.isRedoing ?? false)
+        let groupWindows = window.tabGroup?.windows ?? [window]
+        let hasOtherTerminalWindows = Self.all.contains { controller in
+            guard let w = controller.window else { return false }
+            return !groupWindows.contains(w)
+        }
+        if !hasOtherTerminalWindows && !isUndoRedo {
+            NSApp.terminate(nil)
+            return
+        }
+
         // We need to check all the windows in our tab group for confirmation
         // if we're closing the window. If we don't have a tabgroup for any
         // reason we check ourselves.
