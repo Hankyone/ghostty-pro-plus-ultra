@@ -37,6 +37,7 @@ akimiojr
 alaasdk
 alanmoyano
 alaviss
+alexbathome
 alexfeijoo44
 alexjuca
 alosarjos
@@ -129,6 +130,7 @@ illiakrauchanka
 j0hnm4r5
 jacobsandlund
 jake-stewart
+jamesarch
 jamylak
 jarred-sumner
 jcollie
