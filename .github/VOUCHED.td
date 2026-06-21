@@ -33,6 +33,7 @@ adrum
 agoodkind
 aindriu80
 ajiblock
+ajr-khll
 akimiojr
 alaasdk
 alanmoyano
@@ -102,6 +103,7 @@ ephemera
 -eric-assetpass Try talking, not botting
 eriksremess
 erral
+exlee
 -f1813483-netizen
 faukah
 filip7
@@ -157,6 +159,7 @@ kloneets
 knu
 -kody-w
 koranir
+kostich
 kristina8888
 kristofersoler
 kylesower
@@ -239,6 +242,7 @@ rmengelbrecht
 rmunn
 rockorager
 rpfaeffle
+sahilkmishra
 samasaur1
 sandydoo
 secrus
