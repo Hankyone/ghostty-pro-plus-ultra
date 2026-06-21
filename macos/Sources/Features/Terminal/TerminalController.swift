@@ -1309,6 +1309,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     override func windowWillClose(_ notification: Notification) {
+        // Sidebar tab items strongly reference their NSWindows. Tear the manager
+        // down before the window closes so a closed tab cannot retain its
+        // controller, terminal surfaces, and PTYs through that window list.
+        sidebarTabManager?.invalidate()
+        sidebarTabManager = nil
+        sidebarHostingView = nil
+
         super.windowWillClose(notification)
         cancelPendingInitialPresentation()
         self.relabelTabs()

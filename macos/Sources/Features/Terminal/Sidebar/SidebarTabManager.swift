@@ -149,6 +149,7 @@ class SidebarTabManager: ObservableObject {
     private weak var window: NSWindow?
     private var observers: [NSObjectProtocol] = []
     private var timer: Timer?
+    private(set) var isInvalidated = false
 
     /// Guard flag: when true, notification-driven refreshSelection() calls are
     /// suppressed so they don't overwrite the optimistic selectedTabID that
@@ -172,6 +173,28 @@ class SidebarTabManager: ObservableObject {
         timer?.invalidate()
         GitStatsWatcher.shared.removeChangeObserver(id: ObjectIdentifier(self))
         observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    /// Break all window references when the owning tab closes.
+    ///
+    /// Each tab manager publishes the complete tab group, and every `TabItem`
+    /// contains a strong reference to its window. Leaving those references in a
+    /// closed tab's manager keeps its terminal controller, surface tree, and PTY
+    /// alive after the tab disappears from the UI.
+    func invalidate() {
+        guard !isInvalidated else { return }
+        isInvalidated = true
+
+        timer?.invalidate()
+        timer = nil
+        GitStatsWatcher.shared.removeChangeObserver(id: ObjectIdentifier(self))
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+
+        tabs.removeAll()
+        projectGroups.removeAll()
+        selectedTabID = nil
+        attentionWindows.removeAll()
     }
 
     /// Returns the logical tab order for the current tab group.
@@ -1044,6 +1067,7 @@ class SidebarTabManager: ObservableObject {
     /// Lightweight update that only syncs `selectedTabID` from the window's tab group,
     /// without rebuilding the full tab list.
     private func refreshSelection() {
+        guard !isInvalidated else { return }
         guard !isSelectingTab else { return }
         guard let window else { return }
         let selectedWindow = window.tabGroup?.selectedWindow ?? window
@@ -1060,6 +1084,7 @@ class SidebarTabManager: ObservableObject {
     }
 
     private func refresh(reason: String) {
+        guard !isInvalidated else { return }
         guard let window else { return }
 
         // Keep collapsed state in sync across all tab managers
