@@ -10,6 +10,7 @@
         {
           "blend-mode" : "normal",
           "fill" : "automatic",
+          "glass" : false,
           "hidden" : false,
           "image-name" : "AppIconGenerated.png",
           "name" : "AppIconGenerated"
