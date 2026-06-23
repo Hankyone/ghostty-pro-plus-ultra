@@ -207,6 +207,7 @@ neurosnap
 nicholas-ochoa
 nicosuave
 nikicat
+nilsherzig
 nmggithub
 noib3
 nolinmcfarland
@@ -246,6 +247,7 @@ rpfaeffle
 sahilkmishra
 samasaur1
 sandydoo
+-schickling-assistant NHITL
 secrus
 seruman
 seyoungjeong
