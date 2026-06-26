@@ -112,7 +112,8 @@ struct SidebarView: View {
     @State private var hoveredTabID: ObjectIdentifier?
     @State private var hoveredGroupID: String?
     @State private var tabCardFrames: [ObjectIdentifier: CGRect] = [:]
-    private static let scrollCoordinateSpace = "SidebarScrollCoordinateSpace"
+    @State private var headerFrames: [String: CGRect] = [:]
+    fileprivate static let scrollCoordinateSpace = "SidebarScrollCoordinateSpace"
 
     private var isDragActive: Bool {
         draggingTabID != nil || draggingGroupID != nil
@@ -168,6 +169,7 @@ struct SidebarView: View {
             .padding(.top, 8)
         }
         .coordinateSpace(name: Self.scrollCoordinateSpace)
+        .clipped()
         .task(id: isDragActive) {
             // Watchdog for drag state. The normal end-of-drag signal is the
             // system releasing the drag's NSItemProvider, but the pasteboard
@@ -189,6 +191,7 @@ struct SidebarView: View {
             }
         }
         .onPreferenceChange(SidebarCardFramePreferenceKey.self) { tabCardFrames = $0 }
+        .onPreferenceChange(SidebarHeaderFramePreferenceKey.self) { headerFrames = $0 }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.clear)
         .safeAreaInset(edge: .bottom) {
@@ -201,6 +204,9 @@ struct SidebarView: View {
                 .padding(.vertical, 8)
             }
         }
+        .overlay(WindowDragOverlay(
+            interactiveFrames: Array(tabCardFrames.values) + Array(headerFrames.values)
+        ))
         .overlay(DoubleClickOverlay(
             tabCardFrames: tabCardFrames,
             onBlankSpaceDoubleClick: { tabManager.createNewTab(projectRoot: NSHomeDirectory()) },
@@ -291,6 +297,14 @@ private struct ProjectSection: View {
                     return makeDragProvider(payload: group.id)
                 }
             }
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: SidebarHeaderFramePreferenceKey.self,
+                        value: [group.id: proxy.frame(in: .named(SidebarView.scrollCoordinateSpace))]
+                    )
+                }
+            }
 
             // Thread list with vertical line indicator
             if !isCollapsed {
@@ -306,7 +320,15 @@ private struct ProjectSection: View {
                         .frame(width: 1)
                 }
                 .padding(.leading, 4)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(
+                    .asymmetric(
+                        insertion: .opacity.combined(with: .move(edge: .top)),
+                        // Removal (collapse): fade only, no upward slide.
+                        // The slide causes content to overflow above the
+                        // project header and past the sidebar's top edge.
+                        removal: .opacity
+                    )
+                )
             }
         }
         .padding(.bottom, 2)
@@ -350,6 +372,9 @@ private struct ProjectSection: View {
                 } else {
                     PulsingDot(color: .accentColor, size: 6).padding(.trailing, 6)
                 }
+            } else if tab.statusEntries.contains(where: { $0.key == "process-running" && $0.value == "true" }) {
+                // Process running indicator — subtle pulsing orange dot
+                PulsingDot(color: .orange, size: 5).padding(.trailing, 6)
             } else if tab.needsAttention && !isSelected {
                 Circle().fill(theme.attentionColor).frame(width: 6, height: 6).padding(.trailing, 6)
             }
@@ -945,6 +970,62 @@ private struct SidebarCardFramePreferenceKey: PreferenceKey {
     }
 }
 
+private struct SidebarHeaderFramePreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+// MARK: - WindowDragOverlay
+
+/// Transparent NSView overlay that enables window dragging from blank
+/// sidebar areas. It captures single left-clicks that don't land on any
+/// interactive element (tab rows or project headers) and lets AppKit
+/// drag the window. Double-clicks, middle-clicks, and right-clicks pass
+/// through unchanged.
+private struct WindowDragOverlay: NSViewRepresentable {
+    var interactiveFrames: [CGRect]
+
+    func makeNSView(context: Context) -> WindowDragView {
+        WindowDragView(interactiveFrames: interactiveFrames)
+    }
+
+    func updateNSView(_ nsView: WindowDragView, context: Context) {
+        nsView.interactiveFrames = interactiveFrames
+    }
+
+    final class WindowDragView: NSView {
+        var interactiveFrames: [CGRect]
+
+        init(interactiveFrames: [CGRect]) {
+            self.interactiveFrames = interactiveFrames
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        override var mouseDownCanMoveWindow: Bool { true }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            // Only capture single left-clicks on blank areas.
+            guard let event = NSApp.currentEvent,
+                  event.type == .leftMouseDown,
+                  event.clickCount == 1 else {
+                return nil
+            }
+            let location = convert(event.locationInWindow, from: nil)
+            guard bounds.contains(location) else { return nil }
+            // If the click lands on an interactive element, pass through.
+            if interactiveFrames.contains(where: { $0.contains(location) }) {
+                return nil
+            }
+            return self
+        }
+    }
+}
+
 // MARK: - DoubleClickOverlay
 
 /// Transparent NSView overlay that monitors double-click events via an event
@@ -973,6 +1054,11 @@ private struct DoubleClickOverlay: NSViewRepresentable {
         var onBlankSpaceDoubleClick: () -> Void
         var onTabDoubleClick: (ObjectIdentifier) -> Void
         private var eventMonitor: Any?
+        /// Timestamp of the last handled double-click, used to debounce
+        /// duplicate events that can arrive when multiple sidebar hosting
+        /// views (one per tab in the tab group) briefly have overlapping
+        /// event monitors during window key-state transitions.
+        private var lastHandledClickTime: TimeInterval = 0
 
         init(
             tabCardFrames: [ObjectIdentifier: CGRect],
@@ -1007,6 +1093,14 @@ private struct DoubleClickOverlay: NSViewRepresentable {
                   let myWindow = self.window,
                   myWindow.isKeyWindow,
                   event.window === myWindow else { return }
+            // Debounce: ignore double-clicks within 400ms of a previously
+            // handled one. Multiple sidebar monitors can observe the same
+            // event during the key-window transition that follows tab
+            // creation, causing createNewTab to fire twice.
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastHandledClickTime < 0.4 { return }
+            lastHandledClickTime = now
+
             let locationInView = convert(event.locationInWindow, from: nil)
             guard bounds.contains(locationInView) else { return }
 

@@ -143,11 +143,23 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
 
         set --global __ghostty_prompt_state prompt-start
         echo -en $__ghostty_prompt_start_mark
+
+        # Process-running indicator: notify the Ghostty sidebar that the
+        # command has finished. Uses the IPC socket (GHOSTTY_SOCKET).
+        if test -n "$GHOSTTY_SOCKET"; and test -S "$GHOSTTY_SOCKET"
+            printf '{"method": "tab.clear-status", "params": {"key": "process-running"}}\n' | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
+        end
     end
 
     function __ghostty_mark_output_start --on-event fish_preexec
         set --global __ghostty_prompt_state pre-exec
         echo -en "\e]133;C\a"
+
+        # Process-running indicator: notify the Ghostty sidebar that a
+        # command is executing. Uses the IPC socket (GHOSTTY_SOCKET).
+        if test -n "$GHOSTTY_SOCKET"; and test -S "$GHOSTTY_SOCKET"
+            printf '{"method": "tab.set-status", "params": {"key": "process-running", "value": "true"}}\n' | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
+        end
     end
 
     function __ghostty_mark_output_end --on-event fish_postexec

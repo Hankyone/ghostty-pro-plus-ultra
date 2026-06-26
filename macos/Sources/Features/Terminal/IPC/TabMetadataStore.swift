@@ -26,7 +26,7 @@ final class TabMetadataStore: ObservableObject {
     var acknowledgedDoneToken: [UUID: String] = [:]
 
     /// Keys that are transient and should not be persisted to disk.
-    private static let transientKeys: Set<String> = ["claude-pid", "claude-active", "claude-done-at", "codex-pid", "codex-active", "codex-done-at"]
+    private static let transientKeys: Set<String> = ["claude-pid", "claude-active", "claude-done-at", "codex-pid", "codex-active", "codex-done-at", "process-running"]
 
     private var pendingSave: DispatchWorkItem?
 

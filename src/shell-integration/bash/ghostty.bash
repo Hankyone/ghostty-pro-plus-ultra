@@ -197,6 +197,13 @@ function __ghostty_precmd() {
   fi
 
   _ghostty_executing=0
+
+  # Process-running indicator: notify the Ghostty sidebar that the command
+  # has finished. Uses the IPC socket (GHOSTTY_SOCKET) with nc; runs in
+  # the background to avoid blocking.
+  if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
+    printf '{"method": "tab.clear-status", "params": {"key": "process-running"}}\n' | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
+  fi
 }
 
 function __ghostty_preexec() {
@@ -213,6 +220,13 @@ function __ghostty_preexec() {
   # End of input, start of output.
   builtin printf "\e]133;C;\a"
   _ghostty_executing=1
+
+  # Process-running indicator: notify the Ghostty sidebar that a command
+  # is executing. Uses the IPC socket (GHOSTTY_SOCKET) with nc; runs in
+  # the background to avoid blocking.
+  if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
+    printf '{"method": "tab.set-status", "params": {"key": "process-running", "value": "true"}}\n' | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
+  fi
 }
 
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then

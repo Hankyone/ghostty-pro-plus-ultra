@@ -266,6 +266,16 @@ _ghostty_deferred_init() {
 	  builtin print -rnu $_ghostty_fd \$'\\e[0 q'"
     fi
 
+    # Process-running indicator: notify the Ghostty sidebar when a command
+    # is executing so it can show an activity dot. Uses the IPC socket
+    # (GHOSTTY_SOCKET) with nc; runs in the background to avoid blocking.
+    if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
+        functions[_ghostty_preexec]+="
+            [[ -n \$GHOSTTY_SOCKET && -S \$GHOSTTY_SOCKET ]] && printf '{\"method\": \"tab.set-status\", \"params\": {\"key\": \"process-running\", \"value\": \"true\"}}\\n' | nc -U \$GHOSTTY_SOCKET 2>/dev/null &!"
+        functions[_ghostty_precmd]+="
+            [[ -n \$GHOSTTY_SOCKET && -S \$GHOSTTY_SOCKET ]] && printf '{\"method\": \"tab.clear-status\", \"params\": {\"key\": \"process-running\"}}\\n' | nc -U \$GHOSTTY_SOCKET 2>/dev/null &!"
+    fi
+
     # Emit semantic prompt markers at line-init if PS1 doesn't contain our
     # marks. This ensures the terminal sees prompt markers even if another
     # plugin (like zinit or oh-my-posh) regenerated PS1 after our precmd ran.
