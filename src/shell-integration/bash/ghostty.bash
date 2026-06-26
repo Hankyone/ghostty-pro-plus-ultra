@@ -221,11 +221,15 @@ function __ghostty_preexec() {
   builtin printf "\e]133;C;\a"
   _ghostty_executing=1
 
-  # Process-running indicator: notify the Ghostty sidebar that a command
-  # is executing. Uses the IPC socket (GHOSTTY_SOCKET) with nc; runs in
-  # the background to avoid blocking.
+  # Process-running indicator and last-command tracking: notify the
+  # Ghostty sidebar that a command is executing and store the command
+  # text so it can be displayed in the sidebar after restart.
   if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
     printf '{"method": "tab.set-status", "params": {"key": "process-running", "value": "true"}}\n' | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
+    local _gc_cmd="${cmd//[[:cntrl:]]/}"
+    _gc_cmd="${_gc_cmd//\\/\\\\}"
+    _gc_cmd="${_gc_cmd//\"/\\\"}"
+    printf '{"method": "tab.set-status", "params": {"key": "last-command", "value": "%s"}}\n' "$_gc_cmd" | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
   fi
 }
 

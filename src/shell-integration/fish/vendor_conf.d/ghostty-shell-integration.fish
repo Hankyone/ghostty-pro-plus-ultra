@@ -155,10 +155,15 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
         set --global __ghostty_prompt_state pre-exec
         echo -en "\e]133;C\a"
 
-        # Process-running indicator: notify the Ghostty sidebar that a
-        # command is executing. Uses the IPC socket (GHOSTTY_SOCKET).
+        # Process-running indicator and last-command tracking: notify the
+        # Ghostty sidebar that a command is executing and store the command
+        # text so it can be displayed in the sidebar after restart.
         if test -n "$GHOSTTY_SOCKET"; and test -S "$GHOSTTY_SOCKET"
             printf '{"method": "tab.set-status", "params": {"key": "process-running", "value": "true"}}\n' | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
+            set -l _gc_cmd (string replace --all --regex '[[:cntrl:]]' '' -- $argv)
+            set -l _gc_cmd (string replace --all -- '\\' '\\\\' -- $_gc_cmd)
+            set -l _gc_cmd (string replace --all -- '"' '\\"' -- $_gc_cmd)
+            printf '{"method": "tab.set-status", "params": {"key": "last-command", "value": "%s"}}\n' $_gc_cmd | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
         end
     end
 

@@ -112,7 +112,6 @@ struct SidebarView: View {
     @State private var hoveredTabID: ObjectIdentifier?
     @State private var hoveredGroupID: String?
     @State private var tabCardFrames: [ObjectIdentifier: CGRect] = [:]
-    @State private var headerFrames: [String: CGRect] = [:]
     fileprivate static let scrollCoordinateSpace = "SidebarScrollCoordinateSpace"
 
     private var isDragActive: Bool {
@@ -191,7 +190,6 @@ struct SidebarView: View {
             }
         }
         .onPreferenceChange(SidebarCardFramePreferenceKey.self) { tabCardFrames = $0 }
-        .onPreferenceChange(SidebarHeaderFramePreferenceKey.self) { headerFrames = $0 }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.clear)
         .safeAreaInset(edge: .bottom) {
@@ -204,9 +202,6 @@ struct SidebarView: View {
                 .padding(.vertical, 8)
             }
         }
-        .overlay(WindowDragOverlay(
-            interactiveFrames: Array(tabCardFrames.values) + Array(headerFrames.values)
-        ))
         .overlay(DoubleClickOverlay(
             tabCardFrames: tabCardFrames,
             onBlankSpaceDoubleClick: { tabManager.createNewTab(projectRoot: NSHomeDirectory()) },
@@ -297,14 +292,6 @@ private struct ProjectSection: View {
                     return makeDragProvider(payload: group.id)
                 }
             }
-            .background {
-                GeometryReader { proxy in
-                    Color.clear.preference(
-                        key: SidebarHeaderFramePreferenceKey.self,
-                        value: [group.id: proxy.frame(in: .named(SidebarView.scrollCoordinateSpace))]
-                    )
-                }
-            }
 
             // Thread list with vertical line indicator
             if !isCollapsed {
@@ -358,6 +345,9 @@ private struct ProjectSection: View {
             return .clear
         }()
 
+        Button {
+            tabManager.selectTab(tab)
+        } label: {
         HStack(spacing: 0) {
             // Status dot — leading position
             if let activeEntry {
@@ -379,16 +369,26 @@ private struct ProjectSection: View {
                 Circle().fill(theme.attentionColor).frame(width: 6, height: 6).padding(.trailing, 6)
             }
 
-            // Title
+            // Title + optional last-command subtitle
             let primaryTitle = tab.displayTitle
 
-            Text(primaryTitle)
-                .font(.system(size: 11))
-                .foregroundColor(titleColor)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(primaryTitle)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(primaryTitle)
+                    .font(.system(size: 11))
+                    .foregroundColor(titleColor)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(primaryTitle)
+
+                if let cmd = tab.lastCommand, !cmd.isEmpty, cmd != primaryTitle {
+                    Text(cmd)
+                        .font(.system(size: 9))
+                        .foregroundColor(theme.secondaryText.opacity(0.6))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             // Relative time — "3m", "1h" (time since last real activity)
             if let activity = tab.lastActivity {
@@ -398,7 +398,8 @@ private struct ProjectSection: View {
                     .fixedSize()
             }
         }
-        .frame(height: 28)
+        }
+        .frame(minHeight: 28)
         .padding(.horizontal, 8)
         .offset(x: -1)
         .contentShape(Rectangle())
@@ -406,11 +407,9 @@ private struct ProjectSection: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(rowBackground)
         )
+        .buttonStyle(.plain)
         .onHover { hovering in
             hoveredTabID = hovering ? tab.id : nil
-        }
-        .onTapGesture {
-            tabManager.selectTab(tab)
         }
         .background {
             GeometryReader { proxy in
@@ -967,62 +966,6 @@ private struct SidebarCardFramePreferenceKey: PreferenceKey {
 
     static func reduce(value: inout [ObjectIdentifier: CGRect], nextValue: () -> [ObjectIdentifier: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-private struct SidebarHeaderFramePreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
-// MARK: - WindowDragOverlay
-
-/// Transparent NSView overlay that enables window dragging from blank
-/// sidebar areas. It captures single left-clicks that don't land on any
-/// interactive element (tab rows or project headers) and lets AppKit
-/// drag the window. Double-clicks, middle-clicks, and right-clicks pass
-/// through unchanged.
-private struct WindowDragOverlay: NSViewRepresentable {
-    var interactiveFrames: [CGRect]
-
-    func makeNSView(context: Context) -> WindowDragView {
-        WindowDragView(interactiveFrames: interactiveFrames)
-    }
-
-    func updateNSView(_ nsView: WindowDragView, context: Context) {
-        nsView.interactiveFrames = interactiveFrames
-    }
-
-    final class WindowDragView: NSView {
-        var interactiveFrames: [CGRect]
-
-        init(interactiveFrames: [CGRect]) {
-            self.interactiveFrames = interactiveFrames
-            super.init(frame: .zero)
-        }
-
-        required init?(coder: NSCoder) { fatalError() }
-
-        override var mouseDownCanMoveWindow: Bool { true }
-
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            // Only capture single left-clicks on blank areas.
-            guard let event = NSApp.currentEvent,
-                  event.type == .leftMouseDown,
-                  event.clickCount == 1 else {
-                return nil
-            }
-            let location = convert(event.locationInWindow, from: nil)
-            guard bounds.contains(location) else { return nil }
-            // If the click lands on an interactive element, pass through.
-            if interactiveFrames.contains(where: { $0.contains(location) }) {
-                return nil
-            }
-            return self
-        }
     }
 }
 
