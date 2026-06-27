@@ -194,6 +194,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // checking Codex first (later session overwrites earlier).
         for surface in c.surfaceTree {
             attemptSessionResume(for: surface)
+            attemptLastCommandRestore(for: surface)
         }
 
         guard let mode = state.effectiveFullscreenMode, mode != .native else {
@@ -242,6 +243,31 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             // Type the command but don't execute — let the user press Enter when ready.
             surface.sendText(command)
+        }
+    }
+
+    /// Pre-type the last executed command into a restored surface's prompt,
+    /// so the user can press Enter to re-run it. Only fires when there's no
+    /// Claude/Codex session to resume (those are handled by attemptSessionResume).
+    @MainActor
+    private static func attemptLastCommandRestore(for surface: Ghostty.SurfaceView) {
+        let surfaceId = surface.id
+        let store = TabMetadataStore.shared
+
+        // If this surface has a Claude or Codex session, skip — that's
+        // handled by attemptSessionResume.
+        if store.entries[surfaceId]?["claude-session"] != nil ||
+           store.entries[surfaceId]?["codex-session"] != nil {
+            return
+        }
+
+        guard let cmd = store.entries[surfaceId]?["last-command"]?.value,
+              !cmd.isEmpty else { return }
+
+        // Delay to let the shell initialize and display its prompt.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            // Type the command but don't execute — let the user press Enter when ready.
+            surface.sendText(cmd)
         }
     }
 

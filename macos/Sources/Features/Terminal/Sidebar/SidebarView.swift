@@ -366,26 +366,16 @@ private struct ProjectSection: View {
                 Circle().fill(theme.attentionColor).frame(width: 6, height: 6).padding(.trailing, 6)
             }
 
-            // Title + optional last-command subtitle
+            // Title
             let primaryTitle = tab.displayTitle
 
-            VStack(alignment: .leading, spacing: 0) {
-                Text(primaryTitle)
-                    .font(.system(size: 11))
-                    .foregroundColor(titleColor)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .help(primaryTitle)
-
-                if let cmd = tab.lastCommand, !cmd.isEmpty, cmd != primaryTitle {
-                    Text(cmd)
-                        .font(.system(size: 9))
-                        .foregroundColor(theme.secondaryText.opacity(0.6))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            Text(primaryTitle)
+                .font(.system(size: 11))
+                .foregroundColor(titleColor)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(primaryTitle)
 
             // Relative time — "3m", "1h" (time since last real activity)
             if let activity = tab.lastActivity {
@@ -395,7 +385,7 @@ private struct ProjectSection: View {
                     .fixedSize()
             }
         }
-        .frame(minHeight: 28)
+        .frame(height: 28)
         .padding(.horizontal, 8)
         .offset(x: -1)
         .contentShape(Rectangle())

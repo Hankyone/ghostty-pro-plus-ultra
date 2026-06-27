@@ -53,11 +53,6 @@ class SidebarTabManager: ObservableObject {
             return t
         }
 
-        /// The last command executed in this tab, if known via shell integration.
-        var lastCommand: String? {
-            statusEntries.first(where: { $0.key == "last-command" })?.value
-        }
-
         static func == (lhs: TabItem, rhs: TabItem) -> Bool {
             lhs.id == rhs.id && lhs.title == rhs.title
                 && lhs.pwd == rhs.pwd && lhs.gitDiffStats == rhs.gitDiffStats
