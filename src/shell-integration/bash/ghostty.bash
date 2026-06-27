@@ -202,7 +202,7 @@ function __ghostty_precmd() {
   # has finished. Uses the IPC socket (GHOSTTY_SOCKET) with nc; runs in
   # the background to avoid blocking.
   if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
-    printf '{"method": "tab.clear-status", "params": {"key": "process-running"}}\n' | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
+    printf '{"method": "tab.clear-status", "params": {"key": "process-running"}}\n' | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
   fi
 }
 
@@ -225,11 +225,11 @@ function __ghostty_preexec() {
   # Ghostty sidebar that a command is executing and store the command
   # text so it can be displayed in the sidebar after restart.
   if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
-    printf '{"method": "tab.set-status", "params": {"key": "process-running", "value": "true"}}\n' | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
+    printf '{"method": "tab.set-status", "params": {"key": "process-running", "value": "true"}}\n' | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
     local _gc_cmd="${cmd//[[:cntrl:]]/}"
     _gc_cmd="${_gc_cmd//\\/\\\\}"
     _gc_cmd="${_gc_cmd//\"/\\\"}"
-    printf '{"method": "tab.set-status", "params": {"key": "last-command", "value": "%s"}}\n' "$_gc_cmd" | nc -U "$GHOSTTY_SOCKET" 2>/dev/null &
+    printf '{"method": "tab.set-status", "params": {"key": "last-command", "value": "%s"}}\n' "$_gc_cmd" | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
   fi
 }
 
