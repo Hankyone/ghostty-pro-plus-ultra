@@ -345,9 +345,6 @@ private struct ProjectSection: View {
             return .clear
         }()
 
-        Button {
-            tabManager.selectTab(tab)
-        } label: {
         HStack(spacing: 0) {
             // Status dot — leading position
             if let activeEntry {
@@ -398,7 +395,6 @@ private struct ProjectSection: View {
                     .fixedSize()
             }
         }
-        }
         .frame(minHeight: 28)
         .padding(.horizontal, 8)
         .offset(x: -1)
@@ -407,9 +403,11 @@ private struct ProjectSection: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(rowBackground)
         )
-        .buttonStyle(.plain)
         .onHover { hovering in
             hoveredTabID = hovering ? tab.id : nil
+        }
+        .onTapGesture {
+            tabManager.selectTab(tab)
         }
         .background {
             GeometryReader { proxy in
