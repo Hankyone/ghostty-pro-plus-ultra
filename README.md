@@ -20,7 +20,7 @@ A T3 Code-inspired sidebar that replaces the native tab bar. Terminals are autom
 
 ### AI Agent Integration
 
-Built-in support for Claude Code and Codex. The sidebar shows live status for each agent session — pulsing blue while working, orange when waiting for input, green when done. Each project header has a button to launch a new session or resume a recent one directly from the sidebar.
+Built-in support for Claude Code, Codex, Grok, Devin, and Antigravity. The sidebar shows live status for each agent session — pulsing blue while working, orange when waiting for input, green when done. Each project header has a button to launch a new session or resume a recent one directly from the sidebar. Antigravity has no hook system, so it gets launch support and the built-in process-running indicator but no live status tracking or session resume.
 
 ### Tab Restore
 
@@ -65,6 +65,61 @@ json.dump(s, open(p, 'w'), indent=2)
 print('Hooks installed.')
 "
 ```
+
+**Grok:**
+
+```bash
+# Create the hooks directory and register hooks
+mkdir -p ~/.grok/hooks
+python3 -c "
+import json, os
+p = os.path.expanduser('~/.grok/hooks/ghostty-sidebar.json')
+cmd = 'bash $(pwd)/cli/ghostty-grok-hook.sh'
+entry = [{'hooks': [{'type': 'command', 'command': cmd}]}]
+s = {'hooks': {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','PostToolUse','Stop','StopFailure','SessionEnd']}}
+json.dump(s, open(p, 'w'), indent=2)
+print('Hooks installed.')
+"
+```
+
+> **Note:** Grok reads `~/.claude/settings.json` hooks by default (Claude
+> compatibility). To avoid the Claude sidebar hook firing when you run Grok,
+> either disable Claude hook scanning in `~/.grok/config.toml`:
+> ```toml
+> [compat.claude]
+> hooks = false
+> ```
+> Or use a single shared hook script that detects the agent from the payload.
+
+**Devin:**
+
+```bash
+# Register hooks in Devin user config (merges with existing settings)
+python3 -c "
+import json, os
+p = os.path.expanduser('~/.config/devin/config.json')
+s = json.load(open(p)) if os.path.exists(p) else {}
+cmd = 'bash $(pwd)/cli/ghostty-devin-hook.sh'
+entry = [{'hooks': [{'type': 'command', 'command': cmd}]}]
+s['hooks'] = {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','PostToolUse','Stop','SessionEnd']}
+json.dump(s, open(p, 'w'), indent=2)
+print('Hooks installed.')
+"
+```
+
+> **Note:** Like Grok, Devin reads `~/.claude/settings.json` hooks by default.
+> To avoid the Claude sidebar hook firing when you run Devin, disable Claude
+> config import in `~/.config/devin/config.json`:
+> ```json
+> { "read_config_from": { "claude": false } }
+> ```
+
+**Antigravity:**
+
+No hook setup needed — Antigravity doesn't support hooks. It appears in the
+launch menu with `--dangerously-skip-permissions` and gets the built-in
+process-running indicator (pulsing orange dot) but no live status tracking
+or session resume.
 
 ### CLI
 

@@ -188,10 +188,9 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
         completionHandler(window, nil)
 
-        // Auto-resume Claude Code or Codex sessions for all surfaces in this window.
-        // A surface can only have one active session type — if both keys exist
-        // (e.g. user switched from Claude to Codex), prefer the most recent by
-        // checking Codex first (later session overwrites earlier).
+        // Auto-resume agent sessions for all surfaces in this window.
+        // A surface can only have one active session type — session keys are
+        // mutually exclusive in TabMetadataStore, so only one will be present.
         for surface in c.surfaceTree {
             attemptSessionResume(for: surface)
             attemptLastCommandRestore(for: surface)
@@ -206,34 +205,61 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         c.toggleFullscreen(mode: mode)
     }
 
-    /// Attempt to auto-resume a Claude Code or Codex session in a restored surface.
-    /// A surface can only resume ONE session type. If both keys exist (user switched
-    /// tools in the same tab), we pick the Codex session since it was set later.
+    /// Attempt to auto-resume an agent session in a restored surface.
+    /// A surface can only resume ONE session type. Session keys are mutually
+    /// exclusive in TabMetadataStore, so we detect which agent was running
+    /// and build the appropriate resume command.
     @MainActor
     private static func attemptSessionResume(for surface: Ghostty.SurfaceView) {
         let surfaceId = surface.id
         let store = TabMetadataStore.shared
+        let entries = store.entries[surfaceId] ?? [:]
 
-        let claudeEntry = store.entries[surfaceId]?["claude-session"]
-        let codexEntry = store.entries[surfaceId]?["codex-session"]
-
-        // Determine which session to resume. If both exist, prefer Codex
-        // (the later tool overwrites the earlier). Otherwise pick whichever exists.
+        // Detect which agent was running from its session key.
+        // Session keys are mutually exclusive, so at most one will be present.
+        let agent: SidebarTabManager.AgentType?
         let sessionId: String
-        let command: String
-        if let codex = codexEntry, !codex.value.isEmpty {
-            sessionId = codex.value
-            command = "codex resume \(sessionId) --dangerously-bypass-approvals-and-sandbox"
-        } else if let claude = claudeEntry, !claude.value.isEmpty {
-            sessionId = claude.value
-            command = "claude --resume \(sessionId) --dangerously-skip-permissions"
+
+        if let entry = entries["codex-session"], !entry.value.isEmpty {
+            agent = .codex
+            sessionId = entry.value
+        } else if let entry = entries["claude-session"], !entry.value.isEmpty {
+            agent = .claude
+            sessionId = entry.value
+        } else if let entry = entries["grok-session"], !entry.value.isEmpty {
+            agent = .grok
+            sessionId = entry.value
+        } else if let entry = entries["devin-session"], !entry.value.isEmpty {
+            agent = .devin
+            sessionId = entry.value
         } else {
             return
         }
 
-        // Validate session ID format (alphanumeric + hyphens only) to prevent injection.
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-        guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
+        // Build the resume command for the detected agent.
+        // All agents run with full permissions on resume.
+        let command: String
+        switch agent {
+        case .codex:
+            // Validate session ID format (alphanumeric + hyphens only) to prevent injection.
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+            guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
+            command = "codex resume \(sessionId) --dangerously-bypass-approvals-and-sandbox"
+        case .claude:
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+            guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
+            command = "claude --resume \(sessionId) --dangerously-skip-permissions"
+        case .grok:
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+            guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
+            command = "grok --resume \(sessionId) --permission-mode bypassPermissions"
+        case .devin:
+            // Devin doesn't expose session_id in hooks, so we stored "devin" as
+            // a placeholder. Launch the interactive session picker instead.
+            command = "devin -r --permission-mode dangerous"
+        case .none:
+            return
+        }
 
         // Don't clear session keys here. They persist so that if the app is
         // force-killed before the resume completes, the next restart will
@@ -248,20 +274,21 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
     /// Pre-type the last executed command into a restored surface's prompt,
     /// so the user can press Enter to re-run it. Only fires when there's no
-    /// Claude/Codex session to resume (those are handled by attemptSessionResume).
+    /// agent session to resume (those are handled by attemptSessionResume).
     @MainActor
     private static func attemptLastCommandRestore(for surface: Ghostty.SurfaceView) {
         let surfaceId = surface.id
         let store = TabMetadataStore.shared
+        let entries = store.entries[surfaceId] ?? [:]
 
-        // If this surface has a Claude or Codex session, skip — that's
-        // handled by attemptSessionResume.
-        if store.entries[surfaceId]?["claude-session"] != nil ||
-           store.entries[surfaceId]?["codex-session"] != nil {
-            return
+        // If this surface has any agent session, skip — that's handled by
+        // attemptSessionResume.
+        let hasAgentSession = SidebarTabManager.AgentType.allCases.contains { agent in
+            entries[agent.sessionKey] != nil
         }
+        if hasAgentSession { return }
 
-        guard let cmd = store.entries[surfaceId]?["last-command"]?.value,
+        guard let cmd = entries["last-command"]?.value,
               !cmd.isEmpty else { return }
 
         // Delay to let the shell initialize and display its prompt.

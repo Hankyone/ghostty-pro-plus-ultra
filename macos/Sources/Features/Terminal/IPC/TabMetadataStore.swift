@@ -26,7 +26,13 @@ final class TabMetadataStore: ObservableObject {
     var acknowledgedDoneToken: [UUID: String] = [:]
 
     /// Keys that are transient and should not be persisted to disk.
-    private static let transientKeys: Set<String> = ["claude-pid", "claude-active", "claude-done-at", "codex-pid", "codex-active", "codex-done-at", "process-running"]
+    private static let transientKeys: Set<String> = [
+        "claude-pid", "claude-active", "claude-done-at",
+        "codex-pid", "codex-active", "codex-done-at",
+        "grok-pid", "grok-active", "grok-done-at",
+        "devin-pid", "devin-active", "devin-done-at",
+        "process-running",
+    ]
 
     private var pendingSave: DispatchWorkItem?
 
@@ -34,20 +40,22 @@ final class TabMetadataStore: ObservableObject {
         loadFromDisk()
     }
 
-    /// Session keys that are mutually exclusive — setting one clears the other.
-    private static let exclusiveSessionKeys: [String: String] = [
-        "claude-session": "codex-session",
-        "codex-session": "claude-session",
+    /// Session keys that are mutually exclusive — setting one clears all others.
+    /// A tab can only run one agent at a time.
+    private static let allSessionKeys: Set<String> = [
+        "claude-session", "codex-session", "grok-session", "devin-session",
     ]
 
     func setStatus(tabId: UUID, key: String, value: String, icon: String? = nil) {
         if entries[tabId] == nil {
             entries[tabId] = [:]
         }
-        // Session keys are mutually exclusive: setting one clears the other
-        // so a tab is always either Claude or Codex, never both.
-        if let conflicting = Self.exclusiveSessionKeys[key] {
-            entries[tabId]?.removeValue(forKey: conflicting)
+        // Session keys are mutually exclusive: setting one clears all others
+        // so a tab is always associated with exactly one agent.
+        if Self.allSessionKeys.contains(key) {
+            for other in Self.allSessionKeys where other != key {
+                entries[tabId]?.removeValue(forKey: other)
+            }
         }
         entries[tabId]?[key] = StatusEntry(key: key, value: value, icon: icon)
         if !Self.transientKeys.contains(key) {
@@ -75,29 +83,23 @@ final class TabMetadataStore: ObservableObject {
         scheduleSave()
     }
 
-    /// Sweep stale Claude and Codex sessions whose PIDs are no longer alive.
+    /// Sweep stale agent sessions whose PIDs are no longer alive.
     /// Called periodically from SidebarTabManager.
     func sweepStaleSessions() {
+        // Agent name prefixes whose transient keys should be swept
+        let agentPrefixes = ["claude", "codex", "grok", "devin"]
         for (tabId, tabEntries) in entries {
-            // Sweep stale Claude sessions
-            if let pidEntry = tabEntries["claude-pid"],
-               let pid = Int32(pidEntry.value) {
-                // kill(pid, 0) checks if the process exists without sending a signal.
-                // Returns -1 with ESRCH if the process doesn't exist.
-                if kill(pid, 0) == -1 && errno == ESRCH {
-                    entries[tabId]?.removeValue(forKey: "claude")
-                    entries[tabId]?.removeValue(forKey: "claude-active")
-                    entries[tabId]?.removeValue(forKey: "claude-pid")
-                }
-            }
-
-            // Sweep stale Codex sessions
-            if let pidEntry = tabEntries["codex-pid"],
-               let pid = Int32(pidEntry.value) {
-                if kill(pid, 0) == -1 && errno == ESRCH {
-                    entries[tabId]?.removeValue(forKey: "codex")
-                    entries[tabId]?.removeValue(forKey: "codex-active")
-                    entries[tabId]?.removeValue(forKey: "codex-pid")
+            for prefix in agentPrefixes {
+                let pidKey = "\(prefix)-pid"
+                if let pidEntry = tabEntries[pidKey],
+                   let pid = Int32(pidEntry.value) {
+                    // kill(pid, 0) checks if the process exists without sending a signal.
+                    // Returns -1 with ESRCH if the process doesn't exist.
+                    if kill(pid, 0) == -1 && errno == ESRCH {
+                        entries[tabId]?.removeValue(forKey: prefix)
+                        entries[tabId]?.removeValue(forKey: "\(prefix)-active")
+                        entries[tabId]?.removeValue(forKey: pidKey)
+                    }
                 }
             }
 

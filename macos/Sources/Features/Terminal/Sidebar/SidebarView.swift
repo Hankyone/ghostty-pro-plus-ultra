@@ -329,8 +329,10 @@ private struct ProjectSection: View {
 
         // Determine the current agent from the mutually-exclusive session key,
         // then scope all agent-specific lookups to avoid stale cross-agent state.
-        let isClaudeSession = tab.statusEntries.contains(where: { $0.key == "claude-session" })
-        let activeEntry = tab.statusEntries.first(where: { $0.key == (isClaudeSession ? "claude-active" : "codex-active") })
+        let agent = SidebarTabManager.AgentType.detect(from: tab.statusEntries)
+        let activeEntry = agent.flatMap { a in
+            tab.statusEntries.first(where: { $0.key == a.activeKey })
+        }
         let titleColor = isSelected || isHovered ? theme.foreground : theme.secondaryText
         // Tab color tint — subtle background wash instead of a left bar
         let tabTint: Color? = tab.tabColor.displayColor.map { Color(nsColor: $0) }

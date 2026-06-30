@@ -135,6 +135,17 @@ class SidebarTabManager: ObservableObject {
     /// Pwds currently being detected in the background, to avoid duplicate work.
     private static var faviconDetectionInFlight: Set<String> = []
 
+    /// Invalidate favicon cache entries that returned no icon, so they get
+    /// re-scanned on the next refresh. Called when file changes are detected
+    /// (via GitStatsWatcher's FSEvents) or periodically as a fallback — a
+    /// favicon may have been added after the initial scan cached `nil`.
+    private static func invalidateNilFaviconEntries() {
+        // Remove entries where the optional image is nil (not found).
+        // Non-nil entries are kept — replacing an existing icon is rare and
+        // not worth re-scanning on every file change.
+        faviconCache = faviconCache.filter { $0.value != nil }
+    }
+
     /// Shared FSEvents-based git stats watcher — all tab managers read from the
     /// same store so switching tabs never loses project-level stats.
     private var gitStatsWatcher: GitStatsWatcher { GitStatsWatcher.shared }
@@ -163,6 +174,10 @@ class SidebarTabManager: ObservableObject {
         self.bellTriggersAttention = bellTriggersAttention
         let observerId = ObjectIdentifier(self)
         gitStatsWatcher.addChangeObserver(id: observerId) { [weak self] in
+            // File changes detected by FSEvents — a favicon may have been
+            // added since the initial scan cached nil. Clear stale nil
+            // entries so the next refresh re-scans for icons.
+            Self.invalidateNilFaviconEntries()
             self?.refresh(reason: "git stats changed")
         }
         setupObservers()
@@ -341,9 +356,8 @@ class SidebarTabManager: ObservableObject {
     /// Acknowledge the current completion token for a tab so its green dot stops pulsing.
     private func acknowledgeCompletion(for tab: TabItem) {
         guard let sid = tab.surfaceId else { return }
-        let isClaudeSession = tab.statusEntries.contains(where: { $0.key == "claude-session" })
-        let doneAtKey = isClaudeSession ? "claude-done-at" : "codex-done-at"
-        guard let token = tab.statusEntries.first(where: { $0.key == doneAtKey })?.value else { return }
+        guard let agent = AgentType.detect(from: tab.statusEntries) else { return }
+        guard let token = tab.statusEntries.first(where: { $0.key == agent.doneAtKey })?.value else { return }
         TabMetadataStore.shared.acknowledgedDoneToken[sid] = token
     }
 
@@ -683,6 +697,7 @@ class SidebarTabManager: ObservableObject {
         "assets",
         "static",
         "frontend/public",
+        "icons",  // Chrome extension / PWA icon directory
         "",  // project root
     ]
 
@@ -721,6 +736,8 @@ class SidebarTabManager: ObservableObject {
     private static let fallbackIconNames = [
         "icon-32x32.png", "icon-48x48.png", "icon-192x192.png",
         "apple-touch-icon.png", "logo.svg", "logo.png",
+        // Chrome extension / PWA icon naming conventions
+        "icon16.png", "icon32.png", "icon48.png", "icon128.png",
     ]
 
     /// Background-safe favicon search. Static so it can be called from a
@@ -753,6 +770,9 @@ class SidebarTabManager: ObservableObject {
 
                 // Try app icons (iOS/macOS/Android)
                 if let image = findAppIcon(in: dir, using: fm) { return image }
+
+                // Try Chrome extension / PWA manifest.json icons
+                if let image = findChromeExtensionIcon(in: dir, using: fm) { return image }
 
                 // Try extracting favicon from HTML files
                 if let image = extractFaviconFromHTML(in: dir, using: fm) { return image }
@@ -942,6 +962,50 @@ class SidebarTabManager: ObservableObject {
         return nil
     }
 
+    // MARK: - Chrome Extension / PWA Manifest Icon Extraction
+
+    /// Minimal Decodable for Chrome extension / PWA manifest.json.
+    /// Both `icons` and `action.default_icon` map size strings to file paths.
+    private struct WebManifest: Decodable {
+        let icons: [String: String]?
+        let action: Action?
+        struct Action: Decodable {
+            let defaultIcon: [String: String]?
+            enum CodingKeys: String, CodingKey {
+                case defaultIcon = "default_icon"
+            }
+        }
+    }
+
+    /// Parse manifest.json (Chrome extension MV3 or PWA Web App Manifest)
+    /// and load the best-sized icon. Prefers the top-level `icons` field,
+    /// falls back to `action.default_icon` (the toolbar button icon).
+    nonisolated private static func findChromeExtensionIcon(in projectRoot: String, using fm: FileManager) -> NSImage? {
+        let manifestPath = (projectRoot as NSString).appendingPathComponent("manifest.json")
+        guard fm.fileExists(atPath: manifestPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: manifestPath)),
+              let manifest = try? JSONDecoder().decode(WebManifest.self, from: data) else {
+            return nil
+        }
+
+        // Prefer top-level icons, then action.default_icon
+        let iconMap = manifest.icons ?? manifest.action?.defaultIcon
+        guard let iconMap, !iconMap.isEmpty else { return nil }
+
+        // Pick the size closest to 48px — good middle ground for downscaling to 16px
+        let sorted = iconMap.sorted { lhs, rhs in
+            let lhsSize = Int(lhs.key) ?? 0
+            let rhsSize = Int(rhs.key) ?? 0
+            return abs(lhsSize - 48) < abs(rhsSize - 48)
+        }
+
+        for (_, relPath) in sorted {
+            let iconPath = (projectRoot as NSString).appendingPathComponent(relPath)
+            if let image = loadFaviconFromDisk(at: iconPath) { return image }
+        }
+        return nil
+    }
+
     // MARK: - HTML Favicon Extraction
 
     /// HTML files to check for embedded favicon references, in priority order.
@@ -1127,9 +1191,8 @@ class SidebarTabManager: ObservableObject {
 
             // Determine whether this tab has an unread completion.
             // Scope to the current agent via the mutually-exclusive session key.
-            let isClaudeSession = entries.contains(where: { $0.key == "claude-session" })
-            let doneAtKey = isClaudeSession ? "claude-done-at" : "codex-done-at"
-            let doneToken = entries.first(where: { $0.key == doneAtKey })?.value
+            let agent = AgentType.detect(from: entries)
+            let doneToken = agent.flatMap { a in entries.first(where: { $0.key == a.doneAtKey })?.value }
             var unread = false
             if let sid, let token = doneToken {
                 let isSelected = (w == selectedWindow)
@@ -1176,8 +1239,8 @@ class SidebarTabManager: ObservableObject {
             if let prev = previousTabFingerprints[tab.id] {
                 // Skip fingerprint changes that aren't real user activity:
                 // 1. First 5 seconds after a tab appears (shell initialization)
-                // 2. Session resuming: claude-pid/codex-pid is set (SessionStart
-                //    hook fired) but claude-active/codex-active hasn't appeared
+                // 2. Session resuming: <agent>-pid is set (SessionStart
+                //    hook fired) but <agent>-active hasn't appeared
                 //    yet (user hasn't submitted a prompt). This covers pressing
                 //    Enter on the pre-filled resume command without counting it
                 //    as activity. If the user deletes the command and runs
@@ -1185,11 +1248,11 @@ class SidebarTabManager: ObservableObject {
                 let firstSeen = tabFirstSeenTime[tab.id] ?? .distantPast
                 let isShellInit = now.timeIntervalSince(firstSeen) < 5.0
                 let isSessionResuming: Bool = {
-                    let hasPid = tab.statusEntries.contains(where: {
-                        $0.key == "claude-pid" || $0.key == "codex-pid"
+                    let hasPid = tab.statusEntries.contains(where: { entry in
+                        AgentType.allCases.contains { $0.pidKey == entry.key }
                     })
-                    let hasActive = tab.statusEntries.contains(where: {
-                        $0.key == "claude-active" || $0.key == "codex-active"
+                    let hasActive = tab.statusEntries.contains(where: { entry in
+                        AgentType.allCases.contains { $0.activeKey == entry.key }
                     })
                     return hasPid && !hasActive
                 }()
@@ -1240,6 +1303,11 @@ class SidebarTabManager: ObservableObject {
         if Date().timeIntervalSince(lastPidSweepTime) >= Self.pidSweepInterval {
             lastPidSweepTime = Date()
             metadataStore.sweepStaleClaude()
+            // Also re-check for favicons that may have been added to projects
+            // since the initial scan. This covers non-git projects where
+            // FSEvents is active but git stats never change (so the reactive
+            // invalidation via git stats observer never fires).
+            Self.invalidateNilFaviconEntries()
         }
 
         // Now apply the fingerprint gate: if nothing observable changed on a
@@ -1299,19 +1367,25 @@ class SidebarTabManager: ObservableObject {
         case terminal = "Terminal"
         case claudeCode = "Claude Code"
         case codex = "Codex"
+        case grok = "Grok"
+        case devin = "Devin"
+        case antigravity = "Antigravity"
 
         var icon: String {
             switch self {
             case .terminal: return "terminal"
             case .claudeCode: return "ClaudeIcon"
             case .codex: return "CodexIcon"
+            case .grok: return "GrokIcon"
+            case .devin: return "DevinIcon"
+            case .antigravity: return "AntigravityIcon"
             }
         }
 
         var isCustomIcon: Bool {
             switch self {
             case .terminal: return false
-            case .claudeCode, .codex: return true
+            case .claudeCode, .codex, .grok, .devin, .antigravity: return true
             }
         }
 
@@ -1321,7 +1395,46 @@ class SidebarTabManager: ObservableObject {
             case .terminal: return nil
             case .claudeCode: return "claude --dangerously-skip-permissions"
             case .codex: return "codex --dangerously-bypass-approvals-and-sandbox"
+            case .grok: return "grok --permission-mode bypassPermissions"
+            case .devin: return "devin --permission-mode dangerous"
+            case .antigravity: return "agy --dangerously-skip-permissions"
             }
+        }
+    }
+
+    /// Represents an AI agent that can be tracked in the sidebar.
+    /// Each agent has a set of status keys used by its hook script.
+    enum AgentType: String, CaseIterable {
+        case claude
+        case codex
+        case grok
+        case devin
+
+        /// The session key (e.g. "claude-session"). Presence of this key
+        /// indicates the tab is running this agent.
+        var sessionKey: String { "\(rawValue)-session" }
+
+        /// The active status key (e.g. "claude-active"). Values: "working", "done", "needs-input".
+        var activeKey: String { "\(rawValue)-active" }
+
+        /// The PID key (e.g. "claude-pid"). Used for stale session detection.
+        var pidKey: String { "\(rawValue)-pid" }
+
+        /// The completion token key (e.g. "claude-done-at"). A UUID emitted on Stop.
+        var doneAtKey: String { "\(rawValue)-done-at" }
+
+        /// The prompt text key (e.g. "claude"). Holds the truncated last user prompt.
+        var promptKey: String { rawValue }
+
+        /// Detect which agent is running for a set of status entries.
+        /// Returns the first matching agent (agents are mutually exclusive).
+        static func detect(from entries: [TabMetadataStore.StatusEntry]) -> AgentType? {
+            for agent in allCases {
+                if entries.contains(where: { $0.key == agent.sessionKey }) {
+                    return agent
+                }
+            }
+            return nil
         }
     }
 
