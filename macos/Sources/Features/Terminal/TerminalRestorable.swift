@@ -232,6 +232,9 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         } else if let entry = entries["devin-session"], !entry.value.isEmpty {
             agent = .devin
             sessionId = entry.value
+        } else if let entry = entries["cursor-session"], !entry.value.isEmpty {
+            agent = .cursor
+            sessionId = entry.value
         } else {
             return
         }
@@ -257,6 +260,12 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             // Devin doesn't expose session_id in hooks, so we stored "devin" as
             // a placeholder. Launch the interactive session picker instead.
             command = "devin -r --permission-mode dangerous"
+        case .cursor:
+            // Cursor uses conversation_id as the session identifier.
+            // `cursor --resume <id>` resumes a specific conversation.
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+            guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
+            command = "cursor --resume \(sessionId) --yolo"
         case .none:
             return
         }

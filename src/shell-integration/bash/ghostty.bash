@@ -200,9 +200,13 @@ function __ghostty_precmd() {
 
   # Process-running indicator: notify the Ghostty sidebar that the command
   # has finished. Uses the IPC socket (GHOSTTY_SOCKET) with nc; runs in
-  # the background to avoid blocking.
+  # the background to avoid blocking. Include GHOSTTY_TAB_ID so the clear
+  # always targets the correct surface.
   if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
-    printf '{"method": "tab.clear-status", "params": {"key": "process-running"}}\n' | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
+    local _gc_tid="${GHOSTTY_TAB_ID:-}"
+    local _gc_params="\"key\": \"process-running\""
+    [[ -n "$_gc_tid" ]] && _gc_params="\"tab_id\": \"$_gc_tid\", $_gc_params"
+    printf '{"method": "tab.clear-status", "params": {%s}}\n' "$_gc_params" | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
   fi
 }
 
@@ -224,12 +228,18 @@ function __ghostty_preexec() {
   # Process-running indicator and last-command tracking: notify the
   # Ghostty sidebar that a command is executing and store the command
   # text so it can be displayed in the sidebar after restart.
+  # Include GHOSTTY_TAB_ID so IPC calls always target the correct surface.
   if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
-    printf '{"method": "tab.set-status", "params": {"key": "process-running", "value": "true"}}\n' | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
+    local _gc_tid="${GHOSTTY_TAB_ID:-}"
+    local _gc_params="\"key\": \"process-running\", \"value\": \"true\""
+    [[ -n "$_gc_tid" ]] && _gc_params="\"tab_id\": \"$_gc_tid\", $_gc_params"
+    printf '{"method": "tab.set-status", "params": {%s}}\n' "$_gc_params" | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
     local _gc_cmd="${cmd//[[:cntrl:]]/}"
     _gc_cmd="${_gc_cmd//\\/\\\\}"
     _gc_cmd="${_gc_cmd//\"/\\\"}"
-    printf '{"method": "tab.set-status", "params": {"key": "last-command", "value": "%s"}}\n' "$_gc_cmd" | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
+    _gc_params="\"key\": \"last-command\", \"value\": \"$_gc_cmd\""
+    [[ -n "$_gc_tid" ]] && _gc_params="\"tab_id\": \"$_gc_tid\", $_gc_params"
+    printf '{"method": "tab.set-status", "params": {%s}}\n' "$_gc_params" | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
   fi
 }
 

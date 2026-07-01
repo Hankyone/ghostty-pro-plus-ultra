@@ -564,8 +564,18 @@ private struct ProjectHeader: View {
 
             if let onNewTab {
                 Menu {
-                    // New session options
-                    ForEach(SidebarTabManager.SidebarTool.allCases, id: \.self) { tool in
+                    // Terminal — standalone option
+                    Button {
+                        onNewTab(.terminal)
+                    } label: {
+                        Label("Terminal", systemImage: "terminal")
+                            .labelStyle(.titleAndIcon)
+                    }
+
+                    Divider()
+
+                    // Coding agents
+                    ForEach(SidebarTabManager.SidebarTool.allCases.filter { $0 != .terminal }, id: \.self) { tool in
                         Button {
                             onNewTab(tool)
                         } label: {
@@ -653,7 +663,9 @@ private struct SidebarToolMenuIcon: View {
                 Image(tool.icon)
                     .resizable()
                     .interpolation(.high)
+                    .scaledToFit()
                     .frame(width: 14, height: 14)
+                    .fixedSize(horizontal: true, vertical: true)
             } else {
                 Image(systemName: tool.icon)
                     .font(.system(size: 14, weight: .medium))

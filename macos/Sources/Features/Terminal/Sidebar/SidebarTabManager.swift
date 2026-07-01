@@ -1,6 +1,9 @@
 import Cocoa
 import Combine
 import os.log
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 /// Observes the tab group of a window and publishes tab metadata for the sidebar.
 @MainActor
@@ -1367,8 +1370,9 @@ class SidebarTabManager: ObservableObject {
         case terminal = "Terminal"
         case claudeCode = "Claude Code"
         case codex = "Codex"
-        case grok = "Grok"
+        case grok = "Grok Build"
         case devin = "Devin"
+        case cursor = "Cursor"
         case antigravity = "Antigravity"
 
         var icon: String {
@@ -1378,6 +1382,7 @@ class SidebarTabManager: ObservableObject {
             case .codex: return "CodexIcon"
             case .grok: return "GrokIcon"
             case .devin: return "DevinIcon"
+            case .cursor: return "CursorIcon"
             case .antigravity: return "AntigravityIcon"
             }
         }
@@ -1385,7 +1390,7 @@ class SidebarTabManager: ObservableObject {
         var isCustomIcon: Bool {
             switch self {
             case .terminal: return false
-            case .claudeCode, .codex, .grok, .devin, .antigravity: return true
+            case .claudeCode, .codex, .grok, .devin, .cursor, .antigravity: return true
             }
         }
 
@@ -1397,6 +1402,7 @@ class SidebarTabManager: ObservableObject {
             case .codex: return "codex --dangerously-bypass-approvals-and-sandbox"
             case .grok: return "grok --permission-mode bypassPermissions"
             case .devin: return "devin --permission-mode dangerous"
+            case .cursor: return "cursor --yolo"
             case .antigravity: return "agy --dangerously-skip-permissions"
             }
         }
@@ -1409,6 +1415,7 @@ class SidebarTabManager: ObservableObject {
         case codex
         case grok
         case devin
+        case cursor
 
         /// The session key (e.g. "claude-session"). Presence of this key
         /// indicates the tab is running this agent.
@@ -1622,146 +1629,122 @@ class SidebarTabManager: ObservableObject {
         let stderr: String?
     }
 
-    /// Resolve the absolute path to the `claude` CLI by asking the user's login
-    /// shell. Cached after first resolution so we only shell out once.
-    nonisolated private static let resolvedClaudePath: String? = {
-        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: shell)
-        process.arguments = ["-l", "-c", "which claude"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        guard (try? process.run()) != nil else { return nil }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }()
-
-    /// Generate a commit message by calling `claude -p` with the staged diff.
-    /// Fast Haiku model with no project context to keep it quick.
+    /// Generate a commit message using the on-device Foundation Models framework
+    /// (Apple Intelligence). Uses guided generation (@Generable) to guarantee a
+    /// structurally valid response — no JSON parsing or shell-out needed.
+    ///
+    /// Requires macOS 26+ with Apple Intelligence enabled. On older OSes or
+    /// when the model is unavailable, returns an error so the caller can surface
+    /// it in the sidebar.
     nonisolated private static func generateCommitMessage(at projectRoot: String) -> CommitMessageResult {
-        // Get staged diff (truncated to keep request small)
+        // Get staged diff (truncated to fit the on-device model's 4096-token
+        // context window — ~4000 chars is a safe upper bound).
         let diffResult = runGitOutput(["diff", "--cached"], at: projectRoot)
         guard diffResult.status == 0, !diffResult.output.isEmpty else {
             return CommitMessageResult(message: nil, stderr: nil)
         }
-        let diff = String(diffResult.output.prefix(8000))
+        let diff = String(diffResult.output.prefix(4000))
 
         // Get changed file names for context
         let filesResult = runGitOutput(["diff", "--cached", "--name-only"], at: projectRoot)
         let files = filesResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let prompt = """
-        Return ONLY a JSON object {"message":"..."} with a good git commit message. \
-        Use lowercase, imperative mood. If you can identify the subsystem from \
-        file paths, prefix the subject with it (e.g. 'macos: fix tab rendering'). \
-        Include a body after a blank line if the changes warrant explanation. \
-        Files changed: \(files)\n\nDiff:\n\(diff)
-        """
-
-        guard let claudePath = resolvedClaudePath else {
-            return CommitMessageResult(message: nil, stderr: "claude CLI not found in PATH")
-        }
-
-        // Run claude -p from /tmp to avoid loading project context
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: claudePath)
-        process.arguments = [
-            "-p",
-            "--no-session-persistence",
-            "--output-format", "json",
-            "--model", "claude-haiku-4-5",
-            "--dangerously-skip-permissions",
-            prompt,
-        ]
-        process.currentDirectoryURL = URL(fileURLWithPath: "/tmp")
-
-        // Don't let this process touch the sidebar.
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: "GHOSTTY_TAB_ID")
-        env.removeValue(forKey: "GHOSTTY_SOCKET")
-        process.environment = env
-
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = errPipe
-
-        guard (try? process.run()) != nil else {
-            return CommitMessageResult(message: nil, stderr: "Failed to launch claude")
-        }
-
-        // 30-second timeout for LLM call
-        let done = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in done.signal() }
-        if done.wait(timeout: .now() + .seconds(30)) == .timedOut {
-            process.terminate()
-            return CommitMessageResult(message: nil, stderr: "claude timed out (30s)")
-        }
-
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        let errStr = String(data: errData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let stderrMsg = (errStr?.isEmpty == false) ? errStr : nil
-
-        guard process.terminationStatus == 0 else {
+        guard #available(macOS 26.0, *) else {
             return CommitMessageResult(
                 message: nil,
-                stderr: stderrMsg ?? "claude exited with status \(process.terminationStatus)"
+                stderr: "On-device AI requires macOS 26 or later"
             )
         }
 
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        guard let responseStr = String(data: data, encoding: .utf8),
-              !responseStr.isEmpty else {
-            return CommitMessageResult(message: nil, stderr: stderrMsg ?? "Empty response from claude")
-        }
+        return Self.generateCommitMessageWithFoundationModels(
+            files: files, diff: diff
+        )
+    }
 
-        // Parse JSON response: first try { result: { message: "..." } } then { message: "..." }
-        guard let responseData = responseStr.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
-            return CommitMessageResult(message: nil, stderr: "Failed to parse claude JSON response")
-        }
-
-        var message: String?
-
-        // Try nested: { result: "{ \"message\": ... }" } (claude -p --output-format json wraps in result)
-        if let inner = json["result"] as? String {
-            if let innerData = inner.data(using: .utf8),
-               let innerJson = try? JSONSerialization.jsonObject(with: innerData) as? [String: Any] {
-                message = innerJson["message"] as? String
+    /// macOS 26+ implementation using the FoundationModels framework.
+    /// Separated so the caller can gate on availability without polluting the
+    /// main code path with `@available` annotations on every line.
+    @available(macOS 26.0, *)
+    nonisolated private static func generateCommitMessageWithFoundationModels(
+        files: String, diff: String
+    ) -> CommitMessageResult {
+        let model = SystemLanguageModel.default
+        guard model.availability == .available else {
+            let reason: String
+            switch model.availability {
+            case .unavailable(.deviceNotEligible):
+                reason = "device not eligible for Apple Intelligence"
+            case .unavailable(.appleIntelligenceNotEnabled):
+                reason = "Apple Intelligence is not enabled in System Settings"
+            case .unavailable(.modelNotReady):
+                reason = "on-device model is not ready (still downloading)"
+            case .unavailable(let other):
+                reason = "on-device model unavailable: \(other)"
+            default:
+                reason = "unknown"
             }
-            // Try stripping markdown code fences
-            if message == nil {
-                let stripped = inner
-                    .replacingOccurrences(of: "```json", with: "")
-                    .replacingOccurrences(of: "```", with: "")
+            return CommitMessageResult(message: nil, stderr: reason)
+        }
+
+        let session = LanguageModelSession(instructions: """
+            You write concise git commit messages. \
+            Use lowercase, imperative mood. If you can identify the subsystem \
+            from file paths, prefix the subject with it (e.g. 'macos: fix tab rendering'). \
+            Include a body after a blank line only if the changes warrant explanation. \
+            Keep the subject under 72 characters.
+            """)
+
+        let prompt = """
+        Write a git commit message for these changes.
+
+        Files changed: \(files)
+
+        Diff:
+        \(diff)
+        """
+
+        // Bridge async → sync with a 30-second timeout, matching the
+        // previous claude CLI implementation's timeout behavior.
+        let done = DispatchSemaphore(value: 0)
+        var result: CommitMessageResult!
+
+        Task {
+            defer { done.signal() }
+            do {
+                let response = try await session.respond(
+                    to: prompt, generating: CommitMessageOutput.self
+                )
+                let msg = response.content.message
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if let d = stripped.data(using: .utf8),
-                   let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
-                    message = j["message"] as? String
-                }
+                result = CommitMessageResult(
+                    message: msg.isEmpty ? nil : msg, stderr: nil
+                )
+            } catch {
+                result = CommitMessageResult(
+                    message: nil,
+                    stderr: "Foundation Models error: \(error.localizedDescription)"
+                )
             }
         }
 
-        // Direct top-level
-        if message == nil {
-            message = json["message"] as? String
+        if done.wait(timeout: .now() + .seconds(30)) == .timedOut {
+            return CommitMessageResult(
+                message: nil, stderr: "on-device model timed out (30s)"
+            )
         }
+        return result
+    }
 
-        guard var msg = message, !msg.isEmpty else {
-            return CommitMessageResult(message: nil, stderr: "No message field in claude response")
-        }
-
-        // Sanitize: strip outer quotes
-        if msg.hasPrefix("\"") { msg = String(msg.dropFirst()) }
-        if msg.hasSuffix("\"") { msg = String(msg.dropLast()) }
-        msg = msg.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return CommitMessageResult(message: msg.isEmpty ? nil : msg, stderr: nil)
+    /// Structured output type for guided generation of commit messages.
+    /// The @Generable macro uses constrained decoding to guarantee the model
+    /// produces a valid instance — no manual JSON parsing needed.
+    /// Fileprivate because the @Generable macro expands to code that needs
+    /// to reference this type from the macro expansion site.
+    @available(macOS 26.0, *)
+    @Generable(description: "A git commit message")
+    fileprivate struct CommitMessageOutput {
+        @Guide(description: "The full commit message including optional body")
+        var message: String
     }
 
     /// Run a git command and return success/failure.

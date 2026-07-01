@@ -146,8 +146,13 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
 
         # Process-running indicator: notify the Ghostty sidebar that the
         # command has finished. Uses the IPC socket (GHOSTTY_SOCKET).
+        # Include GHOSTTY_TAB_ID so the clear always targets the correct surface.
         if test -n "$GHOSTTY_SOCKET"; and test -S "$GHOSTTY_SOCKET"
-            printf '{"method": "tab.clear-status", "params": {"key": "process-running"}}\n' | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
+            set -l _gc_params '"key": "process-running"'
+            if test -n "$GHOSTTY_TAB_ID"
+                set _gc_params '"tab_id": "'"$GHOSTTY_TAB_ID"'", '$_gc_params
+            end
+            printf '{"method": "tab.clear-status", "params": {%s}}\n' $_gc_params | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
         end
     end
 
@@ -158,12 +163,22 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
         # Process-running indicator and last-command tracking: notify the
         # Ghostty sidebar that a command is executing and store the command
         # text so it can be displayed in the sidebar after restart.
+        # Include GHOSTTY_TAB_ID so IPC calls always target the correct surface.
         if test -n "$GHOSTTY_SOCKET"; and test -S "$GHOSTTY_SOCKET"
-            printf '{"method": "tab.set-status", "params": {"key": "process-running", "value": "true"}}\n' | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
+            set -l _gc_tid "$GHOSTTY_TAB_ID"
+            set -l _gc_params '"key": "process-running", "value": "true"'
+            if test -n "$_gc_tid"
+                set _gc_params '"tab_id": "'$_gc_tid'", '$_gc_params
+            end
+            printf '{"method": "tab.set-status", "params": {%s}}\n' $_gc_params | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
             set -l _gc_cmd (string replace --all --regex '[[:cntrl:]]' '' -- $argv)
             set -l _gc_cmd (string replace --all -- '\\' '\\\\' -- $_gc_cmd)
             set -l _gc_cmd (string replace --all -- '"' '\\"' -- $_gc_cmd)
-            printf '{"method": "tab.set-status", "params": {"key": "last-command", "value": "%s"}}\n' $_gc_cmd | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
+            set _gc_params '"key": "last-command", "value": "'$_gc_cmd'"'
+            if test -n "$_gc_tid"
+                set _gc_params '"tab_id": "'$_gc_tid'", '$_gc_params
+            end
+            printf '{"method": "tab.set-status", "params": {%s}}\n' $_gc_params | nc -U "$GHOSTTY_SOCKET" >/dev/null 2>&1 &
         end
     end
 

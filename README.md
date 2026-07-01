@@ -20,7 +20,7 @@ A T3 Code-inspired sidebar that replaces the native tab bar. Terminals are autom
 
 ### AI Agent Integration
 
-Built-in support for Claude Code, Codex, Grok, Devin, and Antigravity. The sidebar shows live status for each agent session — pulsing blue while working, orange when waiting for input, green when done. Each project header has a button to launch a new session or resume a recent one directly from the sidebar. Antigravity has no hook system, so it gets launch support and the built-in process-running indicator but no live status tracking or session resume.
+Built-in support for Claude Code, Codex, Grok, Devin, Cursor, and Antigravity. The sidebar shows live status for each agent session — pulsing blue while working, orange when waiting for input, green when done. Each project header has a button to launch a new session or resume a recent one directly from the sidebar. Antigravity has no hook system, so it gets launch support and the built-in process-running indicator but no live status tracking or session resume.
 
 ### Tab Restore
 
@@ -113,6 +113,31 @@ print('Hooks installed.')
 > ```json
 > { "read_config_from": { "claude": false } }
 > ```
+
+**Cursor:**
+
+```bash
+# Register hooks in Cursor user config
+# Cursor reads ~/.cursor/hooks.json
+python3 -c "
+import json, os
+p = os.path.expanduser('~/.cursor/hooks.json')
+s = json.load(open(p)) if os.path.exists(p) else {}
+cmd = 'bash $(pwd)/cli/ghostty-cursor-hook.sh'
+hooks = s.setdefault('hooks', {})
+for e in ['sessionStart','beforeSubmitPrompt','preToolUse','postToolUse','stop','sessionEnd']:
+    hooks[e] = [{'command': cmd}]
+s['version'] = 1
+json.dump(s, open(p, 'w'), indent=2)
+print('Hooks installed.')
+"
+```
+
+> **Note:** Cursor supports Claude Code-compatible hooks natively. If you also
+> have Claude hooks in `~/.claude/settings.json`, Cursor will map them
+> automatically (e.g. `Stop` → `stop`, `SessionStart` → `sessionStart`). To
+> avoid double-firing, either use only the Cursor-native config above or
+> disable Claude config import.
 
 **Antigravity:**
 

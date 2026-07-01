@@ -31,6 +31,7 @@ final class TabMetadataStore: ObservableObject {
         "codex-pid", "codex-active", "codex-done-at",
         "grok-pid", "grok-active", "grok-done-at",
         "devin-pid", "devin-active", "devin-done-at",
+        "cursor-pid", "cursor-active", "cursor-done-at",
         "process-running",
     ]
 
@@ -44,6 +45,7 @@ final class TabMetadataStore: ObservableObject {
     /// A tab can only run one agent at a time.
     private static let allSessionKeys: Set<String> = [
         "claude-session", "codex-session", "grok-session", "devin-session",
+        "cursor-session",
     ]
 
     func setStatus(tabId: UUID, key: String, value: String, icon: String? = nil) {
@@ -87,7 +89,7 @@ final class TabMetadataStore: ObservableObject {
     /// Called periodically from SidebarTabManager.
     func sweepStaleSessions() {
         // Agent name prefixes whose transient keys should be swept
-        let agentPrefixes = ["claude", "codex", "grok", "devin"]
+        let agentPrefixes = ["claude", "codex", "grok", "devin", "cursor"]
         for (tabId, tabEntries) in entries {
             for prefix in agentPrefixes {
                 let pidKey = "\(prefix)-pid"
@@ -151,6 +153,9 @@ final class TabMetadataStore: ObservableObject {
         for (uuidStr, tabEntries) in persisted.entries {
             guard let uuid = UUID(uuidString: uuidStr) else { continue }
             entries[uuid] = tabEntries
+            // Safety net: process-running is transient and should never
+            // persist across restarts. Clear it if it somehow survived.
+            entries[uuid]?.removeValue(forKey: "process-running")
         }
     }
 

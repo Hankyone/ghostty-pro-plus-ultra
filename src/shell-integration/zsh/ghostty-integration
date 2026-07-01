@@ -269,17 +269,29 @@ _ghostty_deferred_init() {
     # Process-running indicator and last-command tracking: notify the
     # Ghostty sidebar when a command is executing and store the command
     # text so it can be displayed in the sidebar after restart.
+    # Include GHOSTTY_TAB_ID so IPC calls always target the correct surface,
+    # even if the terminal isn't the key window.
     if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
         functions[_ghostty_preexec]+="
             [[ -n \$GHOSTTY_SOCKET && -S \$GHOSTTY_SOCKET ]] && {
                 local _gc_cmd=\${1//[[:cntrl:]]}
                 _gc_cmd=\${_gc_cmd//\\\\/\\\\\\\\}
                 _gc_cmd=\${_gc_cmd//\\\"/\\\\\\\"}
-                printf '{\"method\": \"tab.set-status\", \"params\": {\"key\": \"process-running\", \"value\": \"true\"}}\\n' | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!
-                printf '{\"method\": \"tab.set-status\", \"params\": {\"key\": \"last-command\", \"value\": \"%s\"}}\\n' \"\$_gc_cmd\" | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!
+                local _gc_tid=\${GHOSTTY_TAB_ID:-}
+                local _gc_params=\"\\\"key\\\": \\\"process-running\\\", \\\"value\\\": \\\"true\\\"\"
+                [[ -n \$_gc_tid ]] && _gc_params=\"\\\"tab_id\\\": \\\"\$_gc_tid\\\", \$_gc_params\"
+                printf '{\"method\": \"tab.set-status\", \"params\": {%s}}\\n' \"\$_gc_params\" | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!
+                _gc_params=\"\\\"key\\\": \\\"last-command\\\", \\\"value\\\": \\\"\$_gc_cmd\\\"\"
+                [[ -n \$_gc_tid ]] && _gc_params=\"\\\"tab_id\\\": \\\"\$_gc_tid\\\", \$_gc_params\"
+                printf '{\"method\": \"tab.set-status\", \"params\": {%s}}\\n' \"\$_gc_params\" | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!
             }"
         functions[_ghostty_precmd]+="
-            [[ -n \$GHOSTTY_SOCKET && -S \$GHOSTTY_SOCKET ]] && printf '{\"method\": \"tab.clear-status\", \"params\": {\"key\": \"process-running\"}}\\n' | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!"
+            [[ -n \$GHOSTTY_SOCKET && -S \$GHOSTTY_SOCKET ]] && {
+                local _gc_tid=\${GHOSTTY_TAB_ID:-}
+                local _gc_params=\"\\\"key\\\": \\\"process-running\\\"\"
+                [[ -n \$_gc_tid ]] && _gc_params=\"\\\"tab_id\\\": \\\"\$_gc_tid\\\", \$_gc_params\"
+                printf '{\"method\": \"tab.clear-status\", \"params\": {%s}}\\n' \"\$_gc_params\" | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!
+            }"
     fi
 
     # Emit semantic prompt markers at line-init if PS1 doesn't contain our
