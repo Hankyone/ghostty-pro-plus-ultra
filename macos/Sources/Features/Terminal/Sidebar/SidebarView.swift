@@ -169,6 +169,7 @@ struct SidebarView: View {
         }
         .coordinateSpace(name: Self.scrollCoordinateSpace)
         .clipped()
+        .windowDragIfAvailable()
         .task(id: isDragActive) {
             // Watchdog for drag state. The normal end-of-drag signal is the
             // system releasing the drag's NSItemProvider, but the pasteboard

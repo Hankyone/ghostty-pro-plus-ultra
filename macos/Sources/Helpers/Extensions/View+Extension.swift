@@ -29,3 +29,23 @@ extension View {
         }
     }
 }
+
+extension View {
+    /// Adds a `WindowDragGesture` to the view on macOS 15+.
+    /// This lets users drag the window by clicking and dragging on
+    /// blank areas of the view. Child gestures (onTapGesture, onDrag,
+    /// Button actions) take priority, so interactive elements still
+    /// work normally. ScrollView's native scroll handling (NSScrollView)
+    /// is also unaffected since `WindowDragGesture` is a system gesture
+    /// that coexists with AppKit's event handling.
+    @ViewBuilder
+    func windowDragIfAvailable() -> some View {
+        if #available(macOS 15.0, *) {
+            self
+                .gesture(WindowDragGesture())
+                .allowsWindowActivationEvents(true)
+        } else {
+            self
+        }
+    }
+}
