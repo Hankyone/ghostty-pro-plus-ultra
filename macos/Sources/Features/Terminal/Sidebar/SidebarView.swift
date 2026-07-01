@@ -287,7 +287,7 @@ private struct ProjectSection: View {
             // and the system may resolve that ambiguity to the outer (group)
             // drag — making it impossible to drag individual tabs.
             .contentShape(.dragPreview, RoundedRectangle(cornerRadius: 6))
-            .if(!group.isOtherGroup) { view in
+            .if(!group.isOtherGroup && !group.isHomeGroup) { view in
                 view.onDrag {
                     draggingGroupID = group.id
                     return makeDragProvider(payload: group.id)
@@ -523,6 +523,10 @@ private struct ProjectHeader: View {
                     .interpolation(.high)
                     .antialiased(true)
                     .frame(width: 16, height: 16)
+            } else if group.isHomeGroup {
+                Image(systemName: "house.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(theme.secondaryText)
             } else if !group.isOtherGroup {
                 Image(systemName: "folder.fill")
                     .font(.system(size: 11))
@@ -687,11 +691,12 @@ private struct ProjectGroupDropDelegate: DropDelegate {
     @Binding var tabDropTarget: TabDropTarget?
     @Binding var groupDropTarget: GroupDropTarget?
 
-    /// The "Other" group is always pinned last, so it can neither be moved
-    /// nor serve as a reorder target.
+    /// The "Home" and "Other" groups are always pinned last, so they can
+    /// neither be moved nor serve as a reorder target.
     private var isValidGroupDrag: Bool {
         guard let draggingGroupID else { return false }
-        return draggingGroupID != currentGroup.id && !currentGroup.isOtherGroup
+        return draggingGroupID != currentGroup.id
+            && !currentGroup.isOtherGroup && !currentGroup.isHomeGroup
     }
 
     /// Whether the move would land the dragged group below the target.

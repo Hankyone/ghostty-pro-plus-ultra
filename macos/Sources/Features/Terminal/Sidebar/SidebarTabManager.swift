@@ -72,7 +72,7 @@ class SidebarTabManager: ObservableObject {
 
     /// A group of tabs sharing the same project root.
     struct ProjectGroup: Identifiable, Equatable {
-        let id: String  // projectRoot path, or "__other__" for ungrouped
+        let id: String  // projectRoot path, "__home__", or "__other__" for ungrouped
         let name: String
         let projectRoot: String?
         let tabs: [TabItem]
@@ -82,6 +82,9 @@ class SidebarTabManager: ObservableObject {
 
         /// Whether this is the "Other" group for ungrouped tabs.
         var isOtherGroup: Bool { id == "__other__" }
+
+        /// Whether this is the Home group for tabs in the home directory.
+        var isHomeGroup: Bool { id == "__home__" }
 
         static func == (lhs: ProjectGroup, rhs: ProjectGroup) -> Bool {
             lhs.id == rhs.id && lhs.name == rhs.name
@@ -385,10 +388,15 @@ class SidebarTabManager: ObservableObject {
     }
 
     /// Walk up from `pwd` looking for a directory containing a project root marker.
+    /// The home directory is never treated as a project root — stray markers
+    /// like a dotfiles `package.json` shouldn't group all home-dir tabs together.
     nonisolated private static func findProjectRoot(at pwd: String) -> String? {
         let fm = FileManager.default
+        let home = NSHomeDirectory()
         var dir = pwd
         while dir != "/" && dir.hasPrefix("/Users") {
+            // Stop before reaching the home directory — it's not a project.
+            if dir == home { return nil }
             for marker in projectRootMarkers {
                 let markerPath = (dir as NSString).appendingPathComponent(marker)
                 if fm.fileExists(atPath: markerPath) {
@@ -563,9 +571,11 @@ class SidebarTabManager: ObservableObject {
 
     /// Build project groups from the current tab list.
     private func buildProjectGroups(from tabs: [TabItem]) -> [ProjectGroup] {
+        let home = NSHomeDirectory()
         // Group tabs by project root, preserving tab order
         var projectTabs: [String: [TabItem]] = [:]
         var projectOrder: [String] = []  // stable insertion order
+        var homeTabs: [TabItem] = []
         var otherTabs: [TabItem] = []
 
         for tab in tabs {
@@ -574,6 +584,8 @@ class SidebarTabManager: ObservableObject {
                     projectOrder.append(root)
                 }
                 projectTabs[root, default: []].append(tab)
+            } else if tab.pwd == home {
+                homeTabs.append(tab)
             } else {
                 otherTabs.append(tab)
             }
@@ -584,27 +596,7 @@ class SidebarTabManager: ObservableObject {
         // Build groups in stable insertion order (avoids Dictionary random iteration)
         for root in projectOrder {
             guard var rootTabs = projectTabs[root] else { continue }
-
-            // Sort tabs within the group based on the selected sort mode.
-            switch projectSortMode {
-            case .createdAt:
-                // Stable creation order — oldest tab first (top)
-                rootTabs.sort { a, b in
-                    let aTime = tabCreationTime[a.id] ?? .distantPast
-                    let bTime = tabCreationTime[b.id] ?? .distantPast
-                    return aTime < bTime
-                }
-            case .lastActivity:
-                // Most recently active tab on top
-                rootTabs.sort { a, b in
-                    let aTime = lastActivityTime[a.id] ?? .distantPast
-                    let bTime = lastActivityTime[b.id] ?? .distantPast
-                    return aTime > bTime
-                }
-            case .manual:
-                // Preserve tab strip order — no sorting
-                break
-            }
+            sortTabs(&rootTabs)
 
             let name = (root as NSString).lastPathComponent
             let favicon = rootTabs.first?.faviconImage
@@ -657,25 +649,23 @@ class SidebarTabManager: ObservableObject {
             }
         }
 
+        // Add "Home" group before "Other" for tabs whose pwd is the home
+        // directory but have no project root marker.
+        if !homeTabs.isEmpty {
+            sortTabs(&homeTabs)
+            groups.append(ProjectGroup(
+                id: "__home__",
+                name: "Home",
+                projectRoot: nil,
+                tabs: homeTabs,
+                faviconImage: nil,
+                gitDiffStats: nil
+            ))
+        }
+
         // Add "Other" group at the end always
         if !otherTabs.isEmpty {
-            // Sort tabs in "Other" group using the same mode as project groups
-            switch projectSortMode {
-            case .createdAt:
-                otherTabs.sort { a, b in
-                    let aTime = tabCreationTime[a.id] ?? .distantPast
-                    let bTime = tabCreationTime[b.id] ?? .distantPast
-                    return aTime < bTime
-                }
-            case .lastActivity:
-                otherTabs.sort { a, b in
-                    let aTime = lastActivityTime[a.id] ?? .distantPast
-                    let bTime = lastActivityTime[b.id] ?? .distantPast
-                    return aTime > bTime
-                }
-            case .manual:
-                break
-            }
+            sortTabs(&otherTabs)
             groups.append(ProjectGroup(
                 id: "__other__",
                 name: "Other",
@@ -687,6 +677,26 @@ class SidebarTabManager: ObservableObject {
         }
 
         return groups
+    }
+
+    /// Sort tabs in-place using the current `projectSortMode`.
+    private func sortTabs(_ tabs: inout [TabItem]) {
+        switch projectSortMode {
+        case .createdAt:
+            tabs.sort { a, b in
+                let aTime = tabCreationTime[a.id] ?? .distantPast
+                let bTime = tabCreationTime[b.id] ?? .distantPast
+                return aTime < bTime
+            }
+        case .lastActivity:
+            tabs.sort { a, b in
+                let aTime = lastActivityTime[a.id] ?? .distantPast
+                let bTime = lastActivityTime[b.id] ?? .distantPast
+                return aTime > bTime
+            }
+        case .manual:
+            break
+        }
     }
 
     // MARK: - Favicon Detection

@@ -5,7 +5,7 @@
 <h1 align="center">Ghostty Pro Plus Ultra</h1>
 
 <p align="center">
-A personal Ghostty fork with a project-grouped sidebar, AI agent integration, and quality-of-life improvements for macOS.
+A personal Ghostty fork with a project-grouped sidebar, AI agent integration, on-device AI commit messages, and quality-of-life improvements for macOS.
 </p>
 
 <p align="center">
@@ -21,6 +21,10 @@ A T3 Code-inspired sidebar that replaces the native tab bar. Terminals are autom
 ### AI Agent Integration
 
 Built-in support for Claude Code, Codex, Grok, Devin, Cursor, and Antigravity. The sidebar shows live status for each agent session — pulsing blue while working, orange when waiting for input, green when done. Each project header has a button to launch a new session or resume a recent one directly from the sidebar. Antigravity has no hook system, so it gets launch support and the built-in process-running indicator but no live status tracking or session resume.
+
+### Git Integration
+
+Each project header shows live git diff stats (`+N -N`) that update as you edit files, powered by FSEvents file watching with a 2-second debounce. The project menu includes Commit, Push, and Commit & Push actions — commit messages are generated on-device using the Foundation Models framework (Apple Intelligence), so there's no paid API or cloud dependency. Requires macOS 26+ with Apple Intelligence enabled.
 
 ### Tab Restore
 
