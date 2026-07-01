@@ -1412,7 +1412,7 @@ class SidebarTabManager: ObservableObject {
             case .codex: return "codex --dangerously-bypass-approvals-and-sandbox"
             case .grok: return "grok --permission-mode bypassPermissions"
             case .devin: return "devin --permission-mode dangerous"
-            case .cursor: return "cursor --yolo"
+            case .cursor: return "cursor-agent --yolo"
             case .antigravity: return "agy --dangerously-skip-permissions"
             }
         }

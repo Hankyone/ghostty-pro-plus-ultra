@@ -262,10 +262,10 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             command = "devin -r --permission-mode dangerous"
         case .cursor:
             // Cursor uses conversation_id as the session identifier.
-            // `cursor --resume <id>` resumes a specific conversation.
+            // `cursor-agent --resume <id>` resumes a specific conversation.
             let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
             guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
-            command = "cursor --resume \(sessionId) --yolo"
+            command = "cursor-agent --resume \(sessionId) --yolo"
         case .none:
             return
         }
