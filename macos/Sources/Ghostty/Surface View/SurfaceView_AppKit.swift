@@ -382,6 +382,13 @@ extension Ghostty {
             }
             self.surfaceModel = Ghostty.Surface(cSurface: surface)
 
+            // Seed pwd with the configured working directory so the sidebar
+            // can group the tab immediately, before the shell sends OSC 7.
+            // The pty's OSC 7 will overwrite this once the shell starts.
+            if let wd = surface_cfg.workingDirectory, !wd.isEmpty {
+                self.pwd = wd
+            }
+
             // Setup our tracking area so we get mouse moved events
             updateTrackingAreas()
 
