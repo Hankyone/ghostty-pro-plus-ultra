@@ -103,6 +103,7 @@ ephemera
 -eric-assetpass Try talking, not botting
 eriksremess
 erral
+eunos-1128
 exlee
 -f1813483-netizen
 faukah
@@ -272,6 +273,7 @@ unphased
 uzaaft
 vancluever
 vaughanandrews
+-vectorpeak Stupid bot cosplaying as a maintainer
 viruslobster
 vlsi
 voidnv
