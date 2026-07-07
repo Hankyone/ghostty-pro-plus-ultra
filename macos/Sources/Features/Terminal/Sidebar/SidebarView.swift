@@ -1077,20 +1077,64 @@ private struct DoubleClickOverlay: NSViewRepresentable {
 // MARK: - PulsingDot
 
 /// Animated pulsing dot indicator.
+///
+/// The pulse is driven by a Core Animation layer animation rather than a
+/// SwiftUI `.repeatForever` opacity animation. A repeating SwiftUI animation
+/// forces `NSHostingView.layout()` to re-render the *entire* sidebar display
+/// list on every display cycle — walking every tab row just to update one dot's
+/// opacity. That is an O(rows) per-frame cost on the main thread that scales
+/// with tab count and pegs the CPU whenever any tab shows a live dot. A CALayer
+/// `opacity` animation runs entirely on the render server / GPU and never
+/// re-enters SwiftUI or AppKit layout, so the cost is independent of tab count.
 struct PulsingDot: View {
     let color: Color
     var size: CGFloat = 8
-    @State private var isPulsing = false
 
     var body: some View {
-        Circle()
-            .fill(color)
+        PulsingDotLayer(color: color)
             .frame(width: size, height: size)
-            .opacity(isPulsing ? 0.3 : 1.0)
-            .animation(
-                .easeInOut(duration: 0.8).repeatForever(autoreverses: true),
-                value: isPulsing
-            )
-            .onAppear { isPulsing = true }
+    }
+}
+
+/// Hosts a layer-backed `NSView` whose backing layer pulses its opacity via
+/// Core Animation. See `PulsingDot` for why this is not a SwiftUI animation.
+private struct PulsingDotLayer: NSViewRepresentable {
+    let color: Color
+
+    func makeNSView(context: Context) -> PulsingDotNSView {
+        PulsingDotNSView(color: NSColor(color))
+    }
+
+    func updateNSView(_ nsView: PulsingDotNSView, context: Context) {
+        nsView.updateColor(NSColor(color))
+    }
+
+    final class PulsingDotNSView: NSView {
+        init(color: NSColor) {
+            super.init(frame: .zero)
+            wantsLayer = true
+            layer?.backgroundColor = color.cgColor
+
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1.0
+            pulse.toValue = 0.3
+            pulse.duration = 0.8
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer?.add(pulse, forKey: "pulse")
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func layout() {
+            super.layout()
+            // Keep the dot circular for whatever size SwiftUI assigns.
+            layer?.cornerRadius = min(bounds.width, bounds.height) / 2
+        }
+
+        func updateColor(_ color: NSColor) {
+            layer?.backgroundColor = color.cgColor
+        }
     }
 }
