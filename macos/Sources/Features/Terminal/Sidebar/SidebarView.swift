@@ -70,6 +70,21 @@ private struct GroupDropTarget: Equatable {
     let below: Bool
 }
 
+/// Drag state shared by every sidebar instance.
+///
+/// Each tab window hosts its own sidebar. Selecting a tab on mouse-down can
+/// switch the visible window at the very start of a drag, so the sidebar
+/// that *started* the drag (in the now-hidden window) and the sidebar that
+/// shows drop indicators (in the newly visible window) are different view
+/// trees. Keeping the drag state in one shared object keeps them in sync.
+private final class SidebarDragState: ObservableObject {
+    static let shared = SidebarDragState()
+    @Published var draggingTabID: ObjectIdentifier?
+    @Published var draggingGroupID: String?
+    @Published var tabDropTarget: TabDropTarget?
+    @Published var groupDropTarget: GroupDropTarget?
+}
+
 /// An NSItemProvider that fires a callback when the drag session ends.
 /// SwiftUI has no drag-cancelled callback, so without this the
 /// "dragging" state (dimmed rows, insertion lines) sticks around forever
@@ -105,17 +120,14 @@ struct SidebarView: View {
     var theme: SidebarTheme
     var fields: Set<SidebarField> = SidebarField.defaultFields
 
-    @State private var draggingTabID: ObjectIdentifier?
-    @State private var draggingGroupID: String?
-    @State private var tabDropTarget: TabDropTarget?
-    @State private var groupDropTarget: GroupDropTarget?
+    @ObservedObject private var dragState = SidebarDragState.shared
     @State private var hoveredTabID: ObjectIdentifier?
     @State private var hoveredGroupID: String?
     @State private var tabCardFrames: [ObjectIdentifier: CGRect] = [:]
     fileprivate static let scrollCoordinateSpace = "SidebarScrollCoordinateSpace"
 
     private var isDragActive: Bool {
-        draggingTabID != nil || draggingGroupID != nil
+        dragState.draggingTabID != nil || dragState.draggingGroupID != nil
     }
 
     var body: some View {
@@ -134,33 +146,33 @@ struct SidebarView: View {
                         tabManager: tabManager,
                         theme: theme,
                         fields: fields,
-                        draggingTabID: $draggingTabID,
-                        draggingGroupID: $draggingGroupID,
-                        tabDropTarget: $tabDropTarget,
-                        groupDropTarget: $groupDropTarget,
+                        draggingTabID: $dragState.draggingTabID,
+                        draggingGroupID: $dragState.draggingGroupID,
+                        tabDropTarget: $dragState.tabDropTarget,
+                        groupDropTarget: $dragState.groupDropTarget,
                         hoveredTabID: $hoveredTabID,
                         hoveredGroupID: $hoveredGroupID,
                         tabCardFrames: $tabCardFrames,
                         isCollapsed: tabManager.collapsedProjects.contains(group.id)
                     )
-                    .opacity(draggingGroupID == group.id ? 0.4 : 1.0)
+                    .opacity(dragState.draggingGroupID == group.id ? 0.4 : 1.0)
                     .overlay(alignment: .top) {
-                        if groupDropTarget == GroupDropTarget(id: group.id, below: false) {
+                        if dragState.groupDropTarget == GroupDropTarget(id: group.id, below: false) {
                             DropIndicator().offset(y: -1)
                         }
                     }
                     .overlay(alignment: .bottom) {
-                        if groupDropTarget == GroupDropTarget(id: group.id, below: true) {
+                        if dragState.groupDropTarget == GroupDropTarget(id: group.id, below: true) {
                             DropIndicator().offset(y: 1)
                         }
                     }
                     .onDrop(of: [UTType.text], delegate: ProjectGroupDropDelegate(
                         tabManager: tabManager,
                         currentGroup: group,
-                        draggingTabID: $draggingTabID,
-                        draggingGroupID: $draggingGroupID,
-                        tabDropTarget: $tabDropTarget,
-                        groupDropTarget: $groupDropTarget
+                        draggingTabID: $dragState.draggingTabID,
+                        draggingGroupID: $dragState.draggingGroupID,
+                        tabDropTarget: $dragState.tabDropTarget,
+                        groupDropTarget: $dragState.groupDropTarget
                     ))
                 }
             }
@@ -182,10 +194,10 @@ struct SidebarView: View {
                 if NSEvent.pressedMouseButtons == 0 {
                     // Give a pending performDrop a moment to run first.
                     try? await Task.sleep(nanoseconds: 300_000_000)
-                    draggingTabID = nil
-                    draggingGroupID = nil
-                    tabDropTarget = nil
-                    groupDropTarget = nil
+                    dragState.draggingTabID = nil
+                    dragState.draggingGroupID = nil
+                    dragState.tabDropTarget = nil
+                    dragState.groupDropTarget = nil
                     return
                 }
             }
@@ -203,12 +215,21 @@ struct SidebarView: View {
                 .padding(.vertical, 8)
             }
         }
-        .overlay(DoubleClickOverlay(
+        .overlay(SidebarClickOverlay(
             tabCardFrames: tabCardFrames,
             onBlankSpaceDoubleClick: { tabManager.createNewTab(projectRoot: NSHomeDirectory()) },
             onTabDoubleClick: { tabID in
                 if let tab = tabManager.tabs.first(where: { $0.id == tabID }) {
                     tabManager.promptRenameTab(tab)
+                }
+            },
+            onTabMouseDown: { tabID in
+                // Select on mouse-DOWN for a native, snappy feel. The row's
+                // tap gesture still fires on mouse-up as a no-op fallback
+                // (and covers clicks that activate a non-key window).
+                if let tab = tabManager.tabs.first(where: { $0.id == tabID }),
+                   tab.id != tabManager.selectedTabID {
+                    tabManager.selectTab(tab)
                 }
             }
         ))
@@ -327,13 +348,6 @@ private struct ProjectSection: View {
     private func threadRow(for tab: SidebarTabManager.TabItem) -> some View {
         let isSelected = tab.id == tabManager.selectedTabID
         let isHovered = hoveredTabID == tab.id
-
-        // Determine the current agent from the mutually-exclusive session key,
-        // then scope all agent-specific lookups to avoid stale cross-agent state.
-        let agent = SidebarTabManager.AgentType.detect(from: tab.statusEntries)
-        let activeEntry = agent.flatMap { a in
-            tab.statusEntries.first(where: { $0.key == a.activeKey })
-        }
         let titleColor = isSelected || isHovered ? theme.foreground : theme.secondaryText
         // Tab color tint — subtle background wash instead of a left bar
         let tabTint: Color? = tab.tabColor.displayColor.map { Color(nsColor: $0) }
@@ -349,24 +363,24 @@ private struct ProjectSection: View {
         }()
 
         HStack(spacing: 0) {
-            // Status dot — leading position
-            if let activeEntry {
-                if activeEntry.value == "done" {
-                    if tab.hasUnreadCompletion {
-                        PulsingDot(color: .green, size: 6).padding(.trailing, 6)
-                    } else {
-                        Circle().fill(.green).frame(width: 6, height: 6).padding(.trailing, 6)
-                    }
-                } else if activeEntry.value == "needs-input" {
-                    PulsingDot(color: .orange, size: 6).padding(.trailing, 6)
-                } else {
-                    PulsingDot(color: .accentColor, size: 6).padding(.trailing, 6)
-                }
-            } else if tab.statusEntries.contains(where: { $0.key == "process-running" && $0.value == "true" }) {
-                // Process running indicator — subtle pulsing orange dot
-                PulsingDot(color: .orange, size: 5).padding(.trailing, 6)
+            // Status dot — leading position. A pulse strictly means "this
+            // tab needs you"; everything else is solid or absent.
+            if tab.indicator == .needsInput {
+                PulsingDot(color: .orange, size: 6).padding(.trailing, 6)
             } else if tab.needsAttention && !isSelected {
-                Circle().fill(theme.attentionColor).frame(width: 6, height: 6).padding(.trailing, 6)
+                // Bell / desktop notification / IPC notify.
+                PulsingDot(color: theme.attentionColor, size: 6).padding(.trailing, 6)
+            } else {
+                switch tab.indicator {
+                case .doneUnseen:
+                    Circle().fill(.green).frame(width: 6, height: 6).padding(.trailing, 6)
+                case .error:
+                    Circle().fill(.red).frame(width: 6, height: 6).padding(.trailing, 6)
+                case .working:
+                    Circle().fill(Color.accentColor).frame(width: 5, height: 5).padding(.trailing, 6)
+                case .needsInput, .none:
+                    EmptyView()
+                }
             }
 
             // Title
@@ -977,33 +991,42 @@ private struct SidebarCardFramePreferenceKey: PreferenceKey {
     }
 }
 
-// MARK: - DoubleClickOverlay
+// MARK: - SidebarClickOverlay
 
-/// Transparent NSView overlay that monitors double-click events via an event
+/// Transparent NSView overlay that monitors click events via an event
 /// monitor, bypassing SwiftUI's gesture system entirely.
-private struct DoubleClickOverlay: NSViewRepresentable {
+///
+/// Single clicks on a tab row select it on mouse-DOWN — SwiftUI's tap
+/// gesture only fires on mouse-up, which reads as sluggish next to native
+/// sidebars (Finder, Xcode) that all select on mouse-down. Double clicks
+/// rename a tab or create a new tab on blank space.
+private struct SidebarClickOverlay: NSViewRepresentable {
     var tabCardFrames: [ObjectIdentifier: CGRect]
     var onBlankSpaceDoubleClick: () -> Void
     var onTabDoubleClick: (ObjectIdentifier) -> Void
+    var onTabMouseDown: (ObjectIdentifier) -> Void
 
-    func makeNSView(context: Context) -> DoubleClickView {
-        DoubleClickView(
+    func makeNSView(context: Context) -> ClickView {
+        ClickView(
             tabCardFrames: tabCardFrames,
             onBlankSpaceDoubleClick: onBlankSpaceDoubleClick,
-            onTabDoubleClick: onTabDoubleClick
+            onTabDoubleClick: onTabDoubleClick,
+            onTabMouseDown: onTabMouseDown
         )
     }
 
-    func updateNSView(_ nsView: DoubleClickView, context: Context) {
+    func updateNSView(_ nsView: ClickView, context: Context) {
         nsView.tabCardFrames = tabCardFrames
         nsView.onBlankSpaceDoubleClick = onBlankSpaceDoubleClick
         nsView.onTabDoubleClick = onTabDoubleClick
+        nsView.onTabMouseDown = onTabMouseDown
     }
 
-    class DoubleClickView: NSView {
+    class ClickView: NSView {
         var tabCardFrames: [ObjectIdentifier: CGRect]
         var onBlankSpaceDoubleClick: () -> Void
         var onTabDoubleClick: (ObjectIdentifier) -> Void
+        var onTabMouseDown: (ObjectIdentifier) -> Void
         private var eventMonitor: Any?
         /// Timestamp of the last handled double-click, used to debounce
         /// duplicate events that can arrive when multiple sidebar hosting
@@ -1014,11 +1037,13 @@ private struct DoubleClickOverlay: NSViewRepresentable {
         init(
             tabCardFrames: [ObjectIdentifier: CGRect],
             onBlankSpaceDoubleClick: @escaping () -> Void,
-            onTabDoubleClick: @escaping (ObjectIdentifier) -> Void
+            onTabDoubleClick: @escaping (ObjectIdentifier) -> Void,
+            onTabMouseDown: @escaping (ObjectIdentifier) -> Void
         ) {
             self.tabCardFrames = tabCardFrames
             self.onBlankSpaceDoubleClick = onBlankSpaceDoubleClick
             self.onTabDoubleClick = onTabDoubleClick
+            self.onTabMouseDown = onTabMouseDown
             super.init(frame: .zero)
         }
 
@@ -1040,10 +1065,25 @@ private struct DoubleClickOverlay: NSViewRepresentable {
         }
 
         private func handleMouseDown(_ event: NSEvent) {
-            guard event.clickCount == 2,
-                  let myWindow = self.window,
+            guard let myWindow = self.window,
                   myWindow.isKeyWindow,
                   event.window === myWindow else { return }
+
+            let locationInView = convert(event.locationInWindow, from: nil)
+            guard bounds.contains(locationInView) else { return }
+
+            let hitTab = tabCardFrames.first(where: { $0.value.contains(locationInView) })?.key
+
+            // Single click on a tab: select immediately on mouse-down.
+            // The event still propagates so drags keep working.
+            if event.clickCount == 1 {
+                if let hitTab {
+                    onTabMouseDown(hitTab)
+                }
+                return
+            }
+
+            guard event.clickCount == 2 else { return }
             // Debounce: ignore double-clicks within 400ms of a previously
             // handled one. Multiple sidebar monitors can observe the same
             // event during the key-window transition that follows tab
@@ -1052,11 +1092,8 @@ private struct DoubleClickOverlay: NSViewRepresentable {
             if now - lastHandledClickTime < 0.4 { return }
             lastHandledClickTime = now
 
-            let locationInView = convert(event.locationInWindow, from: nil)
-            guard bounds.contains(locationInView) else { return }
-
-            if let (tabID, _) = tabCardFrames.first(where: { $0.value.contains(locationInView) }) {
-                onTabDoubleClick(tabID)
+            if let hitTab {
+                onTabDoubleClick(hitTab)
             } else {
                 onBlankSpaceDoubleClick()
             }

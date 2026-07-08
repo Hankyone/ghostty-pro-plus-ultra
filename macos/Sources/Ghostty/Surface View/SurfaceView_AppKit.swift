@@ -1868,6 +1868,9 @@ extension Ghostty {
             if let uuid = uuid {
                 config.environmentVariables["GHOSTTY_TAB_ID"] = uuid.uuidString
             }
+            if let shimDir = AgentShimInstaller.shimDirectory {
+                config.environmentVariables["GHOSTTY_AGENT_SHIM_DIR"] = shimDir
+            }
 
             let savedTitle = try container.decodeIfPresent(String.self, forKey: .title)
             let isUserSetTitle = try container.decodeIfPresent(Bool.self, forKey: .isUserSetTitle) ?? false

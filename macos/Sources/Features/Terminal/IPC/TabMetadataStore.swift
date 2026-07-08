@@ -32,7 +32,7 @@ final class TabMetadataStore: ObservableObject {
         "grok-pid", "grok-active", "grok-done-at",
         "devin-pid", "devin-active", "devin-done-at",
         "cursor-pid", "cursor-active", "cursor-done-at",
-        "process-running",
+        "process-running", "command-failed",
     ]
 
     private var pendingSave: DispatchWorkItem?

@@ -274,6 +274,7 @@ _ghostty_deferred_init() {
     if [[ -n "$GHOSTTY_SOCKET" && -S "$GHOSTTY_SOCKET" ]]; then
         functions[_ghostty_preexec]+="
             [[ -n \$GHOSTTY_SOCKET && -S \$GHOSTTY_SOCKET ]] && {
+                builtin typeset -g _ghostty_cmd_ran=1
                 local _gc_cmd=\${1//[[:cntrl:]]}
                 _gc_cmd=\${_gc_cmd//\\\\/\\\\\\\\}
                 _gc_cmd=\${_gc_cmd//\\\"/\\\\\\\"}
@@ -285,12 +286,31 @@ _ghostty_deferred_init() {
                 [[ -n \$_gc_tid ]] && _gc_params=\"\\\"tab_id\\\": \\\"\$_gc_tid\\\", \$_gc_params\"
                 printf '{\"method\": \"tab.set-status\", \"params\": {%s}}\\n' \"\$_gc_params\" | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!
             }"
+        # Exit-code reporting: on the prompt after a command finishes, report
+        # nonzero exit codes so the sidebar can flag failed commands (cleared
+        # when the tab is visited). \$cmd_status is captured as the first
+        # statement of _ghostty_precmd, so it is the real command status.
+        # Guarded by _ghostty_cmd_ran so a Ctrl-C at an empty prompt (which
+        # also yields nonzero status) doesn't count; 130 (SIGINT) is skipped
+        # because the user interrupted it themselves and knows.
         functions[_ghostty_precmd]+="
             [[ -n \$GHOSTTY_SOCKET && -S \$GHOSTTY_SOCKET ]] && {
                 local _gc_tid=\${GHOSTTY_TAB_ID:-}
                 local _gc_params=\"\\\"key\\\": \\\"process-running\\\"\"
                 [[ -n \$_gc_tid ]] && _gc_params=\"\\\"tab_id\\\": \\\"\$_gc_tid\\\", \$_gc_params\"
                 printf '{\"method\": \"tab.clear-status\", \"params\": {%s}}\\n' \"\$_gc_params\" | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!
+                if (( \${_ghostty_cmd_ran:-0} )); then
+                    _ghostty_cmd_ran=0
+                    if (( cmd_status != 0 && cmd_status != 130 )); then
+                        _gc_params=\"\\\"key\\\": \\\"command-failed\\\", \\\"value\\\": \\\"\$cmd_status\\\"\"
+                        [[ -n \$_gc_tid ]] && _gc_params=\"\\\"tab_id\\\": \\\"\$_gc_tid\\\", \$_gc_params\"
+                        printf '{\"method\": \"tab.set-status\", \"params\": {%s}}\\n' \"\$_gc_params\" | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!
+                    else
+                        _gc_params=\"\\\"key\\\": \\\"command-failed\\\"\"
+                        [[ -n \$_gc_tid ]] && _gc_params=\"\\\"tab_id\\\": \\\"\$_gc_tid\\\", \$_gc_params\"
+                        printf '{\"method\": \"tab.clear-status\", \"params\": {%s}}\\n' \"\$_gc_params\" | nc -U \$GHOSTTY_SOCKET >/dev/null 2>&1 &!
+                    fi
+                fi
             }"
     fi
 
@@ -306,6 +326,15 @@ _ghostty_deferred_init() {
             builtin print -nu \$_ghostty_fd '\\e]133;P;k=i\\a\\e]133;B\\a'
         fi
     "${functions[_ghostty_zle_line_init]}
+
+    # Prepend the agent shim directory (wrapper scripts that inject sidebar
+    # hooks into agent CLIs like claude). Done here — after profiles ran —
+    # so path_helper and user profiles can't reorder it away.
+    if [[ -n "$GHOSTTY_AGENT_SHIM_DIR" && -d "$GHOSTTY_AGENT_SHIM_DIR" ]]; then
+      if [[ ":$PATH:" != *":$GHOSTTY_AGENT_SHIM_DIR:"* ]]; then
+        builtin export PATH="$GHOSTTY_AGENT_SHIM_DIR:$PATH"
+      fi
+    fi
 
     # Add Ghostty binary to PATH if the path feature is enabled
     if [[ "$GHOSTTY_SHELL_FEATURES" == *"path"* ]] && [[ -n "$GHOSTTY_BIN_DIR" ]]; then

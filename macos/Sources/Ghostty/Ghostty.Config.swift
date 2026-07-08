@@ -579,6 +579,15 @@ extension Ghostty {
             return SidebarTheme.from(background: backgroundNSColor, foreground: foregroundNSColor)
         }
 
+        /// Opacity of the sidebar's frosted-glass background material (0-1).
+        var sidebarOpacity: Double {
+            guard let config = self.config else { return 1 }
+            var v: Double = 1
+            let key = "sidebar-opacity"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return max(0, min(1, v))
+        }
+
         /// Which fields to show in sidebar tab cards.
         var sidebarFields: Set<SidebarField> {
             guard let config = self.config else { return SidebarField.defaultFields }

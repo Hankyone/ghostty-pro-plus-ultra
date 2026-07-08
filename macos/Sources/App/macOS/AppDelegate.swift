@@ -213,6 +213,10 @@ class AppDelegate: NSObject,
         // didFinish, so the socket must be available by then.
         GhosttyIPCServer.shared.start()
 
+        // Materialize agent CLI shims (sidebar hooks with zero user setup)
+        // before any surface spawns so GHOSTTY_AGENT_SHIM_DIR is available.
+        AgentShimInstaller.install()
+
         // Force-load persisted tab metadata so it's available during window restoration.
         _ = TabMetadataStore.shared
     }

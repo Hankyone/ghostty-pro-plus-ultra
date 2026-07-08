@@ -1094,6 +1094,12 @@ palette: Palette = .{},
 /// Default: `title,directory,status`
 @"sidebar-fields": ?[:0]const u8 = null,
 
+/// Opacity of the sidebar background, from 0 to 1. At 1 (the default) the
+/// sidebar uses the standard translucent "frosted glass" sidebar material.
+/// Values below 1 blend the material toward fully transparent, letting more
+/// of whatever is behind the window show through.
+@"sidebar-opacity": f64 = 1.0,
+
 /// Control when Ghostty preserves a zoomed split. Under normal circumstances,
 /// any operation that changes focus or layout of the split tree in a window
 /// will unzoom any zoomed split. This configuration allows you to control

@@ -67,6 +67,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// The sidebar hosting view, kept for theme updates on config change.
     private var sidebarHostingView: NSHostingView<SidebarView>?
 
+    /// The sidebar's background material layer, kept so config reloads can
+    /// re-apply `sidebar-opacity` without rebuilding the view hierarchy.
+    private weak var sidebarEffectView: NSVisualEffectView?
+
     init(_ ghostty: Ghostty.App,
          withBaseConfig base: Ghostty.SurfaceConfiguration? = nil,
          withSurfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil,
@@ -608,6 +612,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             theme: newTheme,
             fields: config.sidebarFields
         )
+        sidebarEffectView?.alphaValue = config.sidebarOpacity
     }
 
     /// Refreshes the sidebar tab manager for all windows in the current tab group.
@@ -1153,18 +1158,32 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Wrap the sidebar in a frosted glass effect view (NSVisualEffectView
         // with .sidebar material). The SwiftUI view has a clear background so
         // the vibrancy shows through.
+        //
+        // The effect view and the hosting view are SIBLINGS inside a plain
+        // container (not parent/child) so that `sidebar-opacity` can fade the
+        // background material alone — fading a parent effect view would fade
+        // the tab list content with it.
+        let sidebarContainer = NSView()
         let sidebarEffectView = NSVisualEffectView()
         sidebarEffectView.material = .sidebar
         sidebarEffectView.blendingMode = .behindWindow
         sidebarEffectView.state = .followsWindowActiveState
+        sidebarEffectView.alphaValue = ghostty.config.sidebarOpacity
+        self.sidebarEffectView = sidebarEffectView
 
+        sidebarEffectView.translatesAutoresizingMaskIntoConstraints = false
         sidebarHostingView.translatesAutoresizingMaskIntoConstraints = false
-        sidebarEffectView.addSubview(sidebarHostingView)
+        sidebarContainer.addSubview(sidebarEffectView)
+        sidebarContainer.addSubview(sidebarHostingView)
         NSLayoutConstraint.activate([
-            sidebarHostingView.topAnchor.constraint(equalTo: sidebarEffectView.topAnchor),
-            sidebarHostingView.bottomAnchor.constraint(equalTo: sidebarEffectView.bottomAnchor),
-            sidebarHostingView.leadingAnchor.constraint(equalTo: sidebarEffectView.leadingAnchor),
-            sidebarHostingView.trailingAnchor.constraint(equalTo: sidebarEffectView.trailingAnchor),
+            sidebarEffectView.topAnchor.constraint(equalTo: sidebarContainer.topAnchor),
+            sidebarEffectView.bottomAnchor.constraint(equalTo: sidebarContainer.bottomAnchor),
+            sidebarEffectView.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
+            sidebarEffectView.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
+            sidebarHostingView.topAnchor.constraint(equalTo: sidebarContainer.topAnchor),
+            sidebarHostingView.bottomAnchor.constraint(equalTo: sidebarContainer.bottomAnchor),
+            sidebarHostingView.leadingAnchor.constraint(equalTo: sidebarContainer.leadingAnchor),
+            sidebarHostingView.trailingAnchor.constraint(equalTo: sidebarContainer.trailingAnchor),
         ])
 
         // Build the split view: sidebar | terminal.
@@ -1173,7 +1192,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let splitView = BorderlessSplitView()
         splitView.isVertical = true
         splitView.dividerStyle = .thin
-        splitView.addSubview(sidebarEffectView)
+        splitView.addSubview(sidebarContainer)
         splitView.addSubview(terminalContainer)
         splitView.setHoldingPriority(.defaultLow, forSubviewAt: 0)
         splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 1)
@@ -1182,7 +1201,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Set initial sidebar width (synced across tabs via UserDefaults)
         let savedWidth = UserDefaults.standard.double(forKey: "SidebarWidth")
         let sidebarWidth = savedWidth > 0 ? min(max(savedWidth, 140), 280) : 200
-        sidebarEffectView.frame = NSRect(x: 0, y: 0, width: sidebarWidth, height: 400)
+        sidebarContainer.frame = NSRect(x: 0, y: 0, width: sidebarWidth, height: 400)
         terminalContainer.frame = NSRect(x: sidebarWidth, y: 0, width: 600, height: 400)
 
         window.contentView = splitView

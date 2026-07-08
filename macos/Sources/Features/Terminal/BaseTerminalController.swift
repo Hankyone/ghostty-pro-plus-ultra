@@ -143,6 +143,9 @@ class BaseTerminalController: NSWindowController,
         config.environmentVariables["GHOSTTY_SOCKET"] = GhosttyIPCServer.shared.socketPath
         let surfaceUUID = UUID()
         config.environmentVariables["GHOSTTY_TAB_ID"] = surfaceUUID.uuidString
+        if let shimDir = AgentShimInstaller.shimDirectory {
+            config.environmentVariables["GHOSTTY_AGENT_SHIM_DIR"] = shimDir
+        }
         self.surfaceTree = tree ?? .init(view: Ghostty.SurfaceView(ghostty_app, baseConfig: config, uuid: surfaceUUID))
 
         // Setup our bell state for the window
