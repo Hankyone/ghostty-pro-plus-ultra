@@ -106,6 +106,13 @@ if [ -d "$HOME/.config/zig/sdk-shim" ]; then
     export PATH="$HOME/.config/zig/sdk-shim:$PATH"
 fi
 
+# The xcframework's iOS slice needs the full Xcode toolchain, not the
+# Command Line Tools (zig's findNative fails with DarwinSdkNotFound
+# otherwise). Xcode-beta is the only Xcode installed on this machine.
+if [ -z "${DEVELOPER_DIR:-}" ] && [ -d "/Applications/Xcode-beta.app" ]; then
+    export DEVELOPER_DIR="/Applications/Xcode-beta.app"
+fi
+
 echo "==> Building GhosttyKit..."
 zig build \
     -Doptimize=ReleaseFast \
