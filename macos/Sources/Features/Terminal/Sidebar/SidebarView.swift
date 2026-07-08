@@ -475,7 +475,7 @@ private struct ProjectSection: View {
 
             if let pwd = tab.pwd {
                 Button("Open in Finder") {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: pwd))
+                    NSWorkspace.shared.open(URL(fileURLWithPath: (pwd as NSString).expandingTildeInPath))
                 }
             }
 

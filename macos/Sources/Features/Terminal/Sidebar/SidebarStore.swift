@@ -301,7 +301,8 @@ final class SidebarStore {
                 if let ctrl = window.windowController as? BaseTerminalController,
                    let surface = ctrl.focusedSurface {
                     hasher.combine(surface.id)
-                    hasher.combine(surface.pwd)
+                    // Normalize tilde paths for fingerprint consistency
+                    hasher.combine((surface.pwd as NSString?)?.expandingTildeInPath)
                     for entry in metadataStore.statusEntries(for: surface.id) {
                         hasher.combine(entry.key)
                         hasher.combine(entry.value)
@@ -851,7 +852,7 @@ final class SidebarStore {
                     projectOrder.append(root)
                 }
                 projectTabs[root, default: []].append(tab)
-            } else if tab.pwd == home {
+            } else if let pwd = tab.pwd, (pwd as NSString).expandingTildeInPath == home {
                 homeTabs.append(tab)
             } else {
                 otherTabs.append(tab)
@@ -966,7 +967,8 @@ final class SidebarStore {
     nonisolated private static func findProjectRoot(at pwd: String) -> String? {
         let fm = FileManager.default
         let home = NSHomeDirectory()
-        var dir = pwd
+        // Expand tilde paths (e.g., ~/macdown -> /Users/hankyone/macdown)
+        var dir = (pwd as NSString).expandingTildeInPath
         while dir != "/" && dir.hasPrefix("/Users") {
             if dir == home { return nil }
             for marker in projectRootMarkers {

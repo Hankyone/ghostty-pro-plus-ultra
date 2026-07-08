@@ -35,7 +35,8 @@ enum SidebarFaviconFinder {
     /// Find a favicon for the project containing `pwd`, or nil.
     static func find(at pwd: String) -> NSImage? {
         let fm = FileManager.default
-        var dir = pwd
+        // Expand tilde paths (e.g., ~/macdown -> /Users/hankyone/macdown)
+        var dir = (pwd as NSString).expandingTildeInPath
         while dir != "/" && dir.hasPrefix("/Users") {
             let isProjectRoot = fm.fileExists(atPath: (dir as NSString).appendingPathComponent("package.json"))
                 || fm.fileExists(atPath: (dir as NSString).appendingPathComponent(".git"))

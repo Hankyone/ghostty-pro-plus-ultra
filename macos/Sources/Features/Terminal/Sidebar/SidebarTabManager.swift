@@ -60,7 +60,7 @@ class SidebarTabManager: ObservableObject {
         /// The last path component of the pwd, for compact display.
         var directoryName: String? {
             guard let pwd, !pwd.isEmpty else { return nil }
-            return (pwd as NSString).lastPathComponent
+            return ((pwd as NSString).expandingTildeInPath as NSString).lastPathComponent
         }
 
         /// Title with bell/ghost emoji stripped for clean sidebar display.
