@@ -2065,6 +2065,8 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             return
         }
 
+        let hadMarkedText = hasMarkedText()
+
         // If insertText is called, our preedit must be over.
         unmarkText()
 
@@ -2073,6 +2075,13 @@ extension Ghostty.SurfaceView: NSTextInputClient {
         if var acc = keyTextAccumulator {
             acc.append(chars)
             keyTextAccumulator = acc
+            return
+        }
+
+        if hadMarkedText, !chars.isEmpty {
+            // Send preedit commits as key events instead of raw text for
+            // keybind interpretation by programs.
+            _ = committedPreeditTextAction(GHOSTTY_ACTION_PRESS, text: chars)
             return
         }
 
