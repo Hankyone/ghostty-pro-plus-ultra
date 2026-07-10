@@ -111,6 +111,7 @@ pub const Action = union(Key) {
     apc_start,
     apc_end,
     apc_put: u8,
+    apc_put_slice: ApcPutSlice,
     end_hyperlink,
     active_status_display: ansi.StatusDisplay,
     decaln,
@@ -209,6 +210,7 @@ pub const Action = union(Key) {
             "apc_start",
             "apc_end",
             "apc_put",
+            "apc_put_slice",
             "end_hyperlink",
             "active_status_display",
             "decaln",
@@ -272,6 +274,19 @@ pub const Action = union(Key) {
 
         pub fn cval(self: PrintSlice) PrintSlice.C {
             return .{ .cps = self.cps.ptr, .len = self.cps.len };
+        }
+    };
+
+    pub const ApcPutSlice = struct {
+        bytes: []const u8,
+
+        pub const C = extern struct {
+            bytes: [*]const u8,
+            len: usize,
+        };
+
+        pub fn cval(self: ApcPutSlice) ApcPutSlice.C {
+            return .{ .bytes = self.bytes.ptr, .len = self.bytes.len };
         }
     };
 
@@ -641,6 +656,18 @@ pub fn Stream(comptime H: type) type {
                         // handle it. Otherwise re-check our state.
                         if (self.parser.state != .csi_param) continue;
                     }
+
+                    // Bulk-consume APC string bytes into a single slice.
+                    // APC payloads (e.g. Kitty graphics) can be megabytes
+                    // of base64 data, so per-byte dispatch is far too slow.
+                    // This can't be used for handlers with a vtRaw hook
+                    // because it dispatches the slice directly.
+                    if (self.parser.state == .sos_pm_apc_string) {
+                        offset += self.consumeApcString(input[offset..]);
+                        if (offset >= input.len) return input.len;
+                        // The next byte exits the string state; let
+                        // nextNonUtf8 below handle it.
+                    }
                 }
 
                 self.nextNonUtf8(input[offset]);
@@ -749,6 +776,38 @@ pub fn Stream(comptime H: type) type {
             p.param_acc_idx = acc_idx;
             p.params_idx = idx;
             return offset;
+        }
+
+        /// Bulk-consume APC string bytes and dispatch them as a single
+        /// apc_put_slice action. Returns the number of bytes consumed.
+        /// Stops at the first byte that is not an apc_put byte in the
+        /// parse table, leaving it for the caller to process through
+        /// the state machine. CAN, SUB, ESC, and most C1 bytes exit
+        /// or abort the string state; 0xA0-0xFF are ignored by the
+        /// table (not payload), so they can't be bulk-consumed either.
+        ///
+        /// Must not be used by handlers with a vtRaw hook because it
+        /// dispatches the slice directly.
+        fn consumeApcString(self: *Self, input: []const u8) usize {
+            comptime assert(!@hasDecl(T, "vtRaw"));
+            assert(self.parser.state == .sos_pm_apc_string);
+
+            var end: usize = 0;
+            while (end < input.len) {
+                switch (input[end]) {
+                    // Not apc_put bytes: CAN/SUB/ESC and most C1 exit
+                    // or abort the state; 0xA0-0xFF are ignored by it.
+                    0x18, 0x1A, 0x1B, 0x80...0xFF => break,
+                    // Everything else is an apc_put byte.
+                    else => end += 1,
+                }
+            }
+
+            if (end > 0) self.handler.vt(
+                .apc_put_slice,
+                .{ .bytes = input[0..end] },
+            );
+            return end;
         }
 
         /// Like nextSlice but takes one byte and is necessarily a scalar
@@ -3759,4 +3818,102 @@ test "stream: tab clear with overflowing param" {
     // This is the exact input from the fuzz crash (minus the mode byte):
     // CSI with a huge numeric param that saturates to 65535, followed by 'g'.
     s.nextSlice("\x1b[388888888888888888888888888888888888g\x1b[0m");
+}
+
+/// A test handler that accumulates APC bytes regardless of whether they
+/// arrive per-byte (apc_put) or in bulk (apc_put_slice).
+const ApcTestHandler = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+    slices: usize = 0,
+    puts: usize = 0,
+    started: usize = 0,
+    ended: usize = 0,
+
+    pub fn vt(
+        self: *@This(),
+        comptime action: Action.Tag,
+        value: Action.Value(action),
+    ) void {
+        switch (action) {
+            .apc_start => self.started += 1,
+            .apc_end => self.ended += 1,
+            .apc_put => {
+                self.buf[self.len] = value;
+                self.len += 1;
+                self.puts += 1;
+            },
+            .apc_put_slice => {
+                @memcpy(self.buf[self.len..][0..value.bytes.len], value.bytes);
+                self.len += value.bytes.len;
+                self.slices += 1;
+            },
+            else => {},
+        }
+    }
+};
+
+test "stream: apc bulk slice" {
+    var s: Stream(ApcTestHandler) = .init(.{});
+    s.nextSlice("\x1b_Gf=24,s=10,v=20;aGVsbG8=\x1b\\");
+
+    try testing.expectEqual(@as(usize, 1), s.handler.started);
+    try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqualStrings(
+        "Gf=24,s=10,v=20;aGVsbG8=",
+        s.handler.buf[0..s.handler.len],
+    );
+
+    // With SIMD enabled the body must arrive as a single slice.
+    if (comptime build_options.simd and !debug) {
+        try testing.expectEqual(@as(usize, 1), s.handler.slices);
+        try testing.expectEqual(@as(usize, 0), s.handler.puts);
+    }
+}
+
+test "stream: apc bulk slice split across inputs" {
+    var s: Stream(ApcTestHandler) = .init(.{});
+    s.nextSlice("\x1b_Gf=24,s=10");
+    s.nextSlice(",v=20;aGVs");
+    s.nextSlice("bG8=\x1b\\");
+
+    try testing.expectEqual(@as(usize, 1), s.handler.started);
+    try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqualStrings(
+        "Gf=24,s=10,v=20;aGVsbG8=",
+        s.handler.buf[0..s.handler.len],
+    );
+}
+
+test "stream: apc bulk slice keeps C0 bytes as data" {
+    var s: Stream(ApcTestHandler) = .init(.{});
+    // BEL does not terminate an APC string; it is payload data.
+    s.nextSlice("\x1b_Gx\x07y\x1b\\");
+
+    try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqualStrings("Gx\x07y", s.handler.buf[0..s.handler.len]);
+}
+
+test "stream: apc aborted by CAN" {
+    var s: Stream(ApcTestHandler) = .init(.{});
+    // CAN (0x18) aborts the APC string via the anywhere => ground
+    // transition. Exiting the sos_pm_apc_string state emits apc_end,
+    // and the trailing bytes are printed, not treated as APC data.
+    s.nextSlice("\x1b_Gabc\x18def");
+
+    try testing.expectEqual(@as(usize, 1), s.handler.started);
+    try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqualStrings("Gabc", s.handler.buf[0..s.handler.len]);
+}
+
+test "stream: apc scalar path matches" {
+    var s: Stream(ApcTestHandler) = .init(.{});
+    for ("\x1b_Gf=24;aGVsbG8=\x1b\\") |c| s.next(c);
+
+    try testing.expectEqual(@as(usize, 1), s.handler.started);
+    try testing.expectEqual(@as(usize, 1), s.handler.ended);
+    try testing.expectEqualStrings(
+        "Gf=24;aGVsbG8=",
+        s.handler.buf[0..s.handler.len],
+    );
 }

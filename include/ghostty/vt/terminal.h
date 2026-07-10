@@ -40,6 +40,17 @@ extern "C" {
  * @snippet c-vt-stream/src/main.c vt-stream-init
  * @snippet c-vt-stream/src/main.c vt-stream-write
  *
+ * ## Scrollback Compression
+ *
+ * Scrollback compression is caller-driven. The terminal exposes an opaque
+ * activity token so an embedding application can restart an idle timer only
+ * when compression-relevant state changes. Once idle, call incremental
+ * compression until it no longer reports pending work. libghostty-vt does not
+ * create a timer or background thread.
+ *
+ * @snippet c-vt-compression/src/main.c compression-activity
+ * @snippet c-vt-compression/src/main.c compression-idle-step
+ *
  * ## Effects
  *
  * By default, the terminal sequence processing with ghostty_terminal_vt_write() 
@@ -176,6 +187,37 @@ typedef struct {
   // We may want to artificially pad it significantly to support
   // future options.
 } GhosttyTerminalOptions;
+
+/**
+ * Amount of compression work to perform before returning.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Perform one bounded compression step suitable for idle scheduling. */
+  GHOSTTY_TERMINAL_COMPRESSION_MODE_INCREMENTAL = 0,
+
+  /** Synchronously inspect every currently eligible page. */
+  GHOSTTY_TERMINAL_COMPRESSION_MODE_FULL = 1,
+  GHOSTTY_TERMINAL_COMPRESSION_MODE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalCompressionMode;
+
+/**
+ * Scheduling result from terminal compression.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Retained-mapping reclamation is unavailable on this target. */
+  GHOSTTY_TERMINAL_COMPRESSION_RESULT_UNSUPPORTED = 0,
+
+  /** More incremental compression work remains. */
+  GHOSTTY_TERMINAL_COMPRESSION_RESULT_PENDING = 1,
+
+  /** The pass has no continuation to schedule. */
+  GHOSTTY_TERMINAL_COMPRESSION_RESULT_COMPLETE = 2,
+  GHOSTTY_TERMINAL_COMPRESSION_RESULT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalCompressionResult;
 
 /**
  * Scroll viewport behavior tag.
@@ -1157,6 +1199,60 @@ GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
  */
 GHOSTTY_API void ghostty_terminal_scroll_viewport(GhosttyTerminal terminal,
                                        GhosttyTerminalScrollViewport behavior);
+
+/**
+ * Return the current compression activity token.
+ *
+ * The token is opaque and only equality comparisons are meaningful. An
+ * embedding application should cache it and restart its compression idle
+ * delay whenever the value changes. The value may wrap and changes in either
+ * direction have the same meaning.
+ *
+ * This function only observes terminal state. It does not perform or schedule
+ * compression.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param[out] out_activity Receives the current activity token
+ * @return GHOSTTY_SUCCESS on success, or GHOSTTY_INVALID_VALUE if an argument
+ *         is NULL
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_compression_activity(
+    GhosttyTerminal terminal,
+    uint64_t* out_activity);
+
+/**
+ * Compress eligible terminal scrollback.
+ *
+ * Incremental mode performs bounded work suitable for an idle callback. A
+ * pending result means the application should invoke another step while the
+ * terminal remains idle. A complete result means no continuation is needed
+ * until ghostty_terminal_compression_activity() changes. Full mode performs
+ * one synchronous scan and can stall on large scrollback buffers.
+ *
+ * Compression is opportunistic. Complete means the pass has finished, not
+ * that every page was compressed: pages may be unprofitable or encounter an
+ * allocation or reclamation failure. Compression changes only the terminal's
+ * storage representation and never its logical contents or scrollback limit.
+ * Accessing compressed history restores it transparently.
+ *
+ * This function is not thread-safe with other operations on the same
+ * terminal. The caller must serialize it with writes, rendering, searches,
+ * and other terminal access.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param mode The amount of compression work to perform
+ * @param[out] out_result Receives the compression scheduling result
+ * @return GHOSTTY_SUCCESS on success, or GHOSTTY_INVALID_VALUE if an argument
+ *         or mode is invalid
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_compress(
+    GhosttyTerminal terminal,
+    GhosttyTerminalCompressionMode mode,
+    GhosttyTerminalCompressionResult* out_result);
 
 /**
  * Get the current value of a terminal mode.

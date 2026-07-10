@@ -223,6 +223,12 @@ const Effects = struct {
 /// C: GhosttyTerminal
 pub const Terminal = ?*TerminalWrapper;
 
+/// C: GhosttyTerminalCompressionMode
+pub const CompressionMode = ZigTerminal.CompressionMode;
+
+/// C: GhosttyTerminalCompressionResult
+pub const CompressionResult = ZigTerminal.CompressionResult;
+
 pub fn zigTerminal(terminal_: Terminal) ?*ZigTerminal {
     return (terminal_ orelse return null).terminal;
 }
@@ -313,6 +319,30 @@ pub fn vt_write(
 ) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
     wrapper.stream.nextSlice(ptr[0..len]);
+}
+
+pub fn compression_activity(
+    terminal_: Terminal,
+    out_activity_: ?*u64,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out_activity = out_activity_ orelse return .invalid_value;
+    out_activity.* = t.compressionActivity();
+    return .success;
+}
+
+pub fn compress(
+    terminal_: Terminal,
+    mode_: c_int,
+    out_result_: ?*CompressionResult,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out_result = out_result_ orelse return .invalid_value;
+    const mode = std.meta.intToEnum(CompressionMode, mode_) catch
+        return .invalid_value;
+
+    out_result.* = t.compress(mode);
+    return .success;
 }
 
 /// C: GhosttyTerminalOption
@@ -1097,6 +1127,112 @@ test "scroll_viewport row alt screen" {
 test "scroll_viewport null" {
     scroll_viewport(null, .{ .tag = .top, .value = undefined });
     scroll_viewport(null, .{ .tag = .row, .value = .{ .row = 1 } });
+}
+
+test "compression invalid arguments" {
+    var activity: u64 = undefined;
+    var compression_result: CompressionResult = undefined;
+
+    try testing.expectEqual(
+        Result.invalid_value,
+        compression_activity(null, &activity),
+    );
+    try testing.expectEqual(
+        Result.invalid_value,
+        compress(null, @intFromEnum(CompressionMode.incremental), &compression_result),
+    );
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 10_000_000,
+        },
+    ));
+    defer free(t);
+
+    try testing.expectEqual(
+        Result.invalid_value,
+        compression_activity(t, null),
+    );
+    try testing.expectEqual(
+        Result.invalid_value,
+        compress(t, @intFromEnum(CompressionMode.incremental), null),
+    );
+    try testing.expectEqual(
+        Result.invalid_value,
+        compress(t, -1, &compression_result),
+    );
+}
+
+test "compression activity and incremental scheduling" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 10_000_000,
+        },
+    ));
+    defer free(t);
+
+    var initial_activity: u64 = undefined;
+    try testing.expectEqual(
+        Result.success,
+        compression_activity(t, &initial_activity),
+    );
+
+    const line = "repeated and compressible terminal history\r\n";
+    const repeat = 4_000;
+    const input = try testing.allocator.alloc(u8, line.len * repeat);
+    defer testing.allocator.free(input);
+    for (0..repeat) |i|
+        @memcpy(input[i * line.len ..][0..line.len], line);
+    vt_write(t, input.ptr, input.len);
+
+    var activity: u64 = undefined;
+    try testing.expectEqual(
+        Result.success,
+        compression_activity(t, &activity),
+    );
+    try testing.expect(activity != initial_activity);
+
+    var compression_result: CompressionResult = undefined;
+    for (0..1_000) |_| {
+        try testing.expectEqual(
+            Result.success,
+            compress(
+                t,
+                @intFromEnum(CompressionMode.incremental),
+                &compression_result,
+            ),
+        );
+
+        switch (compression_result) {
+            .pending => continue,
+            .complete => break,
+            .unsupported => unreachable,
+        }
+    } else return error.TestUnexpectedResult;
+
+    // Compression changes storage representation, not the activity token.
+    var final_activity: u64 = undefined;
+    try testing.expectEqual(
+        Result.success,
+        compression_activity(t, &final_activity),
+    );
+    try testing.expectEqual(activity, final_activity);
+
+    try testing.expectEqual(
+        Result.success,
+        compress(t, @intFromEnum(CompressionMode.full), &compression_result),
+    );
+    try testing.expectEqual(CompressionResult.complete, compression_result);
 }
 
 test "reset" {
