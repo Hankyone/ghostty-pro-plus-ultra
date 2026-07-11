@@ -952,7 +952,13 @@ pub fn print(self: *Terminal, c: u21) !void {
                 const cps = self.screens.active.cursor.page_pin.node.page().lookupGrapheme(prev.cell).?;
                 for (cps) |cp2| {
                     // log.debug("cp1={x} cp2={x}", .{ previous_codepoint, cp2 });
-                    assert(!unicode.graphemeBreak(previous_codepoint, cp2, &state));
+                    // With mode 2027 disabled, zero-width codepoints are
+                    // attached without applying grapheme boundary rules. If
+                    // the mode is enabled later, an existing cell can
+                    // therefore contain one or more breaks. Feed those breaks
+                    // into the state machine so it can reset its context and
+                    // determine the boundary for the new codepoint.
+                    _ = unicode.graphemeBreak(previous_codepoint, cp2, &state);
                     previous_codepoint = cp2;
                 }
             }
@@ -2423,6 +2429,21 @@ fn rowWillBeShifted(
     }
 }
 
+/// Renew every live page generation in an inclusive range before a full-width
+/// line operation moves logical rows between their coordinates.
+fn invalidateFullWidthRowRange(
+    self: *Terminal,
+    first: *PageList.List.Node,
+    last: *PageList.List.Node,
+) void {
+    var node = first;
+    while (true) : (node = node.next.?) {
+        // Full-width line movement remaps cached row coordinates in this page.
+        self.screens.active.pages.invalidateNodeLayout(node);
+        if (node == last) break;
+    }
+}
+
 // TODO(qwerasd): `insertLines` and `deleteLines` are 99% identical,
 // the majority of their logic can (and should) be abstracted in to
 // a single shared helper function, probably on `Screen` not here.
@@ -2497,6 +2518,12 @@ pub fn insertLines(self: *Terminal, count: usize) void {
         @panic("insertLines trackPin OOM");
     };
     defer self.screens.active.pages.untrackPin(cur_p);
+
+    // Partial-width margins edit cells in stable rows; full-width moves rows.
+    if (!left_right) self.invalidateFullWidthRowRange(
+        self.screens.active.cursor.page_pin.node,
+        cur_p.node,
+    );
 
     // Our current y position relative to the cursor
     var y: usize = rem;
@@ -2692,6 +2719,12 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
         @panic("deleteLines trackPin OOM");
     };
     defer self.screens.active.pages.untrackPin(cur_p);
+
+    // Partial-width margins edit cells in stable rows; full-width moves rows.
+    if (!left_right) self.invalidateFullWidthRowRange(
+        cur_p.node,
+        cur_p.down(rem - 1).?.node,
+    );
 
     // Our current y position relative to the cursor
     var y: usize = 0;
@@ -3512,8 +3545,13 @@ pub fn resize(
 
     // Resize our tabstops
     if (self.cols != cols) {
+        const tabstops: Tabstops = try .init(
+            alloc,
+            cols,
+            TABSTOP_INTERVAL,
+        );
         self.tabstops.deinit(alloc);
-        self.tabstops = try .init(alloc, cols, 8);
+        self.tabstops = tabstops;
     }
 
     // Resize primary screen, which supports reflow
@@ -3548,13 +3586,33 @@ pub fn resize(
     };
 }
 
+test "Terminal: resize preserves tabstops on allocation failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing.allocator();
+    var t = try init(alloc, .{ .cols = 10, .rows = 1 });
+    defer t.deinit(alloc);
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, t.resize(alloc, 513, 1));
+
+    try testing.expectEqual(@as(size.CellCountInt, 10), t.cols);
+    try testing.expect(t.tabstops.get(8));
+}
+
 /// Set the pwd for the terminal.
 pub fn setPwd(self: *Terminal, pwd: []const u8) !void {
-    self.pwd.clearRetainingCapacity();
-    if (pwd.len > 0) {
-        try self.pwd.appendSlice(self.gpa(), pwd);
-        try self.pwd.append(self.gpa(), 0);
+    if (pwd.len == 0) {
+        self.pwd.clearRetainingCapacity();
+        return;
     }
+
+    const capacity = std.math.add(usize, pwd.len, 1) catch
+        return error.OutOfMemory;
+    try self.pwd.ensureTotalCapacity(self.gpa(), capacity);
+
+    self.pwd.items.len = capacity;
+    std.mem.copyForwards(u8, self.pwd.items[0..pwd.len], pwd);
+    self.pwd.items[pwd.len] = 0;
 }
 
 /// Returns the pwd for the terminal, if any. The memory is owned by the
@@ -3564,13 +3622,41 @@ pub fn getPwd(self: *const Terminal) ?[:0]const u8 {
     return self.pwd.items[0 .. self.pwd.items.len - 1 :0];
 }
 
+test "Terminal: setPwd preserves a sentinel on allocation failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing.allocator();
+    var t = try init(alloc, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(alloc);
+
+    try t.pwd.ensureTotalCapacityPrecise(alloc, 3);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, t.setPwd("pwd"));
+    try testing.expect(t.getPwd() == null);
+}
+
+test "Terminal: setPwd accepts its current value" {
+    var t = try init(testing.allocator, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(testing.allocator);
+
+    try t.setPwd("file:///tmp");
+    try t.setPwd(t.getPwd().?);
+    try testing.expectEqualStrings("file:///tmp", t.getPwd().?);
+}
+
 /// Set the title for the terminal, as set by escape sequences (e.g. OSC 0/2).
 pub fn setTitle(self: *Terminal, t: []const u8) !void {
-    self.title.clearRetainingCapacity();
-    if (t.len > 0) {
-        try self.title.appendSlice(self.gpa(), t);
-        try self.title.append(self.gpa(), 0);
+    if (t.len == 0) {
+        self.title.clearRetainingCapacity();
+        return;
     }
+
+    const capacity = std.math.add(usize, t.len, 1) catch
+        return error.OutOfMemory;
+    try self.title.ensureTotalCapacity(self.gpa(), capacity);
+
+    self.title.items.len = capacity;
+    std.mem.copyForwards(u8, self.title.items[0..t.len], t);
+    self.title.items[t.len] = 0;
 }
 
 /// Returns the title for the terminal, if any. The memory is owned by the
@@ -3578,6 +3664,27 @@ pub fn setTitle(self: *Terminal, t: []const u8) !void {
 pub fn getTitle(self: *const Terminal) ?[:0]const u8 {
     if (self.title.items.len == 0) return null;
     return self.title.items[0 .. self.title.items.len - 1 :0];
+}
+
+test "Terminal: setTitle preserves a sentinel on allocation failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing.allocator();
+    var t = try init(alloc, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(alloc);
+
+    try t.title.ensureTotalCapacityPrecise(alloc, 5);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, t.setTitle("title"));
+    try testing.expect(t.getTitle() == null);
+}
+
+test "Terminal: setTitle accepts its current value" {
+    var t = try init(testing.allocator, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(testing.allocator);
+
+    try t.setTitle("Ghostty");
+    try t.setTitle(t.getTitle().?);
+    try testing.expectEqualStrings("Ghostty", t.getTitle().?);
 }
 
 /// Switch to the given screen type (alternate or primary).
@@ -4295,6 +4402,22 @@ test "Terminal: print multicodepoint grapheme, disabled mode 2027" {
     }
 
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+}
+
+test "Terminal: enabling grapheme mode handles stored breaks" {
+    var t = try init(testing.allocator, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, false);
+    try t.print('a');
+    try t.print(0x200B); // Zero width space is stored on the prior cell.
+
+    t.modes.set(.grapheme_cluster, true);
+    try t.print(0x0301);
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("a\xE2\x80\x8B\xCC\x81", str);
 }
 
 // Terminal.print receives one codepoint at a time, so it can't use
@@ -6771,8 +6894,11 @@ test "Terminal: insertLines simple" {
     try t.printString("GHI");
     t.setCursorPos(2, 2);
 
+    const node = t.screens.active.cursor.page_pin.node;
+    const serial = node.serial;
     t.clearDirty();
     t.insertLines(1);
+    try testing.expect(!t.screens.active.pages.nodeIsValid(node, serial));
 
     try testing.expect(!t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
@@ -6950,11 +7076,15 @@ test "Terminal: insertLines across page boundary marks all shifted rows dirty" {
     try t.printString("5EEEE");
 
     // Verify we now have a second page
-    try testing.expect(first_page.next != null);
+    const second_page = first_page.next.?;
+    const first_serial = first_page.serial;
+    const second_serial = second_page.serial;
 
     t.setCursorPos(1, 1);
     t.clearDirty();
     t.insertLines(1);
+    try testing.expect(!t.screens.active.pages.nodeIsValid(first_page, first_serial));
+    try testing.expect(!t.screens.active.pages.nodeIsValid(second_page, second_serial));
 
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
@@ -9658,8 +9788,11 @@ test "Terminal: deleteLines simple" {
     try t.printString("GHI");
     t.setCursorPos(2, 2);
 
+    const node = t.screens.active.cursor.page_pin.node;
+    const serial = node.serial;
     t.clearDirty();
     t.deleteLines(1);
+    try testing.expect(!t.screens.active.pages.nodeIsValid(node, serial));
 
     try testing.expect(!t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
@@ -9741,11 +9874,15 @@ test "Terminal: deleteLines across page boundary marks all shifted rows dirty" {
     try t.printString("5EEEE");
 
     // Verify we now have a second page
-    try testing.expect(first_page.next != null);
+    const second_page = first_page.next.?;
+    const first_serial = first_page.serial;
+    const second_serial = second_page.serial;
 
     t.setCursorPos(1, 1);
     t.clearDirty();
     t.deleteLines(1);
+    try testing.expect(!t.screens.active.pages.nodeIsValid(first_page, first_serial));
+    try testing.expect(!t.screens.active.pages.nodeIsValid(second_page, second_serial));
 
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
@@ -12491,13 +12628,6 @@ fn testPrintSliceDifferential(
             },
             15 => {
                 const v = rand.boolean();
-                // Erase the display first: grapheme clusters created
-                // while mode 2027 was off can trip a pre-existing
-                // debug assert in print()'s cluster walk when the mode
-                // is toggled on (unrelated to printSlice; it reproduces
-                // with per-codepoint print alone).
-                t1.eraseDisplay(.complete, false);
-                t2.eraseDisplay(.complete, false);
                 t1.modes.set(.grapheme_cluster, v);
                 t2.modes.set(.grapheme_cluster, v);
             },

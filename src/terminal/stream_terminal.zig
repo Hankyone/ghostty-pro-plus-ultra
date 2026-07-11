@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("terminal_options");
 const testing = std.testing;
 const apc = @import("apc.zig");
+const clipboard = @import("clipboard.zig");
 const csi = @import("csi.zig");
 const device_attributes = @import("device_attributes.zig");
 const device_status = @import("device_status.zig");
@@ -90,6 +91,20 @@ pub const Handler = struct {
         /// handler.terminal.getPwd().
         pwd_changed: ?*const fn (*Handler) void,
 
+        /// Called when the running program writes to a clipboard. The write
+        /// has a normalized destination and one or more decoded MIME
+        /// representations. All request, MIME, and data memory is borrowed
+        /// and only valid for the duration of the callback.
+        ///
+        /// A write with no contents clears the destination. A content entry
+        /// with empty data is a distinct empty representation.
+        ///
+        /// Clipboard read requests (OSC 52 with a "?" payload) are never
+        /// forwarded: answering one would let any program running in the
+        /// terminal silently read the user's clipboard, and a VT state
+        /// library has no way to mediate that with user consent.
+        clipboard_write: ?*const fn (*Handler, clipboard.Write) clipboard.WriteResult,
+
         /// Called in response to an XTVERSION query. Returns the version
         /// string to report (e.g. "ghostty 1.2.3"). The returned memory
         /// must be valid for the lifetime of the call. The maximum length
@@ -101,6 +116,7 @@ pub const Handler = struct {
         /// effects beyond that.
         pub const readonly: Effects = .{
             .bell = null,
+            .clipboard_write = null,
             .color_scheme = null,
             .device_attributes = null,
             .enquiry = null,
@@ -280,6 +296,7 @@ pub const Handler = struct {
             .window_title => self.windowTitle(value.title),
             .report_pwd => self.reportPwd(value.url),
             .xtversion => self.reportXtversion(),
+            .clipboard_contents => try self.clipboardContents(value.kind, value.data),
 
             // No supported DCS commands have any terminal-modifying effects,
             // but they may in the future. For now we just ignore it.
@@ -291,7 +308,6 @@ pub const Handler = struct {
             // Have no terminal-modifying effect
             .show_desktop_notification,
             .progress_report,
-            .clipboard_contents,
             .title_push,
             .title_pop,
             => {},
@@ -306,6 +322,44 @@ pub const Handler = struct {
     fn bell(self: *Handler) void {
         const func = self.effects.bell orelse return;
         func(self);
+    }
+
+    fn clipboardContents(self: *Handler, kind: u8, data: []const u8) !void {
+        const func = self.effects.clipboard_write orelse return;
+
+        // Read requests are deliberately not forwarded; see the effect docs.
+        if (data.len == 1 and data[0] == '?') return;
+
+        const location: clipboard.Location = switch (kind) {
+            's' => .selection,
+            'p' => .primary,
+            else => .standard,
+        };
+
+        // OSC 52 uses an empty payload to clear the selected clipboard.
+        if (data.len == 0) {
+            _ = func(self, .{
+                .location = location,
+                .contents = &.{},
+            });
+            return;
+        }
+
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = try decoder.calcSizeForSlice(data);
+        const alloc = self.terminal.gpa();
+        const decoded = try alloc.alloc(u8, decoded_len);
+        defer alloc.free(decoded);
+        try decoder.decode(decoded, data);
+
+        const contents = [_]clipboard.Content{.{
+            .mime = "text/plain",
+            .data = decoded,
+        }};
+        _ = func(self, .{
+            .location = location,
+            .contents = &contents,
+        });
     }
 
     fn reportDeviceAttributes(self: *Handler, req: device_attributes.Req) void {
@@ -1593,6 +1647,155 @@ test "bell effect callback" {
         s.nextSlice("\x07\x07");
         try testing.expectEqual(@as(usize, 3), S.bell_count);
     }
+}
+
+test "clipboard_write effect callback" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    // A null callback (the default readonly effects) silently ignores writes.
+    {
+        var s: Stream = .initAlloc(testing.allocator, .init(&t));
+        defer s.deinit();
+
+        s.nextSlice("\x1B]52;c;aGVsbG8=\x1B\\");
+
+        // Terminal should still be functional after the ignored sequence
+        s.nextSlice("AfterClipboard");
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("AfterClipboard", str);
+    }
+
+    t.fullReset();
+
+    const S = struct {
+        var count: usize = 0;
+        var result: clipboard.WriteResult = .success;
+        var last_location: clipboard.Location = .standard;
+        var last_contents_len: usize = 0;
+        var last_mime: ?[]u8 = null;
+        var last_data: ?[]u8 = null;
+
+        fn clearCapture() void {
+            if (last_mime) |value| testing.allocator.free(value);
+            if (last_data) |value| testing.allocator.free(value);
+            last_mime = null;
+            last_data = null;
+            last_contents_len = 0;
+        }
+
+        fn clipboardWrite(_: *Handler, write: clipboard.Write) clipboard.WriteResult {
+            clearCapture();
+            count += 1;
+            last_location = write.location;
+            last_contents_len = write.contents.len;
+            if (write.contents.len > 0) {
+                last_mime = testing.allocator.dupe(u8, write.contents[0].mime) catch
+                    @panic("failed to capture clipboard MIME type");
+                last_data = testing.allocator.dupe(u8, write.contents[0].data) catch
+                    @panic("failed to capture clipboard data");
+            }
+            return result;
+        }
+    };
+    S.count = 0;
+    S.result = .denied;
+    S.clearCapture();
+    defer S.clearCapture();
+
+    var handler: Handler = .init(&t);
+    handler.effects.clipboard_write = &S.clipboardWrite;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // Selectors are normalized and payloads are decoded before the callback.
+    const cases = [_]struct {
+        sequence: []const u8,
+        location: clipboard.Location,
+        data: []const u8,
+    }{
+        .{ .sequence = "\x1B]52;c;aGVsbG8=\x1B\\", .location = .standard, .data = "hello" },
+        .{ .sequence = "\x1B]52;s;d29ybGQ=\x07", .location = .selection, .data = "world" },
+        .{ .sequence = "\x1B]52;p;cHJpbWFyeQ==\x1B\\", .location = .primary, .data = "primary" },
+        .{ .sequence = "\x1B]52;0;Y3V0\x1B\\", .location = .standard, .data = "cut" },
+        .{ .sequence = "\x1B]52;x;ZmFsbGJhY2s=\x1B\\", .location = .standard, .data = "fallback" },
+        .{ .sequence = "\x1B]52;c;YQBi\x1B\\", .location = .standard, .data = "a\x00b" },
+    };
+
+    for (cases, 1..) |case, expected_count| {
+        s.nextSlice(case.sequence);
+        try testing.expectEqual(expected_count, S.count);
+        try testing.expectEqual(case.location, S.last_location);
+        try testing.expectEqual(@as(usize, 1), S.last_contents_len);
+        try testing.expectEqualStrings("text/plain", S.last_mime.?);
+        try testing.expectEqualSlices(u8, case.data, S.last_data.?);
+    }
+
+    // Empty data is a clear, represented by an empty contents slice.
+    s.nextSlice("\x1B]52;s;\x1B\\");
+    try testing.expectEqual(@as(usize, cases.len + 1), S.count);
+    try testing.expectEqual(clipboard.Location.selection, S.last_location);
+    try testing.expectEqual(@as(usize, 0), S.last_contents_len);
+    try testing.expect(S.last_mime == null);
+    try testing.expect(S.last_data == null);
+
+    // Reads and malformed base64 are ignored.
+    s.nextSlice("\x1B]52;c;?\x1B\\");
+    s.nextSlice("\x1B]52;c;***\x1B\\");
+    try testing.expectEqual(@as(usize, cases.len + 1), S.count);
+
+    // OSC 1337 Copy shares the normalized clipboard write path.
+    s.nextSlice("\x1B]1337;Copy=:aVRlcm0y\x1B\\");
+    try testing.expectEqual(@as(usize, cases.len + 2), S.count);
+    try testing.expectEqual(clipboard.Location.standard, S.last_location);
+    try testing.expectEqualStrings("text/plain", S.last_mime.?);
+    try testing.expectEqualStrings("iTerm2", S.last_data.?);
+
+    // Parsing across write boundaries still invokes exactly one atomic write.
+    s.nextSlice("\x1B]52;p;ZnJh");
+    s.nextSlice("Z21lbnRlZA==\x1B");
+    s.nextSlice("\\");
+    try testing.expectEqual(@as(usize, cases.len + 3), S.count);
+    try testing.expectEqual(clipboard.Location.primary, S.last_location);
+    try testing.expectEqualStrings("text/plain", S.last_mime.?);
+    try testing.expectEqualStrings("fragmented", S.last_data.?);
+
+    // Callback results are intentionally ignored for protocols without a
+    // write acknowledgement. The denied result above did not stop later writes.
+    try testing.expectEqual(clipboard.WriteResult.denied, S.result);
+}
+
+test "clipboard_write allocation failure is ignored" {
+    var t: Terminal = try .init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var count: usize = 0;
+
+        fn clipboardWrite(_: *Handler, _: clipboard.Write) clipboard.WriteResult {
+            count += 1;
+            return .success;
+        }
+    };
+    S.count = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.clipboard_write = &S.clipboardWrite;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // Only the decoded scratch data uses the terminal allocator here. Swap in
+    // an allocator that always fails, then restore it before terminal teardown.
+    {
+        const alloc = t.screens.active.alloc;
+        t.screens.active.alloc = testing.failing_allocator;
+        defer t.screens.active.alloc = alloc;
+        s.nextSlice("\x1B]52;c;aGVsbG8=\x1B\\");
+    }
+    try testing.expectEqual(@as(usize, 0), S.count);
 }
 
 test "request mode DECRQM with write_pty callback" {

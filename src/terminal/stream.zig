@@ -793,6 +793,18 @@ pub fn Stream(comptime H: type) type {
             assert(self.parser.state == .sos_pm_apc_string);
 
             var end: usize = 0;
+            if (comptime std.simd.suggestVectorLength(u8)) |vector_len| {
+                const ByteVector = @Vector(vector_len, u8);
+                while (end + vector_len <= input.len) {
+                    const bytes: ByteVector = input[end..][0..vector_len].*;
+                    const invalid = (bytes == @as(ByteVector, @splat(0x18))) |
+                        (bytes == @as(ByteVector, @splat(0x1A))) |
+                        (bytes == @as(ByteVector, @splat(0x1B))) |
+                        (bytes >= @as(ByteVector, @splat(0x80)));
+                    if (@reduce(.Or, invalid)) break;
+                    end += vector_len;
+                }
+            }
             while (end < input.len) {
                 switch (input[end]) {
                     // Not apc_put bytes: CAN/SUB/ESC and most C1 exit
@@ -3899,11 +3911,14 @@ test "stream: apc aborted by CAN" {
     // CAN (0x18) aborts the APC string via the anywhere => ground
     // transition. Exiting the sos_pm_apc_string state emits apc_end,
     // and the trailing bytes are printed, not treated as APC data.
-    s.nextSlice("\x1b_Gabc\x18def");
+    s.nextSlice("\x1b_Gabcdefghijklmnopqrstuvwxyz0123456789\x18def");
 
     try testing.expectEqual(@as(usize, 1), s.handler.started);
     try testing.expectEqual(@as(usize, 1), s.handler.ended);
-    try testing.expectEqualStrings("Gabc", s.handler.buf[0..s.handler.len]);
+    try testing.expectEqualStrings(
+        "Gabcdefghijklmnopqrstuvwxyz0123456789",
+        s.handler.buf[0..s.handler.len],
+    );
 }
 
 test "stream: apc scalar path matches" {
@@ -3916,4 +3931,30 @@ test "stream: apc scalar path matches" {
         "Gf=24;aGVsbG8=",
         s.handler.buf[0..s.handler.len],
     );
+}
+
+test "stream: apc vector boundaries match scalar path" {
+    const positions = [_]usize{ 15, 16, 17, 31, 32, 33, 63, 64, 65 };
+    const controls = [_]u8{ 0x18, 0x1A, 0x1B, 0x80, 0xFF };
+
+    for (positions) |position| for (controls) |control| {
+        var input: [96]u8 = undefined;
+        input[0..3].* = "\x1b_G".*;
+        @memset(input[3 .. 3 + position], 'a');
+        input[3 + position] = control;
+        input[4 + position] = '\\';
+        const bytes = input[0 .. 5 + position];
+
+        var bulk: Stream(ApcTestHandler) = .init(.{});
+        bulk.nextSlice(bytes);
+        var scalar: Stream(ApcTestHandler) = .init(.{});
+        for (bytes) |byte| scalar.next(byte);
+
+        try testing.expectEqual(scalar.handler.started, bulk.handler.started);
+        try testing.expectEqual(scalar.handler.ended, bulk.handler.ended);
+        try testing.expectEqualStrings(
+            scalar.handler.buf[0..scalar.handler.len],
+            bulk.handler.buf[0..bulk.handler.len],
+        );
+    };
 }
