@@ -2642,60 +2642,19 @@ pub fn insertLines(self: *Terminal, count: usize) void {
             // If our page doesn't match, then we need to do a copy from
             // one page to another. This is the slow path.
             if (src_p.node != dst_p.node) {
-                dst_p.node.page().clonePartialRowFrom(
+                // The copy may replace the destination node in order
+                // to increase its capacity. Our pins are tracked so
+                // they update automatically; we can discard the
+                // replacement because the remainder of this iteration
+                // only accesses rows through the pins.
+                _ = self.screens.active.clonePartialRowGrowCapacity(
+                    dst_p.node,
+                    dst_p.y,
                     src_p.node.page(),
-                    dst_row,
                     src_row,
                     self.scrolling_region.left,
                     self.scrolling_region.right + 1,
-                ) catch |err| {
-                    // Adjust our page capacity to make
-                    // room for we didn't have space for
-                    _ = self.screens.active.increaseCapacity(
-                        dst_p.node,
-                        switch (err) {
-                            // Rehash the sets
-                            error.StyleSetNeedsRehash,
-                            error.HyperlinkSetNeedsRehash,
-                            => null,
-
-                            // Increase style memory
-                            error.StyleSetOutOfMemory,
-                            => .styles,
-
-                            // Increase string memory
-                            error.StringAllocOutOfMemory,
-                            => .string_bytes,
-
-                            // Increase hyperlink memory
-                            error.HyperlinkSetOutOfMemory,
-                            error.HyperlinkMapOutOfMemory,
-                            => .hyperlink_bytes,
-
-                            // Increase grapheme memory
-                            error.GraphemeMapOutOfMemory,
-                            error.GraphemeAllocOutOfMemory,
-                            => .grapheme_bytes,
-                        },
-                    ) catch |e| switch (e) {
-                        // System OOM. We have no way to recover from this
-                        // currently. We should probably change insertLines
-                        // to raise an error here.
-                        error.OutOfMemory,
-                        => @panic("increaseCapacity system allocator OOM"),
-
-                        // The page can't accommodate the managed memory required
-                        // for this operation. We previously just corrupted
-                        // memory here so a crash is better. The right long
-                        // term solution is to allocate a new page here
-                        // move this row to the new page, and start over.
-                        error.OutOfSpace,
-                        => @panic("increaseCapacity OutOfSpace"),
-                    };
-
-                    // Continue the loop to try handling this row again.
-                    continue;
-                };
+                );
             } else {
                 if (!left_right) {
                     // Swap the src/dst cells. This ensures that our dst gets the
@@ -2843,53 +2802,19 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
             // If our page doesn't match, then we need to do a copy from
             // one page to another. This is the slow path.
             if (src_p.node != dst_p.node) {
-                dst_p.node.page().clonePartialRowFrom(
+                // The copy may replace the destination node in order
+                // to increase its capacity. Our pins are tracked so
+                // they update automatically; we can discard the
+                // replacement because the remainder of this iteration
+                // only accesses rows through the pins.
+                _ = self.screens.active.clonePartialRowGrowCapacity(
+                    dst_p.node,
+                    dst_p.y,
                     src_p.node.page(),
-                    dst_row,
                     src_row,
                     self.scrolling_region.left,
                     self.scrolling_region.right + 1,
-                ) catch |err| {
-                    // Adjust our page capacity to make
-                    // room for we didn't have space for
-                    _ = self.screens.active.increaseCapacity(
-                        dst_p.node,
-                        switch (err) {
-                            // Rehash the sets
-                            error.StyleSetNeedsRehash,
-                            error.HyperlinkSetNeedsRehash,
-                            => null,
-
-                            // Increase style memory
-                            error.StyleSetOutOfMemory,
-                            => .styles,
-
-                            // Increase string memory
-                            error.StringAllocOutOfMemory,
-                            => .string_bytes,
-
-                            // Increase hyperlink memory
-                            error.HyperlinkSetOutOfMemory,
-                            error.HyperlinkMapOutOfMemory,
-                            => .hyperlink_bytes,
-
-                            // Increase grapheme memory
-                            error.GraphemeMapOutOfMemory,
-                            error.GraphemeAllocOutOfMemory,
-                            => .grapheme_bytes,
-                        },
-                    ) catch |e| switch (e) {
-                        // See insertLines
-                        error.OutOfMemory,
-                        => @panic("increaseCapacity system allocator OOM"),
-
-                        error.OutOfSpace,
-                        => @panic("increaseCapacity OutOfSpace"),
-                    };
-
-                    // Continue the loop to try handling this row again.
-                    continue;
-                };
+                );
             } else {
                 if (!left_right) {
                     // Swap the src/dst cells. This ensures that our dst gets the
@@ -7606,6 +7531,91 @@ test "Terminal: insertLines across page boundary marks all shifted rows dirty" {
     }
 }
 
+test "Terminal: insertLines hyperlink-dense row crosses page boundary" {
+    // Regression test for the cross-page copy of insertLines: when the
+    // shifted row carries more unique hyperlinks than the destination
+    // page's hyperlink capacity, the copy must increase the destination
+    // page's capacity and retry rather than corrupting the page list.
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 1024 });
+    defer t.deinit(alloc);
+
+    const pages = &t.screens.active.pages;
+
+    // Fill the first page so it is exactly full, then two more rows so
+    // the second page holds the last two active rows (y=3 and y=4).
+    const first_page_rows = pages.pages.first.?.capacity().rows;
+    for (0..first_page_rows + 1) |_| try t.linefeed();
+    try testing.expect(pages.pages.first != pages.pages.last);
+    try testing.expectEqual(@as(usize, 2), pages.pages.last.?.rows());
+
+    // Marker rows so we can verify the shift afterwards.
+    t.setCursorPos(1, 1);
+    try t.printString("0");
+    t.setCursorPos(2, 1);
+    try t.printString("1");
+    t.setCursorPos(4, 1);
+    try t.printString("3");
+    t.setCursorPos(5, 1);
+    try t.printString("4");
+
+    // Fill the last row of the first page (active y=2) with unique
+    // hyperlinks: more than the second page can hold with its default
+    // hyperlink capacity. Writing them grows the first page's capacity
+    // as needed; the second page keeps its default capacity.
+    t.setCursorPos(3, 1);
+    for (0..10) |i| {
+        var buf: [64]u8 = undefined;
+        const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{i});
+        try t.screens.active.startHyperlink(uri, null);
+        try t.print(@intCast('A' + i));
+        t.screens.active.endHyperlink();
+    }
+    {
+        const pin = pages.pin(.{ .active = .{ .y = 2 } }).?;
+        try testing.expectEqual(pages.pages.first.?, pin.node);
+        try testing.expectEqual(pin.node.rows() - 1, @as(usize, pin.y));
+    }
+    try testing.expect(pages.pages.last.?.page().hyperlink_set.layout.cap < 10);
+
+    // Insert a line at the top: every row shifts down by one and the
+    // dense row crosses the page boundary into the second page.
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("\n0\n1\nABCDEFGHIJ\n3", str);
+    }
+
+    // The second page's hyperlink capacity had to grow to receive the
+    // row, proving the capacity-retry path ran.
+    try testing.expect(pages.pages.last.?.page().hyperlink_set.layout.cap >= 10);
+
+    // Every cell of the dense row must still resolve to a real
+    // hyperlink entry with the correct URI. A half-applied shift
+    // leaves cells whose hyperlink flag is set but that have no map
+    // entry, which aborts in clearCells later.
+    for (0..10) |x| {
+        const list_cell = pages.getCell(.{ .active = .{
+            .x = @intCast(x),
+            .y = 3,
+        } }).?;
+        try testing.expect(list_cell.cell.hyperlink);
+        const page: *Page = list_cell.node.page();
+        const id = page.lookupHyperlink(list_cell.cell).?;
+        const link = page.hyperlink_set.get(page.memory, id);
+        var buf: [64]u8 = undefined;
+        const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
+        try testing.expectEqualStrings(uri, link.uri.slice(page.memory));
+    }
+
+    // All pages must pass integrity checks.
+    var node_: ?*PageList.List.Node = pages.pages.first;
+    while (node_) |node| : (node_ = node.next) node.page().assertIntegrity();
+}
+
 test "Terminal: insertLines (legacy test)" {
     const alloc = testing.allocator;
     var t = try init(alloc, .{ .cols = 2, .rows = 5 });
@@ -10402,6 +10412,96 @@ test "Terminal: deleteLines across page boundary marks all shifted rows dirty" {
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("2BBBB\n3CCCC\n4DDDD\n5EEEE", str);
     }
+}
+
+test "Terminal: deleteLines hyperlink-dense row crosses page boundary" {
+    // Regression test for the cross-page copy of deleteLines: when the
+    // shifted row carries more unique hyperlinks than the destination
+    // page's hyperlink capacity, the copy must increase the destination
+    // page's capacity and retry rather than corrupting the page list.
+    //
+    // This is the mirror of the insertLines variant: the dense row
+    // starts as the first row of the second page and is pulled up into
+    // the first page, which also happens to be the cursor's page so
+    // this exercises the cursor accounting of the capacity increase.
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .rows = 5, .cols = 10, .max_scrollback = 1024 });
+    defer t.deinit(alloc);
+
+    const pages = &t.screens.active.pages;
+
+    // Fill the first page so it is exactly full, then two more rows so
+    // the second page holds the last two active rows (y=3 and y=4).
+    const first_page_rows = pages.pages.first.?.capacity().rows;
+    for (0..first_page_rows + 1) |_| try t.linefeed();
+    try testing.expect(pages.pages.first != pages.pages.last);
+    try testing.expectEqual(@as(usize, 2), pages.pages.last.?.rows());
+
+    // Marker rows so we can verify the shift afterwards.
+    t.setCursorPos(1, 1);
+    try t.printString("0");
+    t.setCursorPos(2, 1);
+    try t.printString("1");
+    t.setCursorPos(3, 1);
+    try t.printString("2");
+    t.setCursorPos(5, 1);
+    try t.printString("4");
+
+    // Fill the first row of the second page (active y=3) with unique
+    // hyperlinks: more than the first page can hold with its default
+    // hyperlink capacity. Writing them grows the second page's
+    // capacity as needed; the first page keeps its default capacity.
+    t.setCursorPos(4, 1);
+    for (0..10) |i| {
+        var buf: [64]u8 = undefined;
+        const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{i});
+        try t.screens.active.startHyperlink(uri, null);
+        try t.print(@intCast('A' + i));
+        t.screens.active.endHyperlink();
+    }
+    {
+        const pin = pages.pin(.{ .active = .{ .y = 3 } }).?;
+        try testing.expectEqual(pages.pages.last.?, pin.node);
+        try testing.expectEqual(@as(usize, 0), @as(usize, pin.y));
+    }
+    try testing.expect(pages.pages.first.?.page().hyperlink_set.layout.cap < 10);
+
+    // Delete the top line: every row shifts up by one and the dense
+    // row crosses the page boundary into the first page.
+    t.setCursorPos(1, 1);
+    t.deleteLines(1);
+
+    {
+        const str = try t.plainString(testing.allocator);
+        defer testing.allocator.free(str);
+        try testing.expectEqualStrings("1\n2\nABCDEFGHIJ\n4", str);
+    }
+
+    // The first page's hyperlink capacity had to grow to receive the
+    // row, proving the capacity-retry path ran.
+    try testing.expect(pages.pages.first.?.page().hyperlink_set.layout.cap >= 10);
+
+    // Every cell of the dense row must still resolve to a real
+    // hyperlink entry with the correct URI. A half-applied shift
+    // leaves cells whose hyperlink flag is set but that have no map
+    // entry, which aborts in clearCells later.
+    for (0..10) |x| {
+        const list_cell = pages.getCell(.{ .active = .{
+            .x = @intCast(x),
+            .y = 2,
+        } }).?;
+        try testing.expect(list_cell.cell.hyperlink);
+        const page: *Page = list_cell.node.page();
+        const id = page.lookupHyperlink(list_cell.cell).?;
+        const link = page.hyperlink_set.get(page.memory, id);
+        var buf: [64]u8 = undefined;
+        const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
+        try testing.expectEqualStrings(uri, link.uri.slice(page.memory));
+    }
+
+    // All pages must pass integrity checks.
+    var node_: ?*PageList.List.Node = pages.pages.first;
+    while (node_) |node| : (node_ = node.next) node.page().assertIntegrity();
 }
 
 test "Terminal: deleteLines (legacy)" {
