@@ -296,8 +296,8 @@ private struct ProjectSection: View {
                     theme: theme,
                     isCollapsed: isCollapsed,
                     isHovered: hoveredGroupID == group.id,
-                    onNewTab: { tool in
-                        tabManager.createNewTab(tool: tool, projectRoot: group.projectRoot)
+                    onNewTab: { agent in
+                        tabManager.createNewTab(agent: agent, projectRoot: group.projectRoot)
                     },
                     onGitCommit: group.projectRoot != nil ? {
                         tabManager.gitCommit(projectRoot: group.projectRoot!)
@@ -605,7 +605,9 @@ private struct ProjectHeader: View {
     let theme: SidebarTheme
     let isCollapsed: Bool
     let isHovered: Bool
-    var onNewTab: ((SidebarTabManager.SidebarTool) -> Void)? = nil
+    /// Called to open a new tab. A nil agent opens a plain terminal.
+    var onNewTab: ((SidebarTabManager.AgentType?) -> Void)? = nil
+    @ObservedObject private var agentDetector = AgentDetector.shared
     var onGitCommit: (() -> Void)? = nil
     var onGitPush: (() -> Void)? = nil
     var onGitCommitAndPush: (() -> Void)? = nil
@@ -680,22 +682,25 @@ private struct ProjectHeader: View {
                 Menu {
                     // Terminal — standalone option
                     Button {
-                        onNewTab(.terminal)
+                        onNewTab(nil)
                     } label: {
                         Label("Terminal", systemImage: "terminal")
                             .labelStyle(.titleAndIcon)
                     }
 
-                    Divider()
-
-                    // Coding agents
-                    ForEach(SidebarTabManager.SidebarTool.allCases.filter { $0 != .terminal }, id: \.self) { tool in
-                        Button {
-                            onNewTab(tool)
-                        } label: {
-                            HStack(spacing: 6) {
-                                SidebarToolMenuIcon(tool: tool)
-                                Text(tool.rawValue)
+                    // Coding agents — only the ones actually installed.
+                    let installedAgents = SidebarTabManager.AgentType.allCases
+                        .filter { agentDetector.installed.contains($0) }
+                    if !installedAgents.isEmpty {
+                        Divider()
+                        ForEach(installedAgents, id: \.self) { agent in
+                            Button {
+                                onNewTab(agent)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    AgentMenuIcon(agent: agent)
+                                    Text(agent.displayName)
+                                }
                             }
                         }
                     }
@@ -768,20 +773,20 @@ private struct ProjectHeader: View {
     }
 }
 
-private struct SidebarToolMenuIcon: View {
-    let tool: SidebarTabManager.SidebarTool
+private struct AgentMenuIcon: View {
+    let agent: SidebarTabManager.AgentType
 
     var body: some View {
         Group {
-            if tool.isCustomIcon {
-                Image(tool.icon)
+            if agent.isCustomIcon {
+                Image(agent.icon)
                     .resizable()
                     .interpolation(.high)
                     .scaledToFit()
                     .frame(width: 14, height: 14)
                     .fixedSize(horizontal: true, vertical: true)
             } else {
-                Image(systemName: tool.icon)
+                Image(systemName: agent.icon)
                     .font(.system(size: 14, weight: .medium))
             }
         }

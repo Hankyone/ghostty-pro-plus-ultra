@@ -217,6 +217,10 @@ class AppDelegate: NSObject,
         // before any surface spawns so GHOSTTY_AGENT_SHIM_DIR is available.
         AgentShimInstaller.install()
 
+        // Detect which agent CLIs are installed so the new-tab menu shows only
+        // launchable agents. Runs off-main; force past the throttle at launch.
+        AgentDetector.shared.refresh(force: true)
+
         // Force-load persisted tab metadata so it's available during window restoration.
         _ = TabMetadataStore.shared
     }

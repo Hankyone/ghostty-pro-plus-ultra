@@ -217,58 +217,19 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
         // Detect which agent was running from its session key.
         // Session keys are mutually exclusive, so at most one will be present.
-        let agent: SidebarTabManager.AgentType?
-        let sessionId: String
-
-        if let entry = entries["codex-session"], !entry.value.isEmpty {
-            agent = .codex
-            sessionId = entry.value
-        } else if let entry = entries["claude-session"], !entry.value.isEmpty {
-            agent = .claude
-            sessionId = entry.value
-        } else if let entry = entries["grok-session"], !entry.value.isEmpty {
-            agent = .grok
-            sessionId = entry.value
-        } else if let entry = entries["devin-session"], !entry.value.isEmpty {
-            agent = .devin
-            sessionId = entry.value
-        } else if let entry = entries["cursor-session"], !entry.value.isEmpty {
-            agent = .cursor
-            sessionId = entry.value
-        } else {
-            return
+        var detected: (agent: SidebarTabManager.AgentType, sessionId: String)?
+        for agent in SidebarTabManager.AgentType.allCases {
+            if let entry = entries[agent.sessionKey], !entry.value.isEmpty {
+                detected = (agent, entry.value)
+                break
+            }
         }
+        guard let (agent, sessionId) = detected else { return }
 
-        // Build the resume command for the detected agent.
-        // All agents run with full permissions on resume.
-        let command: String
-        switch agent {
-        case .codex:
-            // Validate session ID format (alphanumeric + hyphens only) to prevent injection.
-            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-            guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
-            command = "codex resume \(sessionId) --dangerously-bypass-approvals-and-sandbox"
-        case .claude:
-            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-            guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
-            command = "claude --resume \(sessionId) --dangerously-skip-permissions"
-        case .grok:
-            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-            guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
-            command = "grok --resume \(sessionId) --permission-mode bypassPermissions"
-        case .devin:
-            // Devin doesn't expose session_id in hooks, so we stored "devin" as
-            // a placeholder. Launch the interactive session picker instead.
-            command = "devin -r --permission-mode dangerous"
-        case .cursor:
-            // Cursor uses conversation_id as the session identifier.
-            // `cursor-agent --resume <id>` resumes a specific conversation.
-            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
-            guard sessionId.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return }
-            command = "cursor-agent --resume \(sessionId) --yolo"
-        case .none:
-            return
-        }
+        // Build the resume command for the detected agent (runs with full
+        // permissions). Returns nil if the agent can't resume or the stored
+        // session id fails the injection-safety check.
+        guard let command = agent.resumeCommand(sessionId: sessionId) else { return }
 
         // Don't clear session keys here. They persist so that if the app is
         // force-killed before the resume completes, the next restart will

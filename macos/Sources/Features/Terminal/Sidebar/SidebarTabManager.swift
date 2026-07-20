@@ -331,57 +331,125 @@ class SidebarTabManager: ObservableObject {
 
     // MARK: - Tool Launch
 
-    /// The CLI tools that can be auto-launched in a new tab.
-    enum SidebarTool: String, CaseIterable {
-        case terminal = "Terminal"
-        case claudeCode = "Claude Code"
-        case codex = "Codex"
-        case grok = "Grok Build"
-        case devin = "Devin"
-        case cursor = "Cursor"
-        case antigravity = "Antigravity"
-
-        var icon: String {
-            switch self {
-            case .terminal: return "terminal"
-            case .claudeCode: return "ClaudeIcon"
-            case .codex: return "CodexIcon"
-            case .grok: return "GrokIcon"
-            case .devin: return "DevinIcon"
-            case .cursor: return "CursorIcon"
-            case .antigravity: return "AntigravityIcon"
-            }
-        }
-
-        var isCustomIcon: Bool {
-            switch self {
-            case .terminal: return false
-            case .claudeCode, .codex, .grok, .devin, .cursor, .antigravity: return true
-            }
-        }
-
-        /// The shell command to launch this tool.
-        var launchCommand: String? {
-            switch self {
-            case .terminal: return nil
-            case .claudeCode: return "claude --dangerously-skip-permissions"
-            case .codex: return "codex --dangerously-bypass-approvals-and-sandbox"
-            case .grok: return "grok --permission-mode bypassPermissions"
-            case .devin: return "devin --permission-mode dangerous"
-            case .cursor: return "cursor-agent --yolo"
-            case .antigravity: return "agy --dangerously-skip-permissions"
-            }
-        }
-    }
-
-    /// Represents an AI agent that can be tracked in the sidebar.
-    /// Each agent has a set of status keys used by its hook script.
+    /// Represents a coding agent the sidebar knows about — the single source
+    /// of truth for both the new-tab menu and status/session tracking.
+    ///
+    /// To add an agent, add a case here and fill in the switches below; the
+    /// menu, installed-detection, launch, resume, status keys, transient-key
+    /// filtering and stale-session sweep all derive from `allCases`.
+    ///
+    /// `rawValue` is the internal key prefix used by the hook IPC protocol
+    /// (e.g. `claude-session`) and must stay stable — it is NOT the display
+    /// name and NOT necessarily the binary name.
     enum AgentType: String, CaseIterable {
         case claude
         case codex
         case grok
         case devin
         case cursor
+        case antigravity
+        case cline
+
+        /// Human-facing name shown in the new-tab menu.
+        var displayName: String {
+            switch self {
+            case .claude: return "Claude Code"
+            case .codex: return "Codex"
+            case .grok: return "Grok Build"
+            case .devin: return "Devin"
+            case .cursor: return "Cursor"
+            case .antigravity: return "Antigravity"
+            case .cline: return "Cline"
+            }
+        }
+
+        /// The executable name to look for on the user's PATH. This can differ
+        /// from both the display name and the rawValue key prefix.
+        var binaryName: String {
+            switch self {
+            case .claude: return "claude"
+            case .codex: return "codex"
+            case .grok: return "grok"
+            case .devin: return "devin"
+            case .cursor: return "cursor-agent"
+            case .antigravity: return "agy"
+            case .cline: return "cline"
+            }
+        }
+
+        /// Menu icon: an asset-catalog image name when `isCustomIcon`, else an
+        /// SF Symbol name.
+        var icon: String {
+            switch self {
+            case .claude: return "ClaudeIcon"
+            case .codex: return "CodexIcon"
+            case .grok: return "GrokIcon"
+            case .devin: return "DevinIcon"
+            case .cursor: return "CursorIcon"
+            case .antigravity: return "AntigravityIcon"
+            // No bundled Cline logo yet — fall back to an SF Symbol until a
+            // ClineIcon asset is added.
+            case .cline: return "chevron.left.forwardslash.chevron.right"
+            }
+        }
+
+        var isCustomIcon: Bool {
+            switch self {
+            case .cline: return false
+            case .claude, .codex, .grok, .devin, .cursor, .antigravity: return true
+            }
+        }
+
+        /// Flags that launch the agent with permissions fully bypassed (yolo).
+        private var permissionFlags: String {
+            switch self {
+            case .claude: return "--dangerously-skip-permissions"
+            case .codex: return "--dangerously-bypass-approvals-and-sandbox"
+            case .grok: return "--permission-mode bypassPermissions"
+            case .devin: return "--permission-mode dangerous"
+            case .cursor: return "--yolo"
+            case .antigravity: return "--dangerously-skip-permissions"
+            // Cline needs -i for its interactive TUI (bare `cline` runs a
+            // single non-interactive prompt); auto-approve is on by default
+            // but we pass it explicitly to be safe.
+            case .cline: return "-i --auto-approve true"
+            }
+        }
+
+        /// The shell command to launch a fresh session of this agent.
+        var launchCommand: String {
+            "\(binaryName) \(permissionFlags)"
+        }
+
+        /// The shell command to resume a prior session, or nil if resume isn't
+        /// supported. `sessionId` is the stored value of `sessionKey`.
+        func resumeCommand(sessionId: String) -> String? {
+            // Guard against command injection: session ids are typed straight
+            // into the shell, so only allow a safe charset.
+            let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+            let idIsSafe = sessionId.unicodeScalars.allSatisfy { allowed.contains($0) }
+            switch self {
+            case .claude:
+                guard idIsSafe else { return nil }
+                return "claude --resume \(sessionId) \(permissionFlags)"
+            case .codex:
+                guard idIsSafe else { return nil }
+                return "codex resume \(sessionId) \(permissionFlags)"
+            case .grok:
+                guard idIsSafe else { return nil }
+                return "grok --resume \(sessionId) \(permissionFlags)"
+            case .cursor:
+                guard idIsSafe else { return nil }
+                return "cursor-agent --resume \(sessionId) \(permissionFlags)"
+            case .devin:
+                // Devin exposes no session id in hooks, so there's nothing to
+                // validate — launch its interactive session picker instead.
+                return "devin -r \(permissionFlags)"
+            case .antigravity, .cline:
+                // No hook-provided session id / resume support yet.
+                return nil
+            }
+        }
 
         /// The session key (e.g. "claude-session"). Presence of this key
         /// indicates the tab is running this agent.
@@ -411,8 +479,9 @@ class SidebarTabManager: ObservableObject {
         }
     }
 
-    /// Create a new tab, optionally in a project directory and/or running a tool.
-    func createNewTab(tool: SidebarTool = .terminal, projectRoot: String? = nil) {
+    /// Create a new tab, optionally in a project directory and/or running an
+    /// agent. A nil `agent` opens a plain terminal.
+    func createNewTab(agent: AgentType? = nil, projectRoot: String? = nil) {
         guard let window,
               let controller = window.windowController as? TerminalController else {
             // Fallback: create a generic new tab
@@ -424,10 +493,10 @@ class SidebarTabManager: ObservableObject {
         if let root = projectRoot {
             config.workingDirectory = root
         }
-        // Set the tool command as initialInput — this is fed directly into
+        // Set the agent command as initialInput — this is fed directly into
         // the PTY as stdin data, so the shell reads and executes it as if
         // the user typed it and pressed Enter.
-        if let command = tool.launchCommand {
+        if let command = agent?.launchCommand {
             config.initialInput = command + "\n"
         }
 

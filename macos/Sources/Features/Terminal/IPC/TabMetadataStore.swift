@@ -26,14 +26,16 @@ final class TabMetadataStore: ObservableObject {
     var acknowledgedDoneToken: [UUID: String] = [:]
 
     /// Keys that are transient and should not be persisted to disk.
-    private static let transientKeys: Set<String> = [
-        "claude-pid", "claude-active", "claude-done-at",
-        "codex-pid", "codex-active", "codex-done-at",
-        "grok-pid", "grok-active", "grok-done-at",
-        "devin-pid", "devin-active", "devin-done-at",
-        "cursor-pid", "cursor-active", "cursor-done-at",
-        "process-running", "command-failed",
-    ]
+    /// Derived from the agent roster so new agents are covered automatically.
+    private static let transientKeys: Set<String> = {
+        var keys: Set<String> = ["process-running", "command-failed"]
+        for agent in SidebarTabManager.AgentType.allCases {
+            keys.insert(agent.pidKey)
+            keys.insert(agent.activeKey)
+            keys.insert(agent.doneAtKey)
+        }
+        return keys
+    }()
 
     private var pendingSave: DispatchWorkItem?
 
@@ -43,10 +45,9 @@ final class TabMetadataStore: ObservableObject {
 
     /// Session keys that are mutually exclusive — setting one clears all others.
     /// A tab can only run one agent at a time.
-    private static let allSessionKeys: Set<String> = [
-        "claude-session", "codex-session", "grok-session", "devin-session",
-        "cursor-session",
-    ]
+    private static let allSessionKeys: Set<String> = {
+        Set(SidebarTabManager.AgentType.allCases.map { $0.sessionKey })
+    }()
 
     func setStatus(tabId: UUID, key: String, value: String, icon: String? = nil) {
         if entries[tabId] == nil {
@@ -89,7 +90,7 @@ final class TabMetadataStore: ObservableObject {
     /// Called periodically from SidebarTabManager.
     func sweepStaleSessions() {
         // Agent name prefixes whose transient keys should be swept
-        let agentPrefixes = ["claude", "codex", "grok", "devin", "cursor"]
+        let agentPrefixes = SidebarTabManager.AgentType.allCases.map { $0.rawValue }
         for (tabId, tabEntries) in entries {
             for prefix in agentPrefixes {
                 let pidKey = "\(prefix)-pid"
