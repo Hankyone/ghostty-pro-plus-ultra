@@ -362,6 +362,9 @@ extension Notification.Name {
 
     /// A desktop notification was fired for a surface (OSC 9/99 or command completion)
     static let ghosttyDesktopNotificationDidFire = Notification.Name("com.mitchellh.ghostty.desktopNotificationDidFire")
+    /// userInfo keys carrying the notification's title and body text.
+    static let ghosttyDesktopNotificationTitleKey = ghosttyDesktopNotificationDidFire.rawValue + ".title"
+    static let ghosttyDesktopNotificationBodyKey = ghosttyDesktopNotificationDidFire.rawValue + ".body"
 
     /// An IPC notification was received (tab.notify command). Object is the target NSWindow.
     static let ghosttyIPCNotification = Notification.Name("com.mitchellh.ghostty.ipcNotification")

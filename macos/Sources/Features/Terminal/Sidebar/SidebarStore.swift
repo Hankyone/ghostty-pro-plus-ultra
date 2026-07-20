@@ -127,22 +127,37 @@ final class SidebarStore {
             }
         })
 
-        // Desktop notifications (OSC 9/99, command completion): always trigger attention.
+        // Desktop notifications (OSC 9/99, command completion): always trigger
+        // attention, and remember the message text so the tab row can show it
+        // (e.g. Devin's "Devin finished ..." — same source cmux displays).
         observers.append(center.addObserver(
             forName: .ghosttyDesktopNotificationDidFire, object: nil, queue: .main
         ) { [weak self] notification in
             guard let self,
                   let surfaceView = notification.object as? Ghostty.SurfaceView,
                   let w = surfaceView.window else { return }
+            let title = notification.userInfo?[Notification.Name.ghosttyDesktopNotificationTitleKey] as? String ?? ""
+            let body = notification.userInfo?[Notification.Name.ghosttyDesktopNotificationBodyKey] as? String ?? ""
+            let text = (body.isEmpty ? title : body).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                self.notificationTexts[ObjectIdentifier(w)] = text
+            }
             self.markAttention(window: w)
         })
 
-        // IPC notifications (tab.notify command): trigger attention.
+        // IPC notifications (tab.notify command): trigger attention and
+        // surface the message text like desktop notifications above.
         observers.append(center.addObserver(
             forName: .ghosttyIPCNotification, object: nil, queue: .main
         ) { [weak self] notification in
             guard let self,
                   let w = notification.object as? NSWindow else { return }
+            let title = notification.userInfo?[Notification.Name.ghosttyDesktopNotificationTitleKey] as? String ?? ""
+            let body = notification.userInfo?[Notification.Name.ghosttyDesktopNotificationBodyKey] as? String ?? ""
+            let text = (body.isEmpty ? title : body).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty, text != "Ghostty" {
+                self.notificationTexts[ObjectIdentifier(w)] = text
+            }
             self.markAttention(window: w)
         })
     }
@@ -152,12 +167,17 @@ final class SidebarStore {
     /// Windows that need attention, cleared when the tab is selected.
     private(set) var attentionWindows: Set<ObjectIdentifier> = []
 
+    /// Latest desktop-notification text per window, shown as a subtitle on the
+    /// tab row until the user selects the tab (cmux-style).
+    private(set) var notificationTexts: [ObjectIdentifier: String] = [:]
+
     private func markAttention(window w: NSWindow) {
         attentionWindows.insert(ObjectIdentifier(w))
         requestRefresh(reason: "attention set", force: true)
     }
 
     private func clearAttention(window w: NSWindow) {
+        notificationTexts.removeValue(forKey: ObjectIdentifier(w))
         guard attentionWindows.remove(ObjectIdentifier(w)) != nil else { return }
         requestRefresh(reason: "attention cleared", force: true)
     }
@@ -165,6 +185,7 @@ final class SidebarStore {
     /// Called by managers when the user selects a tab.
     func clearAttentionOnSelect(windowID: ObjectIdentifier) {
         attentionWindows.remove(windowID)
+        notificationTexts.removeValue(forKey: windowID)
     }
 
     // MARK: - Refresh Scheduling
@@ -298,6 +319,7 @@ final class SidebarStore {
             for window in windows {
                 hasher.combine(ObjectIdentifier(window))
                 hasher.combine(window.title)
+                hasher.combine(notificationTexts[ObjectIdentifier(window)])
                 if let ctrl = window.windowController as? BaseTerminalController,
                    let surface = ctrl.focusedSurface {
                     hasher.combine(surface.id)
@@ -372,6 +394,7 @@ final class SidebarStore {
                 surfaceId: sid,
                 statusEntries: entries,
                 needsAttention: attentionWindows.contains(wid),
+                notificationText: notificationTexts[wid],
                 hasUnreadCompletion: unread,
                 tabColor: color,
                 faviconImage: favicon,
@@ -840,22 +863,22 @@ final class SidebarStore {
 
     /// Build project groups from a tab list.
     func buildProjectGroups(from tabs: [TabItem]) -> [ProjectGroup] {
-        let home = NSHomeDirectory()
         var projectTabs: [String: [TabItem]] = [:]
         var projectOrder: [String] = []
         var homeTabs: [TabItem] = []
         var otherTabs: [TabItem] = []
 
+        // Bucket by the tab's own group id (the single source of truth) so the
+        // display grouping and the drag-and-drop validator can never disagree.
         for tab in tabs {
-            if let root = tab.projectRoot {
+            switch tab.groupID {
+            case "__home__": homeTabs.append(tab)
+            case "__other__": otherTabs.append(tab)
+            case let root:
                 if projectTabs[root] == nil {
                     projectOrder.append(root)
                 }
                 projectTabs[root, default: []].append(tab)
-            } else if let pwd = tab.pwd, (pwd as NSString).expandingTildeInPath == home {
-                homeTabs.append(tab)
-            } else {
-                otherTabs.append(tab)
             }
         }
 

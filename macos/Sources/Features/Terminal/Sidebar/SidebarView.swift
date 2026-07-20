@@ -72,17 +72,17 @@ private struct GroupDropTarget: Equatable {
 
 /// Drag state shared by every sidebar instance.
 ///
-/// Each tab window hosts its own sidebar. Selecting a tab on mouse-down can
-/// switch the visible window at the very start of a drag, so the sidebar
-/// that *started* the drag (in the now-hidden window) and the sidebar that
-/// shows drop indicators (in the newly visible window) are different view
-/// trees. Keeping the drag state in one shared object keeps them in sync.
+/// Each tab window hosts its own sidebar. A drag can cross those view trees,
+/// so keeping the state in one shared object keeps validation and indicators
+/// in sync for the whole AppKit tab group.
 private final class SidebarDragState: ObservableObject {
     static let shared = SidebarDragState()
     @Published var draggingTabID: ObjectIdentifier?
     @Published var draggingGroupID: String?
     @Published var tabDropTarget: TabDropTarget?
     @Published var groupDropTarget: GroupDropTarget?
+    /// Incremented at every drag start so cleanup belongs to one session.
+    @Published var dragGeneration = 0
 }
 
 /// An NSItemProvider that fires a callback when the drag session ends.
@@ -150,6 +150,7 @@ struct SidebarView: View {
                         draggingGroupID: $dragState.draggingGroupID,
                         tabDropTarget: $dragState.tabDropTarget,
                         groupDropTarget: $dragState.groupDropTarget,
+                        dragGeneration: $dragState.dragGeneration,
                         hoveredTabID: $hoveredTabID,
                         hoveredGroupID: $hoveredGroupID,
                         tabCardFrames: $tabCardFrames,
@@ -182,18 +183,32 @@ struct SidebarView: View {
         .coordinateSpace(name: Self.scrollCoordinateSpace)
         .clipped()
         .windowDragIfAvailable()
-        .task(id: isDragActive) {
+        .task(id: dragState.dragGeneration) {
             // Watchdog for drag state. The normal end-of-drag signal is the
             // system releasing the drag's NSItemProvider, but the pasteboard
             // can retain it long after the session ends, leaving rows dimmed.
             // The mouse button is authoritative — a drag session cannot
             // outlive it — so clear the state shortly after it's released.
+            // Keying this task by generation cancels an older drag's pending
+            // cleanup whenever a new drag starts, including the same item.
             guard isDragActive else { return }
+            let generation = dragState.dragGeneration
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 200_000_000)
+                do {
+                    try await Task.sleep(nanoseconds: 200_000_000)
+                } catch {
+                    return
+                }
+                guard generation == dragState.dragGeneration else { return }
                 if NSEvent.pressedMouseButtons == 0 {
                     // Give a pending performDrop a moment to run first.
-                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    do {
+                        try await Task.sleep(nanoseconds: 300_000_000)
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled,
+                          generation == dragState.dragGeneration else { return }
                     dragState.draggingTabID = nil
                     dragState.draggingGroupID = nil
                     dragState.tabDropTarget = nil
@@ -222,15 +237,6 @@ struct SidebarView: View {
                 if let tab = tabManager.tabs.first(where: { $0.id == tabID }) {
                     tabManager.promptRenameTab(tab)
                 }
-            },
-            onTabMouseDown: { tabID in
-                // Select on mouse-DOWN for a native, snappy feel. The row's
-                // tap gesture still fires on mouse-up as a no-op fallback
-                // (and covers clicks that activate a non-key window).
-                if let tab = tabManager.tabs.first(where: { $0.id == tabID }),
-                   tab.id != tabManager.selectedTabID {
-                    tabManager.selectTab(tab)
-                }
             }
         ))
     }
@@ -248,6 +254,7 @@ private struct ProjectSection: View {
     @Binding var draggingGroupID: String?
     @Binding var tabDropTarget: TabDropTarget?
     @Binding var groupDropTarget: GroupDropTarget?
+    @Binding var dragGeneration: Int
     @Binding var hoveredTabID: ObjectIdentifier?
     @Binding var hoveredGroupID: String?
     @Binding var tabCardFrames: [ObjectIdentifier: CGRect]
@@ -262,7 +269,12 @@ private struct ProjectSection: View {
         let draggingGroup = $draggingGroupID
         let tabTarget = $tabDropTarget
         let groupTarget = $groupDropTarget
+        let generation = $dragGeneration
+        let sessionGeneration = dragGeneration
         provider.onSessionEnd = {
+            // A provider from an older drag may be released after a new drag
+            // starts. It must never clear the newer session's shared state.
+            guard generation.wrappedValue == sessionGeneration else { return }
             draggingTab.wrappedValue = nil
             draggingGroup.wrappedValue = nil
             tabTarget.wrappedValue = nil
@@ -310,7 +322,11 @@ private struct ProjectSection: View {
             .contentShape(.dragPreview, RoundedRectangle(cornerRadius: 6))
             .if(!group.isOtherGroup && !group.isHomeGroup) { view in
                 view.onDrag {
+                    draggingTabID = nil
+                    tabDropTarget = nil
+                    groupDropTarget = nil
                     draggingGroupID = group.id
+                    dragGeneration += 1
                     return makeDragProvider(payload: group.id)
                 }
             }
@@ -319,8 +335,40 @@ private struct ProjectSection: View {
             if !isCollapsed {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(group.tabs) { tab in
-                        threadRow(for: tab)
+                        ThreadRow(
+                            tab: tab,
+                            isSelected: tab.id == tabManager.selectedTabID,
+                            isHovered: hoveredTabID == tab.id,
+                            isDragging: draggingTabID == tab.id,
+                            dropAbove: tabDropTarget == TabDropTarget(id: tab.id, below: false),
+                            dropBelow: tabDropTarget == TabDropTarget(id: tab.id, below: true),
+                            activityLabel: tab.lastActivity.map(relativeTime),
+                            theme: theme,
+                            groupID: group.id,
+                            tabManager: tabManager,
+                            makeDragProvider: { makeDragProvider(payload: $0) },
+                            hoveredTabID: $hoveredTabID,
+                            draggingTabID: $draggingTabID,
+                            draggingGroupID: $draggingGroupID,
+                            tabDropTarget: $tabDropTarget,
+                            groupDropTarget: $groupDropTarget,
+                            dragGeneration: $dragGeneration
+                        )
                     }
+
+                    // A real target after the final row makes the otherwise
+                    // empty trailing area an explicit "move to end" drop zone.
+                    Color.clear
+                        .frame(height: 10)
+                        .contentShape(Rectangle())
+                        .onDrop(of: [UTType.text], delegate: TabTrailingDropDelegate(
+                            tabManager: tabManager,
+                            currentGroup: group,
+                            draggingTabID: $draggingTabID,
+                            draggingGroupID: $draggingGroupID,
+                            tabDropTarget: $tabDropTarget,
+                            groupDropTarget: $groupDropTarget
+                        ))
                 }
                 .padding(.leading, 6)
                 .overlay(alignment: .leading) {
@@ -344,10 +392,41 @@ private struct ProjectSection: View {
         .animation(.easeOut(duration: 0.18), value: isCollapsed)
     }
 
-    @ViewBuilder
-    private func threadRow(for tab: SidebarTabManager.TabItem) -> some View {
-        let isSelected = tab.id == tabManager.selectedTabID
-        let isHovered = hoveredTabID == tab.id
+}
+
+// MARK: - ThreadRow
+
+/// A single tab row in the sidebar.
+///
+/// Kept as a normal SwiftUI view so each render installs a drop delegate with
+/// the current drag bindings and tab identity. This interaction path is not a
+/// safe place for an equality optimization that can retain an older delegate.
+private struct ThreadRow: View {
+    let tab: SidebarTabManager.TabItem
+    let isSelected: Bool
+    let isHovered: Bool
+    let isDragging: Bool
+    let dropAbove: Bool
+    let dropBelow: Bool
+    let activityLabel: String?
+    let theme: SidebarTheme
+    let groupID: String
+    let tabManager: SidebarTabManager
+    let makeDragProvider: (String) -> NSItemProvider
+    @Binding var hoveredTabID: ObjectIdentifier?
+    @Binding var draggingTabID: ObjectIdentifier?
+    @Binding var draggingGroupID: String?
+    @Binding var tabDropTarget: TabDropTarget?
+    @Binding var groupDropTarget: GroupDropTarget?
+    @Binding var dragGeneration: Int
+
+    /// Whether the unread-notification subtitle line is showing; the row
+    /// grows to two lines when it is.
+    private var subtitleVisible: Bool {
+        !isSelected && tab.notificationText != nil
+    }
+
+    var body: some View {
         let titleColor = isSelected || isHovered ? theme.foreground : theme.secondaryText
         // Tab color tint — subtle background wash instead of a left bar
         let tabTint: Color? = tab.tabColor.displayColor.map { Color(nsColor: $0) }
@@ -383,26 +462,39 @@ private struct ProjectSection: View {
                 }
             }
 
-            // Title
+            // Title, with the latest desktop-notification text as a subtitle
+            // while unread (cmux-style — e.g. Devin's "Devin finished ...").
             let primaryTitle = tab.displayTitle
+            let subtitle: String? = subtitleVisible ? tab.notificationText : nil
 
-            Text(primaryTitle)
-                .font(.system(size: 11))
-                .foregroundColor(titleColor)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(primaryTitle)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(primaryTitle)
+                    .font(.system(size: 11))
+                    .foregroundColor(titleColor)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help(primaryTitle)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.attentionColor)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .help(subtitle)
+                }
+            }
 
             // Relative time — "3m", "1h" (time since last real activity)
-            if let activity = tab.lastActivity {
-                Text(relativeTime(activity))
+            if let activityLabel {
+                Text(activityLabel)
                     .font(.system(size: 9))
                     .foregroundColor(theme.secondaryText.opacity(0.5))
                     .fixedSize()
             }
         }
-        .frame(height: 28)
+        .frame(height: subtitleVisible ? 42 : 28)
         .padding(.horizontal, 8)
         .offset(x: -1)
         .contentShape(Rectangle())
@@ -429,26 +521,30 @@ private struct ProjectSection: View {
         })
         .contentShape(.dragPreview, RoundedRectangle(cornerRadius: 6))
         .onDrag {
+            draggingGroupID = nil
+            tabDropTarget = nil
+            groupDropTarget = nil
             draggingTabID = tab.id
-            return makeDragProvider(payload: tab.surfaceId?.uuidString ?? "tab")
+            dragGeneration += 1
+            return makeDragProvider(tab.surfaceId?.uuidString ?? "tab")
         }
         .onDrop(of: [UTType.text], delegate: TabDropDelegate(
             tabManager: tabManager,
             currentTab: tab,
-            groupID: group.id,
+            groupID: groupID,
             draggingTabID: $draggingTabID,
             draggingGroupID: $draggingGroupID,
             tabDropTarget: $tabDropTarget,
             groupDropTarget: $groupDropTarget
         ))
-        .opacity(draggingTabID == tab.id ? 0.4 : 1.0)
+        .opacity(isDragging ? 0.4 : 1.0)
         .overlay(alignment: .top) {
-            if tabDropTarget == TabDropTarget(id: tab.id, below: false) {
+            if dropAbove {
                 DropIndicator().offset(y: -1)
             }
         }
         .overlay(alignment: .bottom) {
-            if tabDropTarget == TabDropTarget(id: tab.id, below: true) {
+            if dropBelow {
                 DropIndicator().offset(y: 1)
             }
         }
@@ -792,6 +888,14 @@ private struct SidebarSortHeader: View {
 private struct TabDropDelegate: DropDelegate {
     /// Row height of a tab row; used to decide above/below insertion.
     private static let rowHeight: CGFloat = 28
+    /// Height when the row shows an unread-notification subtitle line.
+    private static let tallRowHeight: CGFloat = 42
+
+    /// The actual height of this row right now, so the above/below midpoint
+    /// stays correct while a notification subtitle is showing.
+    private var currentRowHeight: CGFloat {
+        currentTab.notificationText == nil ? Self.rowHeight : Self.tallRowHeight
+    }
 
     let tabManager: SidebarTabManager
     let currentTab: SidebarTabManager.TabItem
@@ -803,17 +907,25 @@ private struct TabDropDelegate: DropDelegate {
 
     private var isGroupDrag: Bool { draggingGroupID != nil }
 
-    /// The group ID of the tab being dragged ("__other__" for ungrouped tabs).
+    /// The group ID of the tab being dragged. Uses the tab's own `groupID` so
+    /// it matches `buildProjectGroups` exactly — including the "__home__" case,
+    /// which the old `projectRoot ?? "__other__"` derivation got wrong (it
+    /// classified Home tabs as "__other__", breaking within-Home reordering and
+    /// wrongly permitting Home→Other drops).
     private var draggingTabGroupID: String? {
         guard let id = draggingTabID,
               let tab = tabManager.tabs.first(where: { $0.id == id })
         else { return nil }
-        return tab.projectRoot ?? "__other__"
+        return tab.groupID
     }
 
     private var isValidGroupDrag: Bool {
         guard let draggingGroupID else { return false }
-        return draggingGroupID != groupID && groupID != "__other__"
+        // Home and Other are pinned pseudo-groups and can't be reordered onto,
+        // matching ProjectGroupDropDelegate's own guard.
+        return draggingGroupID != groupID
+            && groupID != "__other__"
+            && groupID != "__home__"
     }
 
     /// Tab drags are restricted to reordering within the same project.
@@ -832,15 +944,22 @@ private struct TabDropDelegate: DropDelegate {
     }
 
     private func updateTarget(_ info: DropInfo) {
+        // `dropUpdated` fires continuously while the mouse moves, so only
+        // publish when the target actually changes. Reassigning the same
+        // @Published value re-renders the whole sidebar on every mouse-move
+        // event, which is what made dragging stutter while the insertion line
+        // was showing.
         if isGroupDrag {
             if isValidGroupDrag {
-                groupDropTarget = GroupDropTarget(id: groupID, below: groupInsertsBelow)
+                let newTarget = GroupDropTarget(id: groupID, below: groupInsertsBelow)
+                if groupDropTarget != newTarget { groupDropTarget = newTarget }
             }
         } else if isValidTabDrag {
-            tabDropTarget = TabDropTarget(
+            let newTarget = TabDropTarget(
                 id: currentTab.id,
-                below: info.location.y >= Self.rowHeight / 2
+                below: info.location.y >= currentRowHeight / 2
             )
+            if tabDropTarget != newTarget { tabDropTarget = newTarget }
         }
     }
 
@@ -870,7 +989,6 @@ private struct TabDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        let target = tabDropTarget
         defer {
             draggingTabID = nil
             draggingGroupID = nil
@@ -886,29 +1004,103 @@ private struct TabDropDelegate: DropDelegate {
             return true
         }
 
-        // Tab reorder. Resolve indices by ID at drop time — indices captured
-        // at drag start can go stale because the tab list refreshes during
-        // the drag.
+        // Tab reorder. Keep identities intact across the drop boundary; the
+        // manager derives the single AppKit/persistence order from them.
         guard isValidTabDrag,
               let draggingTabID,
-              let source = tabManager.tabs.firstIndex(where: { $0.id == draggingTabID }),
-              let targetIndex = tabManager.tabs.firstIndex(where: { $0.id == currentTab.id })
+              let movingTab = tabManager.tabs.first(where: { $0.id == draggingTabID })
         else { return false }
 
-        let below = target?.below ?? false
-        let destination: Int = below
-            ? (source < targetIndex ? targetIndex : targetIndex + 1)
-            : (source < targetIndex ? targetIndex - 1 : targetIndex)
-
+        // Compute the insertion side from the actual drop location, relative to
+        // this row (the same row `targetIndex` resolves to). Reading it from the
+        // shared `tabDropTarget` was unreliable: SwiftUI fires `dropExited` on
+        // the hovered row right before `performDrop`, clearing `tabDropTarget`
+        // to nil, so `?? false` defaulted every such drop to "above" — which is
+        // exactly why "below" insertions silently failed.
+        let below = info.location.y >= currentRowHeight / 2
         // Manual arrangement implies manual sort mode, same as group reorder —
         // in the activity/creation sort modes the displayed order ignores the
         // underlying tab order, so the drop would otherwise appear to do nothing.
         if tabManager.projectSortMode != .manual {
             tabManager.setProjectSortMode(.manual)
         }
-        if destination != source {
-            tabManager.moveTab(from: source, to: destination)
+        tabManager.moveTab(
+            movingTab,
+            relativeTo: currentTab,
+            position: below ? .after : .before
+        )
+        return true
+    }
+}
+
+// MARK: - TabTrailingDropDelegate
+
+/// Accepts a same-group tab in the small trailing area after the final row.
+/// Group drags continue through to the section-level group delegate.
+private struct TabTrailingDropDelegate: DropDelegate {
+    let tabManager: SidebarTabManager
+    let currentGroup: SidebarTabManager.ProjectGroup
+    @Binding var draggingTabID: ObjectIdentifier?
+    @Binding var draggingGroupID: String?
+    @Binding var tabDropTarget: TabDropTarget?
+    @Binding var groupDropTarget: GroupDropTarget?
+
+    private var movingTab: SidebarTabManager.TabItem? {
+        guard draggingGroupID == nil, let draggingTabID else { return nil }
+        return tabManager.tabs.first(where: { $0.id == draggingTabID })
+    }
+
+    private var targetTab: SidebarTabManager.TabItem? {
+        guard let movingTab else { return nil }
+        return currentGroup.tabs.last(where: { $0.id != movingTab.id })
+    }
+
+    private var isValidTabDrag: Bool {
+        movingTab?.groupID == currentGroup.id && targetTab != nil
+    }
+
+    private func updateTarget() {
+        guard isValidTabDrag, let lastTab = currentGroup.tabs.last else { return }
+        // Only publish on change — dropUpdated fires on every mouse-move and
+        // reassigning the same @Published target re-renders the whole sidebar.
+        let newTarget = TabDropTarget(id: lastTab.id, below: true)
+        if tabDropTarget != newTarget { tabDropTarget = newTarget }
+    }
+
+    func dropEntered(info: DropInfo) {
+        updateTarget()
+    }
+
+    func dropExited(info: DropInfo) {
+        if let lastTab = currentGroup.tabs.last,
+           tabDropTarget == TabDropTarget(id: lastTab.id, below: true) {
+            tabDropTarget = nil
         }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard isValidTabDrag else { return DropProposal(operation: .forbidden) }
+        updateTarget()
+        return DropProposal(operation: .move)
+    }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        isValidTabDrag
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        defer {
+            draggingTabID = nil
+            draggingGroupID = nil
+            tabDropTarget = nil
+            groupDropTarget = nil
+        }
+        guard let movingTab, let targetTab, isValidTabDrag else { return false }
+
+        if tabManager.projectSortMode != .manual {
+            tabManager.setProjectSortMode(.manual)
+        }
+        tabManager.moveTab(movingTab, relativeTo: targetTab, position: .after)
         return true
     }
 }
@@ -993,25 +1185,20 @@ private struct SidebarCardFramePreferenceKey: PreferenceKey {
 
 // MARK: - SidebarClickOverlay
 
-/// Transparent NSView overlay that monitors click events via an event
-/// monitor, bypassing SwiftUI's gesture system entirely.
-///
-/// Single clicks on a tab row select it on mouse-DOWN — SwiftUI's tap
-/// gesture only fires on mouse-up, which reads as sluggish next to native
-/// sidebars (Finder, Xcode) that all select on mouse-down. Double clicks
-/// rename a tab or create a new tab on blank space.
+/// Transparent NSView overlay that recognizes double-click actions without
+/// taking pointer events away from SwiftUI. Single-click selection stays on
+/// the row's mouse-up tap so pressing a nonselected row can become a drag
+/// without replacing its hosting window in the middle of the gesture.
 private struct SidebarClickOverlay: NSViewRepresentable {
     var tabCardFrames: [ObjectIdentifier: CGRect]
     var onBlankSpaceDoubleClick: () -> Void
     var onTabDoubleClick: (ObjectIdentifier) -> Void
-    var onTabMouseDown: (ObjectIdentifier) -> Void
 
     func makeNSView(context: Context) -> ClickView {
         ClickView(
             tabCardFrames: tabCardFrames,
             onBlankSpaceDoubleClick: onBlankSpaceDoubleClick,
-            onTabDoubleClick: onTabDoubleClick,
-            onTabMouseDown: onTabMouseDown
+            onTabDoubleClick: onTabDoubleClick
         )
     }
 
@@ -1019,14 +1206,12 @@ private struct SidebarClickOverlay: NSViewRepresentable {
         nsView.tabCardFrames = tabCardFrames
         nsView.onBlankSpaceDoubleClick = onBlankSpaceDoubleClick
         nsView.onTabDoubleClick = onTabDoubleClick
-        nsView.onTabMouseDown = onTabMouseDown
     }
 
     class ClickView: NSView {
         var tabCardFrames: [ObjectIdentifier: CGRect]
         var onBlankSpaceDoubleClick: () -> Void
         var onTabDoubleClick: (ObjectIdentifier) -> Void
-        var onTabMouseDown: (ObjectIdentifier) -> Void
         private var eventMonitor: Any?
         /// Timestamp of the last handled double-click, used to debounce
         /// duplicate events that can arrive when multiple sidebar hosting
@@ -1037,13 +1222,11 @@ private struct SidebarClickOverlay: NSViewRepresentable {
         init(
             tabCardFrames: [ObjectIdentifier: CGRect],
             onBlankSpaceDoubleClick: @escaping () -> Void,
-            onTabDoubleClick: @escaping (ObjectIdentifier) -> Void,
-            onTabMouseDown: @escaping (ObjectIdentifier) -> Void
+            onTabDoubleClick: @escaping (ObjectIdentifier) -> Void
         ) {
             self.tabCardFrames = tabCardFrames
             self.onBlankSpaceDoubleClick = onBlankSpaceDoubleClick
             self.onTabDoubleClick = onTabDoubleClick
-            self.onTabMouseDown = onTabMouseDown
             super.init(frame: .zero)
         }
 
@@ -1073,15 +1256,6 @@ private struct SidebarClickOverlay: NSViewRepresentable {
             guard bounds.contains(locationInView) else { return }
 
             let hitTab = tabCardFrames.first(where: { $0.value.contains(locationInView) })?.key
-
-            // Single click on a tab: select immediately on mouse-down.
-            // The event still propagates so drags keep working.
-            if event.clickCount == 1 {
-                if let hitTab {
-                    onTabMouseDown(hitTab)
-                }
-                return
-            }
 
             guard event.clickCount == 2 else { return }
             // Debounce: ignore double-clicks within 400ms of a previously

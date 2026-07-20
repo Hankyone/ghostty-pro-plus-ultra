@@ -321,7 +321,11 @@ final class GhosttyIPCServer {
            let window = controller.window {
             NotificationCenter.default.post(
                 name: .ghosttyIPCNotification,
-                object: window
+                object: window,
+                userInfo: [
+                    Notification.Name.ghosttyDesktopNotificationTitleKey: title,
+                    Notification.Name.ghosttyDesktopNotificationBodyKey: body,
+                ]
             )
         }
 

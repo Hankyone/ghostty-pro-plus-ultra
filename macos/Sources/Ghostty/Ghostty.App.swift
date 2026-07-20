@@ -1421,10 +1421,15 @@ extension Ghostty {
             body: String,
             requireFocus: Bool = true) {
             // Post an internal notification so the sidebar can show an unread indicator
+            // and surface the message text on the tab row (cmux-style).
             DispatchQueue.main.async {
                 NotificationCenter.default.post(
                     name: .ghosttyDesktopNotificationDidFire,
-                    object: surfaceView
+                    object: surfaceView,
+                    userInfo: [
+                        Foundation.Notification.Name.ghosttyDesktopNotificationTitleKey: title,
+                        Foundation.Notification.Name.ghosttyDesktopNotificationBodyKey: body,
+                    ]
                 )
             }
 

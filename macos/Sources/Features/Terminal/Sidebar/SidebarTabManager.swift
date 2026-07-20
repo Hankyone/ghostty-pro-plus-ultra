@@ -42,6 +42,10 @@ class SidebarTabManager: ObservableObject {
         let surfaceId: UUID?
         let statusEntries: [TabMetadataStore.StatusEntry]
         let needsAttention: Bool
+        /// Latest desktop-notification text (OSC 9/777), shown as a row
+        /// subtitle until the tab is selected. This is how agents without
+        /// hooks (e.g. Devin) report "finished" — same source cmux shows.
+        let notificationText: String?
         /// True when the tab has a completion that hasn't been viewed yet.
         let hasUnreadCompletion: Bool
         let tabColor: TerminalTabColor
@@ -67,14 +71,29 @@ class SidebarTabManager: ObservableObject {
         var displayTitle: String {
             var t = title
             // Strip bell emoji prefix (sidebar has its own attention indicator)
-            if t.hasPrefix("\u{1F514} ") { t = String(t.dropFirst(3)) }
-            // Strip ghost emoji prefix (default Ghostty window title)
-            if t.hasPrefix("\u{1F47B} ") { t = String(t.dropFirst(3)) }
+            // and ghost emoji prefix (default Ghostty window title). Note:
+            // dropFirst counts Characters, so each emoji+space prefix is 2.
+            for prefix in ["\u{1F514} ", "\u{1F47B} "] {
+                if t.hasPrefix(prefix) { t = String(t.dropFirst(prefix.count)) }
+            }
             // If title is just "Ghostty" or empty after stripping, use directory name
             if t.isEmpty || t == "Ghostty" {
                 if let dir = directoryName { return dir }
             }
             return t
+        }
+
+        /// The id of the display group this tab belongs to: a project root path,
+        /// or "__home__" / "__other__". Single source of truth for group
+        /// membership — used by both `SidebarStore.buildProjectGroups` and the
+        /// drag-and-drop validator so grouping and drop-eligibility can never
+        /// disagree (a mismatch previously broke Home-group reordering).
+        var groupID: String {
+            if let projectRoot { return projectRoot }
+            if let pwd, (pwd as NSString).expandingTildeInPath == NSHomeDirectory() {
+                return "__home__"
+            }
+            return "__other__"
         }
 
         static func == (lhs: TabItem, rhs: TabItem) -> Bool {
@@ -83,6 +102,7 @@ class SidebarTabManager: ObservableObject {
                 && lhs.surfaceId == rhs.surfaceId
                 && lhs.statusEntries == rhs.statusEntries
                 && lhs.needsAttention == rhs.needsAttention
+                && lhs.notificationText == rhs.notificationText
                 && lhs.hasUnreadCompletion == rhs.hasUnreadCompletion
                 && lhs.tabColor == rhs.tabColor
                 && lhs.faviconImage === rhs.faviconImage
@@ -241,7 +261,9 @@ class SidebarTabManager: ObservableObject {
         // attention/acknowledgment changes.
         store.clearAttentionOnSelect(windowID: tab.id)
         acknowledgeCompletion(for: tab)
-        selectedTabID = tab.id
+        // Only publish when the value actually changes. `@Published` fires on
+        // every assignment, even to an equal value.
+        if selectedTabID != tab.id { selectedTabID = tab.id }
         // Guard against notification-driven refreshSelection() calls that fire
         // synchronously during the tabGroup.selectedWindow setter. Without this,
         // those handlers read intermediate state and revert our optimistic update.
@@ -260,7 +282,8 @@ class SidebarTabManager: ObservableObject {
         // intermediate (old) state. Correct it now that the setter has completed.
         if let targetController = tab.window.windowController as? TerminalController,
            let targetManager = targetController.sidebarTabManager,
-           targetManager !== self {
+           targetManager !== self,
+           targetManager.selectedTabID != tab.id {
             targetManager.selectedTabID = tab.id
         }
     }
@@ -474,41 +497,86 @@ class SidebarTabManager: ObservableObject {
         }
     }
 
-    func moveTab(from sourceIndex: Int, to destinationIndex: Int) {
-        Self.orderLog.info("moveTab from \(sourceIndex) to \(destinationIndex)")
+    enum TabInsertionPosition: Equatable {
+        case before
+        case after
+    }
 
-        guard let window else { return }
-        let tabbedWindows = store.orderedTabWindows(for: window)
-        guard sourceIndex != destinationIndex,
-              sourceIndex >= 0, sourceIndex < tabbedWindows.count,
-              destinationIndex >= 0, destinationIndex < tabbedWindows.count else { return }
+    /// Reorder one tab relative to another by identity.
+    ///
+    /// The sidebar display groups tabs by project, while AppKit and the
+    /// persisted order are a flat window list. Keeping integer indices across
+    /// those two spaces is unsafe, so the drop boundary passes stable window
+    /// identities and this method derives one desired flat order used by both
+    /// AppKit and persistence.
+    @discardableResult
+    func moveTab(
+        _ movingTab: TabItem,
+        relativeTo targetTab: TabItem,
+        position: TabInsertionPosition
+    ) -> Bool {
+        Self.orderLog.info(
+            "moveTab win#\(movingTab.window.windowNumber) \(position == .before ? "before" : "after") win#\(targetTab.window.windowNumber)")
 
-        let movingWindow = tabbedWindows[sourceIndex]
-        let targetWindow = tabbedWindows[destinationIndex]
+        guard movingTab.id != targetTab.id,
+              movingTab.groupID == targetTab.groupID,
+              let window else { return false }
 
-        let reorderedGroupIds: [String]? = {
-            let ids = tabbedWindows.compactMap { store.tabOrderKey(for: $0) }
-            guard ids.count == tabbedWindows.count else { return nil }
-            var reordered = ids
-            let moved = reordered.remove(at: sourceIndex)
-            reordered.insert(moved, at: destinationIndex)
-            return reordered
-        }()
+        let currentWindows = store.orderedTabWindows(for: window)
+        guard let sourceIndex = currentWindows.firstIndex(where: {
+            ObjectIdentifier($0) == movingTab.id
+        }), currentWindows.contains(where: {
+            ObjectIdentifier($0) == targetTab.id
+        }) else { return false }
 
-        if sourceIndex > destinationIndex {
-            targetWindow.addTabbedWindow(movingWindow, ordered: .below)
+        let movingWindow = currentWindows[sourceIndex]
+        var desiredWindows = currentWindows
+        desiredWindows.remove(at: sourceIndex)
+
+        guard let targetIndex = desiredWindows.firstIndex(where: {
+            ObjectIdentifier($0) == targetTab.id
+        }) else { return false }
+        let insertionIndex = position == .before ? targetIndex : targetIndex + 1
+        desiredWindows.insert(movingWindow, at: insertionIndex)
+
+        guard desiredWindows.map(ObjectIdentifier.init) != currentWindows.map(ObjectIdentifier.init)
+        else { return false }
+
+        // Capture the visible member before AppKit mutates the tab group.
+        let selectedWindow = window.tabGroup?.selectedWindow ?? window
+        let preMoveFrame = selectedWindow.frame
+
+        // Position the moving window against its neighbor in the final order.
+        // AppKit's `.below` inserts before the receiver and `.above` after it.
+        if insertionIndex == 0 {
+            desiredWindows[1].addTabbedWindow(movingWindow, ordered: .below)
         } else {
-            targetWindow.addTabbedWindow(movingWindow, ordered: .above)
+            desiredWindows[insertionIndex - 1].addTabbedWindow(movingWindow, ordered: .above)
         }
 
-        if let reorderedGroupIds {
-            store.persistTabOrder(reorderedGroupIds, for: tabbedWindows)
+        let reorderedIds = desiredWindows.compactMap { store.tabOrderKey(for: $0) }
+        if reorderedIds.count == desiredWindows.count {
+            store.persistTabOrder(reorderedIds, for: currentWindows)
         }
 
-        if let selectedWindow = window.tabGroup?.selectedWindow {
+        // A macOS tab group renders a single shared frame (the key window's).
+        // Reordering via addTabbedWindow + makeKeyAndOrderFront can make the
+        // group adopt the re-inserted/newly-key window's own cascade-offset
+        // origin, teleporting the whole visible window on drop. Capture the
+        // current on-screen frame and restore it afterward so the window stays
+        // put. (Same teleport class the showWindow secondary-tab guard prevents.)
+        if let tabGroup = window.tabGroup,
+           tabGroup.windows.contains(selectedWindow) {
+            tabGroup.selectedWindow = selectedWindow
+        }
+        if selectedWindow.tabGroup?.windows.contains(selectedWindow) == true || selectedWindow === window {
             selectedWindow.makeKeyAndOrderFront(nil)
+            if selectedWindow.frame != preMoveFrame {
+                selectedWindow.setFrame(preMoveFrame, display: true)
+            }
         }
 
         refresh()
+        return true
     }
 }
