@@ -263,7 +263,10 @@ git stash --include-untracked 2>/dev/null || true
 
 git fetch origin gh-pages 2>/dev/null || true
 if git rev-parse --verify origin/gh-pages >/dev/null 2>&1; then
-    git checkout gh-pages
+    # Force local gh-pages to match the remote before regenerating, so a
+    # stale local branch can't produce a non-fast-forward push. The appcast
+    # is fully regenerated below, so resetting to remote loses nothing.
+    git checkout -B gh-pages origin/gh-pages
     cp /tmp/appcast.xml appcast.xml
     git add appcast.xml
     git commit -m "Update appcast for ${TAG}" || true
