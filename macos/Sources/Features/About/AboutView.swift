@@ -77,14 +77,14 @@ struct AboutView: View {
 
     var body: some View {
         VStack(alignment: .center) {
-            CyclingIconView()
+            AboutIconView()
 
             VStack(alignment: .center, spacing: 32) {
                 VStack(alignment: .center, spacing: 8) {
                     Text("Ghostty Pro Plus Ultra")
                         .bold()
                         .font(.title3)
-                    Text("A Ghostty fork with sidebar tabs, Claude Code\nintegration, and quality-of-life improvements.")
+                    Text("A Ghostty fork with vertical tabs, agentic coding\ntool integration, and quality-of-life improvements.")
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                         .font(.caption)
@@ -131,6 +131,14 @@ struct AboutView: View {
                         }
                     }
                 }
+
+                Text("Based on Ghostty and its open-source contributors.")
+                    .font(.caption)
+                    .textSelection(.enabled)
+                    .tint(.secondary)
+                    .opacity(0.8)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
 
                 if let copy = self.copyright {
                     Text(copy)

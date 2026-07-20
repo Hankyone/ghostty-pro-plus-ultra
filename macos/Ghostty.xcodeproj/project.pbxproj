@@ -123,7 +123,6 @@
 				Features/About/About.xib,
 				Features/About/AboutController.swift,
 				Features/About/AboutView.swift,
-				Features/About/AboutViewModel.swift,
 				Features/About/CyclingIconView.swift,
 				"Features/App Intents/CloseTerminalIntent.swift",
 				"Features/App Intents/CommandPaletteIntent.swift",
@@ -1142,7 +1141,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 16718;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = "";
@@ -1175,7 +1174,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				MARKETING_VERSION = 0.1;
+				MARKETING_VERSION = 1.4.0;
 				"OTHER_LDFLAGS[arch=*]" = "-lstdc++";
 				PRODUCT_BUNDLE_IDENTIFIER = "com.hankyone.ghostty-ppu.debug";
 				PRODUCT_NAME = "$(TARGET_NAME)";
