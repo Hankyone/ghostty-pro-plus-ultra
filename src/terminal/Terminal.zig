@@ -7,6 +7,7 @@ const std = @import("std");
 const build_options = @import("terminal_options");
 const lib = @import("lib.zig");
 const assert = @import("../quirks.zig").inlineAssert;
+const tripwire = @import("../tripwire.zig");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const unicode = @import("../unicode/main.zig");
@@ -30,6 +31,7 @@ const Stream = @import("stream_terminal.zig").Stream;
 const size = @import("size.zig");
 const pagepkg = @import("page.zig");
 const style = @import("style.zig");
+const PageList = @import("PageList.zig");
 const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
 const Page = pagepkg.Page;
@@ -78,6 +80,9 @@ previous_char: ?u21 = null,
 
 /// The modes that this terminal currently has active.
 modes: modespkg.ModeState = .{},
+
+/// Terminal-level cursor state.
+cursor: Cursor = .{},
 
 /// The most recently set mouse shape for the terminal.
 mouse_shape: mouse.Shape = .text,
@@ -234,6 +239,19 @@ pub const ScrollingRegion = struct {
     right: size.CellCountInt,
 };
 
+/// Terminal-level cursor state shared by all screens.
+pub const Cursor = struct {
+    /// Whether the current cursor appearance follows the configured defaults.
+    is_default: bool = true,
+
+    /// Configured style restored by DECSCUSR default and RIS.
+    default_style: Screen.CursorStyle = .block,
+
+    /// Configured blink restored by DECSCUSR default and RIS. Null selects
+    /// the terminal emulator default, which is blinking.
+    default_blink: ?bool = false,
+};
+
 pub const Options = struct {
     cols: size.CellCountInt,
     rows: size.CellCountInt,
@@ -243,6 +261,10 @@ pub const Options = struct {
     /// The default mode state. When the terminal gets a reset, it
     /// will revert back to this state.
     default_modes: modespkg.ModePacked = .{},
+
+    /// Cursor state restored by DECSCUSR default and RIS.
+    default_cursor_style: Screen.CursorStyle = .block,
+    default_cursor_blink: ?bool = false,
 
     /// The total storage limit for Kitty images in bytes. Has no effect
     /// if kitty images are disabled at build-time.
@@ -282,7 +304,7 @@ pub fn init(
     });
     errdefer screen_set.deinit(alloc);
 
-    return .{
+    var result: Terminal = .{
         .cols = cols,
         .rows = rows,
         .screens = screen_set,
@@ -300,7 +322,13 @@ pub fn init(
             .values = opts.default_modes,
             .default = opts.default_modes,
         },
+        .cursor = .{
+            .default_style = opts.default_cursor_style,
+            .default_blink = opts.default_cursor_blink,
+        },
     };
+    result.setCursorStyle(.default);
+    return result;
 }
 
 pub fn deinit(self: *Terminal, alloc: Allocator) void {
@@ -333,6 +361,63 @@ pub fn vtStream(self: *Terminal) Stream {
 /// This is the handler-side only for vtStream.
 pub fn vtHandler(self: *Terminal) Stream.Handler {
     return .init(self);
+}
+
+/// Change the cursor's current shape and blink behavior.
+///
+/// The terminal parser uses this for DECSCUSR (`CSI Ps SP q`), but the behavior
+/// is general: `.default` selects the configured defaults, while any other
+/// value selects a concrete appearance until it is changed again or reset.
+pub fn setCursorStyle(self: *Terminal, value: ansi.CursorStyle) void {
+    // Remember whether future configuration changes should update the visible
+    // cursor. An explicit appearance must remain in effect until the program
+    // selects the default again.
+    self.cursor.is_default = value == .default;
+
+    // Convert the request into the concrete values used by the renderer and
+    // terminal mode state. A null default blink means the emulator default.
+    self.modes.set(.cursor_blinking, switch (value) {
+        .default => self.cursor.default_blink orelse true,
+        .steady_block, .steady_bar, .steady_underline => false,
+        .blinking_block, .blinking_bar, .blinking_underline => true,
+    });
+    self.screens.active.cursor.cursor_style = switch (value) {
+        .default => self.cursor.default_style,
+        .blinking_block, .steady_block => .block,
+        .blinking_bar, .steady_bar => .bar,
+        .blinking_underline, .steady_underline => .underline,
+    };
+}
+
+/// Change the default cursor shape.
+///
+/// If the cursor currently follows its defaults, the visible shape changes
+/// immediately. Otherwise the new shape is saved for the next reset or default
+/// selection, such as DECSCUSR `CSI 0 SP q`.
+pub fn setDefaultCursorStyle(
+    self: *Terminal,
+    configured_style: Screen.CursorStyle,
+) void {
+    // Always retain the new default, even while an explicit appearance is
+    // active, so a later reset or default request can restore it.
+    self.cursor.default_style = configured_style;
+
+    // Do not overwrite an appearance explicitly selected by the program.
+    if (self.cursor.is_default) self.setCursorStyle(.default);
+}
+
+/// Change the default cursor blink behavior.
+///
+/// Null selects the terminal emulator default (blinking). Like the default
+/// shape, this is applied immediately only when the cursor currently follows
+/// its defaults; otherwise it is saved for the next reset or default selection.
+pub fn setDefaultCursorBlink(self: *Terminal, blink: ?bool) void {
+    // Keep the configured value separate from the currently resolved mode so
+    // null can continue to mean "use the emulator default."
+    self.cursor.default_blink = blink;
+
+    // Do not overwrite blink behavior explicitly selected by the program.
+    if (self.cursor.is_default) self.setCursorStyle(.default);
 }
 
 /// The general allocator we should use for this terminal.
@@ -642,7 +727,9 @@ fn printSliceFill(
         const avail: usize = right_limit - cursor.x;
         assert(avail > 0);
 
-        const page = &cursor.page_pin.node.data;
+        // The cursor caches live row and cell pointers into this mapping, so
+        // its page cannot be compressed while this print path is active.
+        const page = cursor.page_pin.node.pageAssumeResident();
         const cells: [*]Cell = @ptrCast(cursor.page_cell);
         const style_id = cursor.style_id;
         const template: Cell = .{
@@ -946,10 +1033,16 @@ pub fn print(self: *Terminal, c: u21) !void {
         const grapheme_break = brk: {
             var state: uucode.grapheme.BreakState = .default;
             if (prev.cell.hasGrapheme()) {
-                const cps = self.screens.active.cursor.page_pin.node.data.lookupGrapheme(prev.cell).?;
+                const cps = self.screens.active.cursor.page_pin.node.page().lookupGrapheme(prev.cell).?;
                 for (cps) |cp2| {
                     // log.debug("cp1={x} cp2={x}", .{ previous_codepoint, cp2 });
-                    assert(!unicode.graphemeBreak(previous_codepoint, cp2, &state));
+                    // With mode 2027 disabled, zero-width codepoints are
+                    // attached without applying grapheme boundary rules. If
+                    // the mode is enabled later, an existing cell can
+                    // therefore contain one or more breaks. Feed those breaks
+                    // into the state machine so it can reset its context and
+                    // determine the boundary for the new codepoint.
+                    _ = unicode.graphemeBreak(previous_codepoint, cp2, &state);
                     previous_codepoint = cp2;
                 }
             }
@@ -1003,19 +1096,19 @@ pub fn print(self: *Terminal, c: u21) !void {
                                 const old_rac = old_pin.rowAndCell();
 
                                 if (new_pin.node == old_pin.node) {
-                                    new_pin.node.data.moveGrapheme(prev.cell, new_rac.cell);
+                                    new_pin.node.page().moveGrapheme(prev.cell, new_rac.cell);
                                     prev.cell.content_tag = .codepoint;
                                     new_rac.cell.content_tag = .codepoint_grapheme;
                                     new_rac.row.grapheme = true;
                                 } else {
-                                    const cps = old_pin.node.data.lookupGrapheme(old_rac.cell).?;
+                                    const cps = old_pin.node.page().lookupGrapheme(old_rac.cell).?;
                                     for (cps) |cp| {
                                         try self.screens.active.appendGrapheme(new_rac.cell, cp);
                                     }
-                                    old_pin.node.data.clearGrapheme(old_rac.cell);
+                                    old_pin.node.page().clearGrapheme(old_rac.cell);
                                 }
 
-                                old_pin.node.data.updateRowGraphemeFlag(old_rac.row);
+                                old_pin.node.page().updateRowGraphemeFlag(old_rac.row);
                             }
 
                             // Point prev.cell to our new previous cell that
@@ -1282,7 +1375,7 @@ fn printCell(
 
                 const spacer_cell = self.screens.active.cursorCellRight(1);
                 self.screens.active.clearCells(
-                    &self.screens.active.cursor.page_pin.node.data,
+                    self.screens.active.cursor.page_pin.node.page(),
                     self.screens.active.cursor.page_row,
                     spacer_cell[0..1],
                 );
@@ -1308,7 +1401,7 @@ fn printCell(
 
                 const wide_cell = self.screens.active.cursorCellLeft(1);
                 self.screens.active.clearCells(
-                    &self.screens.active.cursor.page_pin.node.data,
+                    self.screens.active.cursor.page_pin.node.page(),
                     self.screens.active.cursor.page_row,
                     wide_cell[0..1],
                 );
@@ -1331,7 +1424,7 @@ fn printCell(
 
     // If the prior value had graphemes, clear those
     if (cell.hasGrapheme()) {
-        const page = &self.screens.active.cursor.page_pin.node.data;
+        const page = self.screens.active.cursor.page_pin.node.page();
         page.clearGrapheme(cell);
         page.updateRowGraphemeFlag(self.screens.active.cursor.page_row);
     }
@@ -1340,7 +1433,7 @@ fn printCell(
     // cell's new style will be different after writing.
     const style_changed = cell.style_id != self.screens.active.cursor.style_id;
     if (style_changed) {
-        var page = &self.screens.active.cursor.page_pin.node.data;
+        var page = self.screens.active.cursor.page_pin.node.page();
 
         // Release the old style.
         if (cell.style_id != style.default_id) {
@@ -1363,7 +1456,7 @@ fn printCell(
     };
 
     if (style_changed) {
-        var page = &self.screens.active.cursor.page_pin.node.data;
+        var page = self.screens.active.cursor.page_pin.node.page();
 
         // Use the new style.
         if (cell.style_id != style.default_id) {
@@ -1392,7 +1485,7 @@ fn printCell(
         };
     } else if (had_hyperlink) {
         // If the previous cell had a hyperlink then we need to clear it.
-        var page = &self.screens.active.cursor.page_pin.node.data;
+        var page = self.screens.active.cursor.page_pin.node.page();
         page.clearHyperlink(cell);
         page.updateRowHyperlinkFlag(self.screens.active.cursor.page_row);
     }
@@ -2117,8 +2210,8 @@ pub fn setCursorPos(self: *Terminal, row_req: usize, col_req: usize) void {
     // Calculate our new x/y
     const row = if (row_req == 0) 1 else row_req;
     const col = if (col_req == 0) 1 else col_req;
-    const x = @min(params.x_max, col + params.x_offset) -| 1;
-    const y = @min(params.y_max, row + params.y_offset) -| 1;
+    const x = @min(params.x_max, col +| params.x_offset) -| 1;
+    const y = @min(params.y_max, row +| params.y_offset) -| 1;
 
     // If the y is unchanged then this is fast pointer math
     if (y == self.screens.active.cursor.y) {
@@ -2291,6 +2384,76 @@ pub fn scrollViewport(self: *Terminal, behavior: ScrollViewport) void {
     });
 }
 
+/// Return the current compression activity value.
+///
+/// Callers should schedule a `compress` call whenever this value changes. The
+/// direction of the change has no meaning; this is an opaque change token
+/// rather than a monotonic sequence exposed by Terminal.
+///
+/// It is up to the terminal what it decides to compress, but currently
+/// we compress cold (non-viewed, non-editable) scrollback history on
+/// the primary screen.
+///
+/// Note that compression requires specific system features, namely
+/// the ability to retain virtual memory allocations while discarding their
+/// physical memory backings. Callers must still use `compress` to determine
+/// whether compression is supported on the current target.
+pub fn compressionActivity(self: *const Terminal) u64 {
+    const state = &self.screens.get(.primary).?.pages.page_compression;
+    // For now we don't use the extra 16 bits.
+    return @as(u64, state.activity_serial);
+}
+
+/// The amount of compression work performed by `compress` before returning.
+///
+/// The declaration order is part of the libghostty-vt C ABI. Removed values
+/// must leave a `null` hole so later values retain their integer values.
+pub const CompressionMode = lib.Enum(lib.target, &.{
+    "incremental",
+    "full",
+});
+
+/// The scheduling result of a `compress` call.
+///
+/// The declaration order is part of the libghostty-vt C ABI. Removed values
+/// must leave a `null` hole so later values retain their integer values.
+pub const CompressionResult = lib.Enum(lib.target, &.{
+    "unsupported",
+    "pending",
+    "complete",
+});
+
+/// Compress cold memory to save resident memory space.
+///
+/// Full compression does a full pass compressing everything it can before
+/// returning. This is not recommended for interactive terminals because
+/// compression is relatively slow and with large scrollbacks this can cause
+/// stalls.
+///
+/// Incremental compression bounds itself on how much data it can look
+/// up to compress and how much compression work it does before returning.
+/// It is stateful (we maintain the state) and the return value tells callers
+/// whether they should continue calling it in the future.
+///
+/// Callers should schedule compression when it doesn't impact user
+/// experience, for example during idle times.
+pub fn compress(
+    self: *Terminal,
+    mode: CompressionMode,
+) CompressionResult {
+    const pages = &self.screens.get(.primary).?.pages;
+    const result = switch (mode) {
+        .incremental => pages.compress(.incremental),
+        .full => pages.compress(.full),
+    };
+
+    return switch (result) {
+        .unsupported => .unsupported,
+        .pending => .pending,
+        .complete => .complete,
+    };
+}
+
 /// To be called before shifting a row (as in insertLines and deleteLines)
 ///
 /// Takes care of boundary conditions such as potentially split wide chars
@@ -2347,6 +2510,21 @@ fn rowWillBeShifted(
         right_cell.content.codepoint = 0;
         right_cell.wide = .narrow;
         tail_cell.wide = .narrow;
+    }
+}
+
+/// Renew every live page generation in an inclusive range before a full-width
+/// line operation moves logical rows between their coordinates.
+fn invalidateFullWidthRowRange(
+    self: *Terminal,
+    first: *PageList.List.Node,
+    last: *PageList.List.Node,
+) void {
+    var node = first;
+    while (true) : (node = node.next.?) {
+        // Full-width line movement remaps cached row coordinates in this page.
+        self.screens.active.pages.invalidateNodeLayout(node);
+        if (node == last) break;
     }
 }
 
@@ -2425,6 +2603,12 @@ pub fn insertLines(self: *Terminal, count: usize) void {
     };
     defer self.screens.active.pages.untrackPin(cur_p);
 
+    // Partial-width margins edit cells in stable rows; full-width moves rows.
+    if (!left_right) self.invalidateFullWidthRowRange(
+        self.screens.active.cursor.page_pin.node,
+        cur_p.node,
+    );
+
     // Our current y position relative to the cursor
     var y: usize = rem;
 
@@ -2439,8 +2623,8 @@ pub fn insertLines(self: *Terminal, count: usize) void {
             const off_rac = off_p.rowAndCell();
             const off_row: *Row = off_rac.row;
 
-            self.rowWillBeShifted(&cur_p.node.data, cur_row);
-            self.rowWillBeShifted(&off_p.node.data, off_row);
+            self.rowWillBeShifted(cur_p.node.page(), cur_row);
+            self.rowWillBeShifted(off_p.node.page(), off_row);
 
             // If our scrolling region is full width, then we unset wrap.
             if (!left_right) {
@@ -2458,8 +2642,8 @@ pub fn insertLines(self: *Terminal, count: usize) void {
             // If our page doesn't match, then we need to do a copy from
             // one page to another. This is the slow path.
             if (src_p.node != dst_p.node) {
-                dst_p.node.data.clonePartialRowFrom(
-                    &src_p.node.data,
+                dst_p.node.page().clonePartialRowFrom(
+                    src_p.node.page(),
                     dst_row,
                     src_row,
                     self.scrolling_region.left,
@@ -2522,11 +2706,11 @@ pub fn insertLines(self: *Terminal, count: usize) void {
                     src_row.* = dst;
 
                     // Ensure what we did didn't corrupt the page
-                    cur_p.node.data.assertIntegrity();
+                    cur_p.node.page().assertIntegrity();
                 } else {
                     // Left/right scroll margins we have to
                     // copy cells, which is much slower...
-                    const page = &cur_p.node.data;
+                    const page = cur_p.node.page();
                     page.moveCells(
                         src_row,
                         self.scrolling_region.left,
@@ -2538,8 +2722,8 @@ pub fn insertLines(self: *Terminal, count: usize) void {
             }
         } else {
             // Clear the cells for this row, it has been shifted.
-            self.rowWillBeShifted(&cur_p.node.data, cur_row);
-            const page = &cur_p.node.data;
+            self.rowWillBeShifted(cur_p.node.page(), cur_row);
+            const page = cur_p.node.page();
             const cells = page.getCells(cur_row);
             self.screens.active.clearCells(
                 page,
@@ -2620,6 +2804,12 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
     };
     defer self.screens.active.pages.untrackPin(cur_p);
 
+    // Partial-width margins edit cells in stable rows; full-width moves rows.
+    if (!left_right) self.invalidateFullWidthRowRange(
+        cur_p.node,
+        cur_p.down(rem - 1).?.node,
+    );
+
     // Our current y position relative to the cursor
     var y: usize = 0;
 
@@ -2634,8 +2824,8 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
             const off_rac = off_p.rowAndCell();
             const off_row: *Row = off_rac.row;
 
-            self.rowWillBeShifted(&cur_p.node.data, cur_row);
-            self.rowWillBeShifted(&off_p.node.data, off_row);
+            self.rowWillBeShifted(cur_p.node.page(), cur_row);
+            self.rowWillBeShifted(off_p.node.page(), off_row);
 
             // If our scrolling region is full width, then we unset wrap.
             if (!left_right) {
@@ -2653,8 +2843,8 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
             // If our page doesn't match, then we need to do a copy from
             // one page to another. This is the slow path.
             if (src_p.node != dst_p.node) {
-                dst_p.node.data.clonePartialRowFrom(
-                    &src_p.node.data,
+                dst_p.node.page().clonePartialRowFrom(
+                    src_p.node.page(),
                     dst_row,
                     src_row,
                     self.scrolling_region.left,
@@ -2710,11 +2900,11 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
                     src_row.* = dst;
 
                     // Ensure what we did didn't corrupt the page
-                    cur_p.node.data.assertIntegrity();
+                    cur_p.node.page().assertIntegrity();
                 } else {
                     // Left/right scroll margins we have to
                     // copy cells, which is much slower...
-                    const page = &cur_p.node.data;
+                    const page = cur_p.node.page();
                     page.moveCells(
                         src_row,
                         self.scrolling_region.left,
@@ -2726,8 +2916,8 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
             }
         } else {
             // Clear the cells for this row, it's from out of bounds.
-            self.rowWillBeShifted(&cur_p.node.data, cur_row);
-            const page = &cur_p.node.data;
+            self.rowWillBeShifted(cur_p.node.page(), cur_row);
+            const page = cur_p.node.page();
             const cells = page.getCells(cur_row);
             self.screens.active.clearCells(
                 page,
@@ -2781,7 +2971,7 @@ pub fn insertBlanks(self: *Terminal, count: usize) void {
 
     // left is just the cursor position but as a multi-pointer
     const left: [*]Cell = @ptrCast(self.screens.active.cursor.page_cell);
-    var page = &self.screens.active.cursor.page_pin.node.data;
+    var page = self.screens.active.cursor.page_pin.node.page();
 
     // If our X is a wide spacer tail then we need to erase the
     // previous cell too so we don't split a multi-cell character.
@@ -2864,7 +3054,7 @@ pub fn deleteChars(self: *Terminal, count_req: usize) void {
 
     // left is just the cursor position but as a multi-pointer
     const left: [*]Cell = @ptrCast(self.screens.active.cursor.page_cell);
-    var page = &self.screens.active.cursor.page_pin.node.data;
+    var page = self.screens.active.cursor.page_pin.node.page();
 
     // Remaining cols from our cursor to the right margin.
     const rem = self.scrolling_region.right - self.screens.active.cursor.x + 1;
@@ -2941,7 +3131,7 @@ pub fn eraseChars(self: *Terminal, count_req: usize) void {
     // mode was not ISO we also always ignore protection attributes.
     if (self.screens.active.protected_mode != .iso) {
         self.screens.active.clearCells(
-            &self.screens.active.cursor.page_pin.node.data,
+            self.screens.active.cursor.page_pin.node.page(),
             self.screens.active.cursor.page_row,
             cells[0..count],
         );
@@ -2949,7 +3139,7 @@ pub fn eraseChars(self: *Terminal, count_req: usize) void {
     }
 
     self.screens.active.clearUnprotectedCells(
-        &self.screens.active.cursor.page_pin.node.data,
+        self.screens.active.cursor.page_pin.node.page(),
         self.screens.active.cursor.page_row,
         cells[0..count],
     );
@@ -3021,7 +3211,7 @@ pub fn eraseLine(
     // to fill the entire line.
     if (!protected) {
         self.screens.active.clearCells(
-            &self.screens.active.cursor.page_pin.node.data,
+            self.screens.active.cursor.page_pin.node.page(),
             self.screens.active.cursor.page_row,
             cells[start..end],
         );
@@ -3029,7 +3219,7 @@ pub fn eraseLine(
     }
 
     self.screens.active.clearUnprotectedCells(
-        &self.screens.active.cursor.page_pin.node.data,
+        self.screens.active.cursor.page_pin.node.page(),
         self.screens.active.cursor.page_row,
         cells[start..end],
     );
@@ -3203,7 +3393,7 @@ pub fn decaln(self: *Terminal) !void {
 
     // Fill with Es by moving the cursor but reset it after.
     while (true) {
-        const page = &self.screens.active.cursor.page_pin.node.data;
+        const page = self.screens.active.cursor.page_pin.node.page();
         const row = self.screens.active.cursor.page_row;
         const cells_multi: [*]Cell = row.cells.ptr(page.memory);
         const cells = cells_multi[0..page.size.cols];
@@ -3413,75 +3603,522 @@ pub fn deccolm(self: *Terminal, alloc: Allocator, mode: DeccolmMode) !void {
     self.modes.set(.@"132_column", mode == .@"132_cols");
 
     // Resize to the requested size
-    try self.resize(
-        alloc,
-        switch (mode) {
+    try self.resize(alloc, .{
+        .cols = switch (mode) {
             .@"132_cols" => 132,
             .@"80_cols" => 80,
         },
-        self.rows,
-    );
+        .rows = self.rows,
+    });
 
     // Erase our display and move our cursor.
     self.eraseDisplay(.complete, false);
     self.setCursorPos(1, 1);
 }
 
+/// A terminal resize expressed in cells with optional per-cell pixel
+/// geometry. It is highly recommended that callers supply cell geometry
+/// but a terminal can technically function without it (but some reports
+/// like certain mouse reporting modes and Kitty image protocol will
+/// not be functional).
+///
+/// Cell pixel dimensions must already be scaled for the current display DPI.
+pub const Resize = struct {
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+    cell_size_px: ?struct {
+        width: u32,
+        height: u32,
+    } = null,
+};
+
+pub const ResizeError = error{
+    /// Resize requires allocation
+    OutOfMemory,
+
+    /// Input value was invalid, such as a 0-sized dimension.
+    InvalidValue,
+};
+
+const resize_tw = tripwire.module(enum {
+    tabstops,
+    primary_screen,
+    alternate_screen,
+    alternate_screen_init,
+}, resize);
+
 /// Resize the underlying terminal.
+///
+/// This has follow-on impacts:
+///
+///   - If the column count changes, tabstops are reset.
+///   - The scroll region is always reset
+///   - Synchronized output mode is reset for every successful resize.
+///
+/// This handles errors gracefully and recovers the terminal back to
+/// a clean usable state.
+///
+/// The only error handling edge case is in the highly exceptional scenario
+/// where the primary screen can be resized but the alternate screen cannot.
+/// In this scenario, we attempt to clear the alt screen at the desired
+/// new size. If that fails, we unconditionally deallocate the alt screen
+/// and move to primary screen. This can break terminal programs but it
+/// requires a really particular scenario where memory exists for one
+/// but not the other and we do our best.
 pub fn resize(
     self: *Terminal,
     alloc: Allocator,
-    cols: size.CellCountInt,
-    rows: size.CellCountInt,
-) !void {
-    // If our cols/rows didn't change then we're done
-    if (self.cols == cols and self.rows == rows) return;
+    opts: Resize,
+) ResizeError!void {
+    const tw = resize_tw;
 
-    // Resize our tabstops
-    if (self.cols != cols) {
-        self.tabstops.deinit(alloc);
-        self.tabstops = try .init(alloc, cols, 8);
+    // Screen and scrolling-region invariants require non-zero dimensions.
+    // Validate before changing any terminal state.
+    if (opts.cols == 0 or opts.rows == 0) return error.InvalidValue;
+
+    // Pixel geometry and synchronized output are updated on every valid
+    // resize attempt, including one that doesn't change the grid dimensions.
+    // Save their old values so later allocation failures can roll them back.
+    const old_width_px = self.width_px;
+    const old_height_px = self.height_px;
+    const old_synchronized_output = self.modes.get(.synchronized_output);
+    errdefer {
+        self.width_px = old_width_px;
+        self.height_px = old_height_px;
+        self.modes.set(.synchronized_output, old_synchronized_output);
     }
 
-    // Resize primary screen, which supports reflow
+    // If our pixel geometry was set, then we set it even if our rows/cols
+    // didn't change.
+    if (opts.cell_size_px) |cell_size| {
+        self.width_px = std.math.mul(
+            u32,
+            opts.cols,
+            cell_size.width,
+        ) catch std.math.maxInt(u32);
+        self.height_px = std.math.mul(
+            u32,
+            opts.rows,
+            cell_size.height,
+        ) catch std.math.maxInt(u32);
+    }
+
+    self.modes.set(.synchronized_output, false);
+
+    // If our cols/rows didn't change, skip grid work but still apply pixels.
+    if (self.cols == opts.cols and self.rows == opts.rows) return;
+
+    // Build replacement tabstops without touching the current table. Keep
+    // ownership here until every fallible resize operation has succeeded.
+    var new_tabstops: ?Tabstops = null;
+    errdefer if (new_tabstops) |*v| v.deinit(alloc);
+    if (self.cols != opts.cols) {
+        try tw.check(.tabstops);
+        new_tabstops = try .init(
+            alloc,
+            opts.cols,
+            TABSTOP_INTERVAL,
+        );
+    }
+
+    // Resize primary screen, which supports reflow. We do this first
+    // because the cleanup situation is a lot better if this succeeds
+    // and alt fails than the reverse.
+    try tw.check(.primary_screen);
     const primary = self.screens.get(.primary).?;
     try primary.resize(.{
-        .cols = cols,
-        .rows = rows,
+        .cols = opts.cols,
+        .rows = opts.rows,
         .reflow = self.modes.get(.wraparound),
         .prompt_redraw = self.flags.shell_redraws_prompt,
     });
 
-    // Alternate screen, if it exists, doesn't reflow
-    if (self.screens.get(.alternate)) |alt| try alt.resize(.{
-        .cols = cols,
-        .rows = rows,
-        .reflow = false,
-    });
+    // Alternate screen, if it exists, doesn't reflow. The primary resize
+    // above can't be losslessly undone, so if the alternate resize fails we
+    // replace it with an empty screen at the requested size. If that
+    // also fails, we fall back to the primary screen.
+    if (self.screens.get(.alternate)) |alt| alt: {
+        const err: ResizeError = resize: {
+            tw.check(.alternate_screen) catch |err| break :resize err;
+            alt.resize(.{
+                .cols = opts.cols,
+                .rows = opts.rows,
+                .reflow = false,
+            }) catch |err| break :resize err;
+
+            // Resize succeeded.
+            break :alt;
+        };
+
+        log.warn("alternate screen resize failed, replacing it err={}", .{err});
+
+        // If the alternate screen isn't active, then we just free it
+        // and move on. It'll be reallocated when it gets reinitialized lazily.
+        // In this case, we just lose the prior data if the terminal program
+        // expected it to be saved.
+        if (self.screens.active_key != .alternate) {
+            self.screens.remove(alloc, .alternate);
+            break :alt;
+        }
+
+        // The alt screen is active, so we temporarily switch to primary
+        // so we can safely remove the alt and recreate it blank. This loses
+        // the data but hopefully keeps us on the alt screen.
+        const charset = alt.charset;
+        self.screens.switchTo(.primary);
+        self.screens.remove(alloc, .alternate);
+
+        // Replace the alt screen with an empty version. If this fails
+        // we just go back to the primary screen. Not great, but best
+        // we can do.
+        tw.check(.alternate_screen_init) catch break :alt;
+        const replacement = self.screens.getInit(alloc, .alternate, .{
+            .cols = opts.cols,
+            .rows = opts.rows,
+            .max_scrollback = 0,
+            .kitty_image_storage_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.total_limit
+            else
+                0,
+            .kitty_image_loading_limits = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.image_limits
+            else {},
+        }) catch |init_err| {
+            log.warn(
+                "alternate screen replacement failed, falling back to primary err={}",
+                .{init_err},
+            );
+            break :alt;
+        };
+
+        replacement.charset = charset;
+        self.screens.switchTo(.alternate);
+    }
+
+    // No more failures are allowed after this point because the screens have
+    // committed their new sizes and the remaining Terminal state must follow.
+    errdefer comptime unreachable;
+
+    // All fallible work is complete. Replace the old tabstop table only now.
+    if (new_tabstops) |v| {
+        self.tabstops.deinit(alloc);
+        self.tabstops = v;
+        new_tabstops = null;
+    }
 
     // Whenever we resize we just mark it as a screen clear
     self.flags.dirty.clear = true;
 
     // Set our size
-    self.cols = cols;
-    self.rows = rows;
+    self.cols = opts.cols;
+    self.rows = opts.rows;
 
     // Reset the scrolling region
     self.scrolling_region = .{
         .top = 0,
-        .bottom = rows - 1,
+        .bottom = opts.rows - 1,
         .left = 0,
-        .right = cols - 1,
+        .right = opts.cols - 1,
     };
+}
+
+test "Terminal: resize resets synchronized output" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    t.modes.set(.synchronized_output, true);
+    try t.resize(alloc, .{ .cols = 10, .rows = 5 });
+    try testing.expect(!t.modes.get(.synchronized_output));
+}
+
+test "Terminal: resize rejects zero dimensions before mutation" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    t.width_px = 100;
+    t.height_px = 100;
+    t.flags.dirty.clear = false;
+
+    try testing.expectError(error.InvalidValue, t.resize(alloc, .{
+        .cols = 0,
+        .rows = 5,
+        .cell_size_px = .{ .width = 9, .height = 18 },
+    }));
+    try testing.expectError(error.InvalidValue, t.resize(alloc, .{
+        .cols = 10,
+        .rows = 0,
+        .cell_size_px = .{ .width = 9, .height = 18 },
+    }));
+
+    try testing.expectEqual(@as(size.CellCountInt, 10), t.cols);
+    try testing.expectEqual(@as(size.CellCountInt, 5), t.rows);
+    try testing.expectEqual(@as(u32, 100), t.width_px);
+    try testing.expectEqual(@as(u32, 100), t.height_px);
+    try testing.expect(!t.flags.dirty.clear);
+}
+
+test "Terminal: resize preserves pixel dimensions when omitted" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    t.width_px = 90;
+    t.height_px = 90;
+    try t.resize(alloc, .{ .cols = 20, .rows = 10 });
+
+    try testing.expectEqual(@as(u32, 90), t.width_px);
+    try testing.expectEqual(@as(u32, 90), t.height_px);
+}
+
+test "Terminal: resize updates pixels without changing cell dimensions" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    try t.resize(alloc, .{
+        .cols = 10,
+        .rows = 5,
+        .cell_size_px = .{ .width = 9, .height = 18 },
+    });
+
+    try testing.expectEqual(@as(u32, 90), t.width_px);
+    try testing.expectEqual(@as(u32, 90), t.height_px);
+}
+
+test "Terminal: resize pixel dimensions saturate" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 2, .rows = 3 });
+    defer t.deinit(alloc);
+
+    try t.resize(alloc, .{
+        .cols = 2,
+        .rows = 3,
+        .cell_size_px = .{
+            .width = std.math.maxInt(u32),
+            .height = std.math.maxInt(u32),
+        },
+    });
+
+    try testing.expectEqual(std.math.maxInt(u32), t.width_px);
+    try testing.expectEqual(std.math.maxInt(u32), t.height_px);
+}
+
+test "Terminal: resize preserves tabstops on allocation failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing.allocator();
+    var t = try init(alloc, .{ .cols = 10, .rows = 1 });
+    defer t.deinit(alloc);
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, t.resize(alloc, .{
+        .cols = 513,
+        .rows = 1,
+    }));
+
+    try testing.expectEqual(@as(size.CellCountInt, 10), t.cols);
+    try testing.expect(t.tabstops.get(8));
+}
+
+test "Terminal: resize failure paths preserve consistent state" {
+    const alloc = testing.allocator;
+
+    for ([_]resize_tw.FailPoint{
+        .tabstops,
+        .primary_screen,
+        .alternate_screen,
+    }) |tag| {
+        const tw = resize_tw;
+        defer tw.end(.reset) catch unreachable;
+
+        var t = try init(alloc, .{ .cols = 10, .rows = 3 });
+        defer t.deinit(alloc);
+
+        try t.printString("primary");
+        _ = try t.switchScreen(.alternate);
+        try t.printString("alternate");
+        _ = try t.switchScreen(.primary);
+
+        t.width_px = 100;
+        t.height_px = 50;
+        t.modes.set(.synchronized_output, true);
+        t.flags.dirty.clear = false;
+        t.scrolling_region = .{
+            .top = 1,
+            .bottom = 2,
+            .left = 1,
+            .right = 8,
+        };
+        t.tabstops.unset(8);
+        t.tabstops.set(3);
+
+        const primary = t.screens.get(.primary).?;
+        const alternate = t.screens.get(.alternate).?;
+        const alternate_generation = t.screens.generation(.alternate);
+        try testing.expectEqual(primary.pages.pages.first, primary.pages.pages.last);
+        try testing.expectEqual(alternate.pages.pages.first, alternate.pages.pages.last);
+
+        const before = t;
+        const before_primary = primary.*;
+        const before_alternate = alternate.*;
+        const before_primary_page = try alloc.dupe(
+            u8,
+            primary.pages.pages.first.?.page().memory,
+        );
+        defer alloc.free(before_primary_page);
+        const before_alternate_page = try alloc.dupe(
+            u8,
+            alternate.pages.pages.first.?.page().memory,
+        );
+        defer alloc.free(before_alternate_page);
+        tw.errorAlways(tag, error.OutOfMemory);
+
+        // A failure after the primary screen has resized is recovered by
+        // dropping the inactive alternate and completing the resize. This
+        // also proves the alternate tripwire is after the primary resize
+        // rather than acting as a preflight check.
+        if (tag == .alternate_screen) {
+            try t.resize(alloc, .{
+                .cols = 513,
+                .rows = 4,
+                .cell_size_px = .{ .width = 9, .height = 18 },
+            });
+
+            try testing.expectEqual(@as(size.CellCountInt, 513), t.cols);
+            try testing.expectEqual(@as(size.CellCountInt, 4), t.rows);
+            try testing.expectEqual(@as(u32, 4617), t.width_px);
+            try testing.expectEqual(@as(u32, 72), t.height_px);
+            try testing.expect(!t.modes.get(.synchronized_output));
+            try testing.expect(t.flags.dirty.clear);
+            try testing.expectEqual(@as(size.CellCountInt, 513), primary.pages.cols);
+            try testing.expectEqual(@as(size.CellCountInt, 4), primary.pages.rows);
+            try testing.expectEqual(@as(?*Screen, null), t.screens.get(.alternate));
+            try testing.expectEqual(
+                alternate_generation +% 1,
+                t.screens.generation(.alternate),
+            );
+            try testing.expectEqual(.primary, t.screens.active_key);
+            try testing.expectEqual(primary, t.screens.active);
+            try testing.expect(t.tabstops.get(8));
+            try testing.expect(!t.tabstops.get(3));
+
+            // The alternate is recreated lazily at the terminal's new size.
+            _ = try t.switchScreen(.alternate);
+            const replacement = t.screens.get(.alternate).?;
+            try testing.expectEqual(@as(size.CellCountInt, 513), replacement.pages.cols);
+            try testing.expectEqual(@as(size.CellCountInt, 4), replacement.pages.rows);
+            try testing.expect(replacement.pages.getCell(.{ .active = .{} }).?.cell.isEmpty());
+            continue;
+        }
+
+        try testing.expectError(error.OutOfMemory, t.resize(alloc, .{
+            .cols = 513,
+            .rows = 4,
+            .cell_size_px = .{ .width = 9, .height = 18 },
+        }));
+
+        try testing.expectEqual(before.width_px, t.width_px);
+        try testing.expectEqual(before.height_px, t.height_px);
+        try testing.expect(std.meta.eql(before.modes, t.modes));
+        try testing.expectEqual(before.cols, t.cols);
+        try testing.expectEqual(before.rows, t.rows);
+        try testing.expectEqual(before.scrolling_region, t.scrolling_region);
+        try testing.expectEqual(before.flags, t.flags);
+        try testing.expect(std.meta.eql(before.tabstops, t.tabstops));
+        try testing.expectEqual(before.screens.active_key, t.screens.active_key);
+        try testing.expectEqual(before.screens.active, t.screens.active);
+
+        try testing.expectEqual(before_primary.pages.cols, primary.pages.cols);
+        try testing.expectEqual(before_primary.pages.rows, primary.pages.rows);
+        try testing.expectEqual(
+            before_primary.pages.total_rows,
+            primary.pages.total_rows,
+        );
+        try testing.expect(std.meta.eql(before_primary.cursor, primary.cursor));
+        try testing.expectEqualSlices(
+            u8,
+            before_primary_page,
+            primary.pages.pages.first.?.page().memory,
+        );
+
+        try testing.expectEqual(before_alternate.pages.cols, alternate.pages.cols);
+        try testing.expectEqual(before_alternate.pages.rows, alternate.pages.rows);
+        try testing.expectEqual(
+            before_alternate.pages.total_rows,
+            alternate.pages.total_rows,
+        );
+        try testing.expect(std.meta.eql(before_alternate.cursor, alternate.cursor));
+        try testing.expectEqualSlices(
+            u8,
+            before_alternate_page,
+            alternate.pages.pages.first.?.page().memory,
+        );
+    }
+}
+
+test "Terminal: alternate resize failure replaces active alternate screen" {
+    const alloc = testing.allocator;
+    const tw = resize_tw;
+    defer tw.end(.reset) catch unreachable;
+
+    var t = try init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    _ = try t.switchScreen(.alternate);
+    try testing.expectEqual(.alternate, t.screens.active_key);
+    t.screens.active.charset.gl = .G1;
+    try t.printString("alternate");
+    const generation = t.screens.generation(.alternate);
+
+    tw.errorAlways(.alternate_screen, error.OutOfMemory);
+    try t.resize(alloc, .{ .cols = 20, .rows = 4 });
+
+    const alternate = t.screens.get(.alternate).?;
+    try testing.expectEqual(.alternate, t.screens.active_key);
+    try testing.expectEqual(alternate, t.screens.active);
+    try testing.expectEqual(@as(size.CellCountInt, 20), alternate.pages.cols);
+    try testing.expectEqual(@as(size.CellCountInt, 4), alternate.pages.rows);
+    try testing.expect(alternate.pages.getCell(.{ .active = .{} }).?.cell.isEmpty());
+    try testing.expectEqual(.G1, alternate.charset.gl);
+    try testing.expectEqual(generation +% 1, t.screens.generation(.alternate));
+}
+
+test "Terminal: alternate resize replacement failure falls back to primary" {
+    const alloc = testing.allocator;
+    const tw = resize_tw;
+    defer tw.end(.reset) catch unreachable;
+
+    var t = try init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    _ = try t.switchScreen(.alternate);
+    tw.errorAlways(.alternate_screen, error.OutOfMemory);
+    tw.errorAlways(.alternate_screen_init, error.OutOfMemory);
+    try t.resize(alloc, .{ .cols = 20, .rows = 4 });
+
+    const primary = t.screens.get(.primary).?;
+    try testing.expectEqual(@as(?*Screen, null), t.screens.get(.alternate));
+    try testing.expectEqual(.primary, t.screens.active_key);
+    try testing.expectEqual(primary, t.screens.active);
+    try testing.expectEqual(@as(size.CellCountInt, 20), primary.pages.cols);
+    try testing.expectEqual(@as(size.CellCountInt, 4), primary.pages.rows);
 }
 
 /// Set the pwd for the terminal.
 pub fn setPwd(self: *Terminal, pwd: []const u8) !void {
-    self.pwd.clearRetainingCapacity();
-    if (pwd.len > 0) {
-        try self.pwd.appendSlice(self.gpa(), pwd);
-        try self.pwd.append(self.gpa(), 0);
+    if (pwd.len == 0) {
+        self.pwd.clearRetainingCapacity();
+        return;
     }
+
+    const capacity = std.math.add(usize, pwd.len, 1) catch
+        return error.OutOfMemory;
+    try self.pwd.ensureTotalCapacity(self.gpa(), capacity);
+
+    self.pwd.items.len = capacity;
+    std.mem.copyForwards(u8, self.pwd.items[0..pwd.len], pwd);
+    self.pwd.items[pwd.len] = 0;
 }
 
 /// Returns the pwd for the terminal, if any. The memory is owned by the
@@ -3491,13 +4128,41 @@ pub fn getPwd(self: *const Terminal) ?[:0]const u8 {
     return self.pwd.items[0 .. self.pwd.items.len - 1 :0];
 }
 
+test "Terminal: setPwd preserves a sentinel on allocation failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing.allocator();
+    var t = try init(alloc, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(alloc);
+
+    try t.pwd.ensureTotalCapacityPrecise(alloc, 3);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, t.setPwd("pwd"));
+    try testing.expect(t.getPwd() == null);
+}
+
+test "Terminal: setPwd accepts its current value" {
+    var t = try init(testing.allocator, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(testing.allocator);
+
+    try t.setPwd("file:///tmp");
+    try t.setPwd(t.getPwd().?);
+    try testing.expectEqualStrings("file:///tmp", t.getPwd().?);
+}
+
 /// Set the title for the terminal, as set by escape sequences (e.g. OSC 0/2).
 pub fn setTitle(self: *Terminal, t: []const u8) !void {
-    self.title.clearRetainingCapacity();
-    if (t.len > 0) {
-        try self.title.appendSlice(self.gpa(), t);
-        try self.title.append(self.gpa(), 0);
+    if (t.len == 0) {
+        self.title.clearRetainingCapacity();
+        return;
     }
+
+    const capacity = std.math.add(usize, t.len, 1) catch
+        return error.OutOfMemory;
+    try self.title.ensureTotalCapacity(self.gpa(), capacity);
+
+    self.title.items.len = capacity;
+    std.mem.copyForwards(u8, self.title.items[0..t.len], t);
+    self.title.items[t.len] = 0;
 }
 
 /// Returns the title for the terminal, if any. The memory is owned by the
@@ -3505,6 +4170,27 @@ pub fn setTitle(self: *Terminal, t: []const u8) !void {
 pub fn getTitle(self: *const Terminal) ?[:0]const u8 {
     if (self.title.items.len == 0) return null;
     return self.title.items[0 .. self.title.items.len - 1 :0];
+}
+
+test "Terminal: setTitle preserves a sentinel on allocation failure" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing.allocator();
+    var t = try init(alloc, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(alloc);
+
+    try t.title.ensureTotalCapacityPrecise(alloc, 5);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, t.setTitle("title"));
+    try testing.expect(t.getTitle() == null);
+}
+
+test "Terminal: setTitle accepts its current value" {
+    var t = try init(testing.allocator, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(testing.allocator);
+
+    try t.setTitle("Ghostty");
+    try t.setTitle(t.getTitle().?);
+    try testing.expectEqualStrings("Ghostty", t.getTitle().?);
 }
 
 /// Switch to the given screen type (alternate or primary).
@@ -3728,6 +4414,7 @@ pub fn fullReset(self: *Terminal) void {
         .left = 0,
         .right = self.cols - 1,
     };
+    self.setCursorStyle(.default);
 
     // Always mark dirty so we redraw everything
     self.flags.dirty.clear = true;
@@ -3741,6 +4428,24 @@ fn isDirty(t: *const Terminal, pt: point.Point) bool {
 /// Clear all dirty bits. Testing only.
 fn clearDirty(t: *Terminal) void {
     t.screens.active.pages.clearDirty();
+}
+
+test "Terminal: setCursorPos saturates overflowing origin offsets" {
+    const alloc = testing.allocator;
+    var t = try init(alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+
+    t.scrolling_region = .{
+        .top = 2,
+        .bottom = 7,
+        .left = 3,
+        .right = 8,
+    };
+    t.modes.set(.origin, true);
+
+    t.setCursorPos(std.math.maxInt(usize), std.math.maxInt(usize));
+    try testing.expectEqual(@as(size.CellCountInt, 8), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 7), t.screens.active.cursor.y);
 }
 
 test "Terminal: input with no control characters" {
@@ -3838,19 +4543,19 @@ test "Terminal: input glitch text" {
     // Get our initial grapheme capacity.
     const grapheme_cap = cap: {
         const page = t.screens.active.pages.pages.first.?;
-        break :cap page.data.capacity.grapheme_bytes;
+        break :cap page.capacity().grapheme_bytes;
     };
 
     // Print glitch text until our capacity changes
     while (true) {
         const page = t.screens.active.pages.pages.first.?;
-        if (page.data.capacity.grapheme_bytes != grapheme_cap) break;
+        if (page.capacity().grapheme_bytes != grapheme_cap) break;
         try t.printString(glitch);
     }
 
     // We're testing to make sure that grapheme capacity gets increased.
     const page = t.screens.active.pages.pages.first.?;
-    try testing.expect(page.data.capacity.grapheme_bytes > grapheme_cap);
+    try testing.expect(page.capacity().grapheme_bytes > grapheme_cap);
 }
 
 test "Terminal: zero-width character at start" {
@@ -4086,7 +4791,7 @@ test "Terminal: print over wide char with bold" {
     try t.print(0x1F600); // Smiley face
     // verify we have styles in our style map
     {
-        const page = &t.screens.active.cursor.page_pin.node.data;
+        const page = t.screens.active.cursor.page_pin.node.page();
         try testing.expectEqual(@as(usize, 1), page.styles.count());
     }
 
@@ -4097,7 +4802,7 @@ test "Terminal: print over wide char with bold" {
 
     // verify our style is gone
     {
-        const page = &t.screens.active.cursor.page_pin.node.data;
+        const page = t.screens.active.cursor.page_pin.node.page();
         try testing.expectEqual(@as(usize, 0), page.styles.count());
     }
 
@@ -4116,7 +4821,7 @@ test "Terminal: print over wide char with bg color" {
     try t.print(0x1F600); // Smiley face
     // verify we have styles in our style map
     {
-        const page = &t.screens.active.cursor.page_pin.node.data;
+        const page = t.screens.active.cursor.page_pin.node.page();
         try testing.expectEqual(@as(usize, 1), page.styles.count());
     }
 
@@ -4127,7 +4832,7 @@ test "Terminal: print over wide char with bg color" {
 
     // verify our style is gone
     {
-        const page = &t.screens.active.cursor.page_pin.node.data;
+        const page = t.screens.active.cursor.page_pin.node.page();
         try testing.expectEqual(@as(usize, 0), page.styles.count());
     }
 
@@ -4158,7 +4863,7 @@ test "Terminal: print multicodepoint grapheme, disabled mode 2027" {
         try testing.expectEqual(@as(u21, 0x1F468), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
     }
     {
@@ -4167,7 +4872,7 @@ test "Terminal: print multicodepoint grapheme, disabled mode 2027" {
         try testing.expectEqual(@as(u21, 0), cell.content.codepoint);
         try testing.expect(!cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
-        try testing.expect(list_cell.node.data.lookupGrapheme(cell) == null);
+        try testing.expect(list_cell.node.page().lookupGrapheme(cell) == null);
     }
     {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 0 } }).?;
@@ -4175,7 +4880,7 @@ test "Terminal: print multicodepoint grapheme, disabled mode 2027" {
         try testing.expectEqual(@as(u21, 0x1F469), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
     }
     {
@@ -4184,7 +4889,7 @@ test "Terminal: print multicodepoint grapheme, disabled mode 2027" {
         try testing.expectEqual(@as(u21, 0), cell.content.codepoint);
         try testing.expect(!cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
-        try testing.expect(list_cell.node.data.lookupGrapheme(cell) == null);
+        try testing.expect(list_cell.node.page().lookupGrapheme(cell) == null);
     }
     {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
@@ -4192,7 +4897,7 @@ test "Terminal: print multicodepoint grapheme, disabled mode 2027" {
         try testing.expectEqual(@as(u21, 0x1F467), cell.content.codepoint);
         try testing.expect(!cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
-        try testing.expect(list_cell.node.data.lookupGrapheme(cell) == null);
+        try testing.expect(list_cell.node.page().lookupGrapheme(cell) == null);
     }
     {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 5, .y = 0 } }).?;
@@ -4200,10 +4905,26 @@ test "Terminal: print multicodepoint grapheme, disabled mode 2027" {
         try testing.expectEqual(@as(u21, 0), cell.content.codepoint);
         try testing.expect(!cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.spacer_tail, cell.wide);
-        try testing.expect(list_cell.node.data.lookupGrapheme(cell) == null);
+        try testing.expect(list_cell.node.page().lookupGrapheme(cell) == null);
     }
 
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+}
+
+test "Terminal: enabling grapheme mode handles stored breaks" {
+    var t = try init(testing.allocator, .{ .cols = 5, .rows = 1 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.grapheme_cluster, false);
+    try t.print('a');
+    try t.print(0x200B); // Zero width space is stored on the prior cell.
+
+    t.modes.set(.grapheme_cluster, true);
+    try t.print(0x0301);
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("a\xE2\x80\x8B\xCC\x81", str);
 }
 
 // Terminal.print receives one codepoint at a time, so it can't use
@@ -4266,7 +4987,7 @@ test "Terminal: VS16 doesn't make character with 2027 disabled" {
         try testing.expectEqual(@as(u21, 0x2764), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
     }
 }
@@ -4347,7 +5068,7 @@ test "Terminal: variation selectors apply to preceding codepoint" {
     const cell = list_cell.cell;
     try testing.expectEqual(@as(u21, 0x1F3F4), cell.content.codepoint);
     try testing.expect(cell.hasGrapheme());
-    try testing.expectEqualSlices(u21, &.{ 0x200D, 0x2620, 0xFE0F }, list_cell.node.data.lookupGrapheme(cell).?);
+    try testing.expectEqualSlices(u21, &.{ 0x200D, 0x2620, 0xFE0F }, list_cell.node.page().lookupGrapheme(cell).?);
 }
 
 test "Terminal: print multicodepoint grapheme, mode 2027" {
@@ -4380,7 +5101,7 @@ test "Terminal: print multicodepoint grapheme, mode 2027" {
         try testing.expectEqual(@as(u21, 0x1F468), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 4), cps.len);
     }
     {
@@ -4588,7 +5309,7 @@ test "Terminal: VS15 to make narrow character" {
         try testing.expectEqual(@as(u21, 0x2614), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
     }
 }
@@ -4623,7 +5344,7 @@ test "Terminal: VS15 on already narrow emoji" {
         try testing.expectEqual(@as(u21, 0x26C8), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
     }
 }
@@ -4682,7 +5403,7 @@ test "Terminal: print invalid VS15 in emoji ZWJ sequence" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, '\u{1F469}'), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
-        try testing.expectEqualSlices(u21, &.{ '\u{200D}', '\u{1F466}' }, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqualSlices(u21, &.{ '\u{200D}', '\u{1F466}' }, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
     }
     {
@@ -4734,7 +5455,7 @@ test "Terminal: VS15 to make narrow character with pending wrap" {
         try testing.expectEqual(@as(u21, 0x2614), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
     }
 
@@ -4785,7 +5506,7 @@ test "Terminal: VS16 to make wide character on next line" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, '#'), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
-        try testing.expectEqualSlices(u21, &.{0xFE0F}, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqualSlices(u21, &.{0xFE0F}, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
     }
     {
@@ -4836,7 +5557,7 @@ test "Terminal: VS16 to make wide character on next line with hyperlink" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, '#'), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
-        try testing.expectEqualSlices(u21, &.{0xFE0F}, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqualSlices(u21, &.{0xFE0F}, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
         try testing.expect(cell.hyperlink);
     }
@@ -4874,7 +5595,7 @@ test "Terminal: VS16 to make wide character with pending wrap" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, '#'), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
-        try testing.expectEqualSlices(u21, &.{0xFE0F}, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqualSlices(u21, &.{0xFE0F}, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
     }
     {
@@ -4913,7 +5634,7 @@ test "Terminal: VS16 to make wide character with mode 2027" {
         try testing.expectEqual(@as(u21, 0x2764), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
     }
 }
@@ -4944,7 +5665,7 @@ test "Terminal: VS16 repeated with mode 2027" {
         try testing.expectEqual(@as(u21, 0x2764), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
     }
     {
@@ -4953,7 +5674,7 @@ test "Terminal: VS16 repeated with mode 2027" {
         try testing.expectEqual(@as(u21, 0x2764), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
-        const cps = list_cell.node.data.lookupGrapheme(cell).?;
+        const cps = list_cell.node.page().lookupGrapheme(cell).?;
         try testing.expectEqual(@as(usize, 1), cps.len);
     }
 }
@@ -5046,7 +5767,7 @@ test "Terminal: print grapheme ò (o with nonspacing mark) should be narrow" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, 'o'), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
-        try testing.expectEqualSlices(u21, &.{0x0300}, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqualSlices(u21, &.{0x0300}, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
     }
 }
@@ -5075,7 +5796,7 @@ test "Terminal: print Devanagari grapheme should be wide" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, 0x0915), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
-        try testing.expectEqualSlices(u21, &.{ 0x094D, 0x200D, 0x0937 }, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqualSlices(u21, &.{ 0x094D, 0x200D, 0x0937 }, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
     }
     {
@@ -5123,7 +5844,7 @@ test "Terminal: print Devanagari grapheme should be wide on next line" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, 0x0915), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
-        try testing.expectEqualSlices(u21, &.{ 0x094D, 0x200D, 0x0937 }, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqualSlices(u21, &.{ 0x094D, 0x200D, 0x0937 }, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
     }
     {
@@ -5144,7 +5865,7 @@ test "Terminal: print Devanagari grapheme should be wide on next page" {
 
     t.cursorDown(rows - 1);
 
-    for (rows..t.screens.active.pages.pages.first.?.data.capacity.rows) |_| {
+    for (rows..t.screens.active.pages.pages.first.?.capacity().rows) |_| {
         try t.index();
     }
 
@@ -5182,7 +5903,7 @@ test "Terminal: print Devanagari grapheme should be wide on next page" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, 0x0915), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
-        try testing.expectEqualSlices(u21, &.{ 0x094D, 0x200D, 0x0937 }, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqualSlices(u21, &.{ 0x094D, 0x200D, 0x0937 }, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.wide, cell.wide);
     }
     {
@@ -5215,7 +5936,7 @@ test "Terminal: print invalid VS16 with second char (combining)" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, 'n'), cell.content.codepoint);
         try testing.expect(cell.hasGrapheme());
-        try testing.expectEqualSlices(u21, &.{'\u{0303}'}, list_cell.node.data.lookupGrapheme(cell).?);
+        try testing.expectEqualSlices(u21, &.{'\u{0303}'}, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
     }
     {
@@ -5277,7 +5998,7 @@ test "Terminal: overwrite multicodepoint grapheme clears grapheme data" {
     try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
 
     // We should have one cell with graphemes
-    const page = &t.screens.active.cursor.page_pin.node.data;
+    const page = t.screens.active.cursor.page_pin.node.page();
     try testing.expectEqual(@as(usize, 1), page.graphemeCount());
 
     // Move back and overwrite wide
@@ -5317,7 +6038,7 @@ test "Terminal: overwrite multicodepoint grapheme tail clears grapheme data" {
     try testing.expectEqual(@as(usize, 2), t.screens.active.cursor.x);
 
     // We should have one cell with graphemes
-    const page = &t.screens.active.cursor.page_pin.node.data;
+    const page = t.screens.active.cursor.page_pin.node.page();
     try testing.expectEqual(@as(usize, 1), page.graphemeCount());
 
     // Move back and overwrite wide
@@ -5368,7 +6089,7 @@ test "Terminal: print breaks valid grapheme cluster with Prepend + ASCII for spe
         try testing.expect(!cell.hasGrapheme());
         // This is what we'd expect if we did break correctly:
         //try testing.expect(cell.hasGrapheme());
-        //try testing.expectEqualSlices(u21, &.{'1'}, list_cell.node.data.lookupGrapheme(cell).?);
+        //try testing.expectEqualSlices(u21, &.{'1'}, list_cell.node.page().lookupGrapheme(cell).?);
         try testing.expectEqual(Cell.Wide.narrow, cell.wide);
     }
     {
@@ -5816,7 +6537,7 @@ test "Terminal: print with hyperlink" {
         try testing.expect(row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 1), id);
     }
 
@@ -5843,7 +6564,7 @@ test "Terminal: print over cell with same hyperlink" {
         try testing.expect(row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 1), id);
     }
 
@@ -5870,7 +6591,7 @@ test "Terminal: print and end hyperlink" {
         try testing.expect(row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 1), id);
     }
     for (3..6) |x| {
@@ -5905,7 +6626,7 @@ test "Terminal: print and change hyperlink" {
         } }).?;
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 1), id);
     }
     for (3..6) |x| {
@@ -5915,7 +6636,7 @@ test "Terminal: print and change hyperlink" {
         } }).?;
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 2), id);
     }
 
@@ -5939,7 +6660,7 @@ test "Terminal: overwrite hyperlink" {
             .x = @intCast(x),
             .y = 0,
         } }).?;
-        const page = &list_cell.node.data;
+        const page = list_cell.node.page();
         const row = list_cell.row;
         try testing.expect(!row.hyperlink);
         const cell = list_cell.cell;
@@ -6680,8 +7401,11 @@ test "Terminal: insertLines simple" {
     try t.printString("GHI");
     t.setCursorPos(2, 2);
 
+    const node = t.screens.active.cursor.page_pin.node;
+    const serial = node.serial;
     t.clearDirty();
     t.insertLines(1);
+    try testing.expect(!t.screens.active.pages.nodeIsValid(node, serial));
 
     try testing.expect(!t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
@@ -6754,7 +7478,7 @@ test "Terminal: insertLines handles style refs" {
     try t.setAttribute(.{ .unset = {} });
 
     // verify we have styles in our style map
-    const page = &t.screens.active.cursor.page_pin.node.data;
+    const page = t.screens.active.cursor.page_pin.node.page();
     try testing.expectEqual(@as(usize, 1), page.styles.count());
 
     t.setCursorPos(2, 2);
@@ -6838,7 +7562,7 @@ test "Terminal: insertLines across page boundary marks all shifted rows dirty" {
     defer t.deinit(alloc);
 
     const first_page = t.screens.active.pages.pages.first.?;
-    const first_page_nrows = first_page.data.capacity.rows;
+    const first_page_nrows = first_page.capacity().rows;
 
     // Fill up the first page minus 3 rows
     for (0..first_page_nrows - 3) |_| try t.linefeed();
@@ -6859,11 +7583,15 @@ test "Terminal: insertLines across page boundary marks all shifted rows dirty" {
     try t.printString("5EEEE");
 
     // Verify we now have a second page
-    try testing.expect(first_page.next != null);
+    const second_page = first_page.next.?;
+    const first_serial = first_page.serial;
+    const second_serial = second_page.serial;
 
     t.setCursorPos(1, 1);
     t.clearDirty();
     t.insertLines(1);
+    try testing.expect(!t.screens.active.pages.nodeIsValid(first_page, first_serial));
+    try testing.expect(!t.screens.active.pages.nodeIsValid(second_page, second_serial));
 
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
@@ -7170,9 +7898,9 @@ test "Terminal: scrollUp moves hyperlink" {
         try testing.expect(row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 1), id);
-        const page = &list_cell.node.data;
+        const page = list_cell.node.page();
         try testing.expectEqual(1, page.hyperlink_set.count());
     }
     for (0..3) |x| {
@@ -7184,7 +7912,7 @@ test "Terminal: scrollUp moves hyperlink" {
         try testing.expect(!row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(!cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell);
+        const id = list_cell.node.page().lookupHyperlink(cell);
         try testing.expect(id == null);
     }
 }
@@ -7221,7 +7949,7 @@ test "Terminal: scrollUp clears hyperlink" {
         try testing.expect(!row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(!cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell);
+        const id = list_cell.node.page().lookupHyperlink(cell);
         try testing.expect(id == null);
     }
 }
@@ -7323,7 +8051,7 @@ test "Terminal: scrollUp left/right scroll region hyperlink" {
             } }).?;
             const cell = list_cell.cell;
             try testing.expect(!cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell);
+            const id = list_cell.node.page().lookupHyperlink(cell);
             try testing.expect(id == null);
         }
         for (1..4) |x| {
@@ -7335,9 +8063,9 @@ test "Terminal: scrollUp left/right scroll region hyperlink" {
             try testing.expect(row.hyperlink);
             const cell = list_cell.cell;
             try testing.expect(cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell).?;
+            const id = list_cell.node.page().lookupHyperlink(cell).?;
             try testing.expectEqual(@as(hyperlink.Id, 1), id);
-            const page = &list_cell.node.data;
+            const page = list_cell.node.page();
             try testing.expectEqual(1, page.hyperlink_set.count());
         }
         for (4..6) |x| {
@@ -7347,7 +8075,7 @@ test "Terminal: scrollUp left/right scroll region hyperlink" {
             } }).?;
             const cell = list_cell.cell;
             try testing.expect(!cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell);
+            const id = list_cell.node.page().lookupHyperlink(cell);
             try testing.expect(id == null);
         }
     }
@@ -7363,9 +8091,9 @@ test "Terminal: scrollUp left/right scroll region hyperlink" {
             try testing.expect(row.hyperlink);
             const cell = list_cell.cell;
             try testing.expect(cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell).?;
+            const id = list_cell.node.page().lookupHyperlink(cell).?;
             try testing.expectEqual(@as(hyperlink.Id, 1), id);
-            const page = &list_cell.node.data;
+            const page = list_cell.node.page();
             try testing.expectEqual(1, page.hyperlink_set.count());
         }
         for (1..4) |x| {
@@ -7375,7 +8103,7 @@ test "Terminal: scrollUp left/right scroll region hyperlink" {
             } }).?;
             const cell = list_cell.cell;
             try testing.expect(!cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell);
+            const id = list_cell.node.page().lookupHyperlink(cell);
             try testing.expect(id == null);
         }
         for (4..6) |x| {
@@ -7387,9 +8115,9 @@ test "Terminal: scrollUp left/right scroll region hyperlink" {
             try testing.expect(row.hyperlink);
             const cell = list_cell.cell;
             try testing.expect(cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell).?;
+            const id = list_cell.node.page().lookupHyperlink(cell).?;
             try testing.expectEqual(@as(hyperlink.Id, 1), id);
-            const page = &list_cell.node.data;
+            const page = list_cell.node.page();
             try testing.expectEqual(1, page.hyperlink_set.count());
         }
     }
@@ -7670,9 +8398,9 @@ test "Terminal: scrollDown hyperlink moves" {
         try testing.expect(row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 1), id);
-        const page = &list_cell.node.data;
+        const page = list_cell.node.page();
         try testing.expectEqual(1, page.hyperlink_set.count());
     }
     for (0..3) |x| {
@@ -7684,7 +8412,7 @@ test "Terminal: scrollDown hyperlink moves" {
         try testing.expect(!row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(!cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell);
+        const id = list_cell.node.page().lookupHyperlink(cell);
         try testing.expect(id == null);
     }
 }
@@ -7794,9 +8522,9 @@ test "Terminal: scrollDown left/right scroll region hyperlink" {
             try testing.expect(row.hyperlink);
             const cell = list_cell.cell;
             try testing.expect(cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell).?;
+            const id = list_cell.node.page().lookupHyperlink(cell).?;
             try testing.expectEqual(@as(hyperlink.Id, 1), id);
-            const page = &list_cell.node.data;
+            const page = list_cell.node.page();
             try testing.expectEqual(1, page.hyperlink_set.count());
         }
         for (1..4) |x| {
@@ -7806,7 +8534,7 @@ test "Terminal: scrollDown left/right scroll region hyperlink" {
             } }).?;
             const cell = list_cell.cell;
             try testing.expect(!cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell);
+            const id = list_cell.node.page().lookupHyperlink(cell);
             try testing.expect(id == null);
         }
         for (4..6) |x| {
@@ -7818,9 +8546,9 @@ test "Terminal: scrollDown left/right scroll region hyperlink" {
             try testing.expect(row.hyperlink);
             const cell = list_cell.cell;
             try testing.expect(cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell).?;
+            const id = list_cell.node.page().lookupHyperlink(cell).?;
             try testing.expectEqual(@as(hyperlink.Id, 1), id);
-            const page = &list_cell.node.data;
+            const page = list_cell.node.page();
             try testing.expectEqual(1, page.hyperlink_set.count());
         }
     }
@@ -7834,7 +8562,7 @@ test "Terminal: scrollDown left/right scroll region hyperlink" {
             } }).?;
             const cell = list_cell.cell;
             try testing.expect(!cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell);
+            const id = list_cell.node.page().lookupHyperlink(cell);
             try testing.expect(id == null);
         }
         for (1..4) |x| {
@@ -7846,9 +8574,9 @@ test "Terminal: scrollDown left/right scroll region hyperlink" {
             try testing.expect(row.hyperlink);
             const cell = list_cell.cell;
             try testing.expect(cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell).?;
+            const id = list_cell.node.page().lookupHyperlink(cell).?;
             try testing.expectEqual(@as(hyperlink.Id, 1), id);
-            const page = &list_cell.node.data;
+            const page = list_cell.node.page();
             try testing.expectEqual(1, page.hyperlink_set.count());
         }
         for (4..6) |x| {
@@ -7858,7 +8586,7 @@ test "Terminal: scrollDown left/right scroll region hyperlink" {
             } }).?;
             const cell = list_cell.cell;
             try testing.expect(!cell.hyperlink);
-            const id = list_cell.node.data.lookupHyperlink(cell);
+            const id = list_cell.node.page().lookupHyperlink(cell);
             try testing.expect(id == null);
         }
     }
@@ -8092,7 +8820,7 @@ test "Terminal: eraseChars handles refcounted styles" {
     try t.print('C');
 
     // verify we have styles in our style map
-    const page = &t.screens.active.cursor.page_pin.node.data;
+    const page = t.screens.active.cursor.page_pin.node.page();
     try testing.expectEqual(@as(usize, 1), page.styles.count());
 
     t.setCursorPos(1, 1);
@@ -8169,7 +8897,7 @@ test "Terminal: eraseChars wide char boundary conditions" {
 
     t.setCursorPos(1, 2);
     t.eraseChars(3);
-    t.screens.active.cursor.page_pin.node.data.assertIntegrity();
+    t.screens.active.cursor.page_pin.node.page().assertIntegrity();
 
     {
         const str = try t.plainString(alloc);
@@ -8199,7 +8927,7 @@ test "Terminal: eraseChars wide char splits proper cell boundaries" {
 
     t.setCursorPos(1, 6); // At: て
     t.eraseChars(4); // Delete: て下
-    t.screens.active.cursor.page_pin.node.data.assertIntegrity();
+    t.screens.active.cursor.page_pin.node.page().assertIntegrity();
 
     {
         const str = try t.plainString(alloc);
@@ -8226,7 +8954,7 @@ test "Terminal: eraseChars wide char wrap boundary conditions" {
 
     t.setCursorPos(2, 2);
     t.eraseChars(3);
-    t.screens.active.cursor.page_pin.node.data.assertIntegrity();
+    t.screens.active.cursor.page_pin.node.page().assertIntegrity();
 
     {
         const str = try t.plainString(alloc);
@@ -8529,7 +9257,7 @@ test "Terminal: index scrolling with hyperlink" {
         try testing.expect(row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 1), id);
     }
     {
@@ -8541,7 +9269,7 @@ test "Terminal: index scrolling with hyperlink" {
         try testing.expect(!row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(!cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell);
+        const id = list_cell.node.page().lookupHyperlink(cell);
         try testing.expect(id == null);
     }
 }
@@ -8703,7 +9431,7 @@ test "Terminal: index bottom of scroll region with hyperlinks" {
         try testing.expect(row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 1), id);
     }
     {
@@ -8715,7 +9443,7 @@ test "Terminal: index bottom of scroll region with hyperlinks" {
         try testing.expect(!row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(!cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell);
+        const id = list_cell.node.page().lookupHyperlink(cell);
         try testing.expect(id == null);
     }
 }
@@ -8752,9 +9480,9 @@ test "Terminal: index bottom of scroll region clear hyperlinks" {
         try testing.expect(!row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(!cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell);
+        const id = list_cell.node.page().lookupHyperlink(cell);
         try testing.expect(id == null);
-        const page = &list_cell.node.data;
+        const page = list_cell.node.page();
         try testing.expectEqual(0, page.hyperlink_set.count());
     }
 }
@@ -9567,8 +10295,11 @@ test "Terminal: deleteLines simple" {
     try t.printString("GHI");
     t.setCursorPos(2, 2);
 
+    const node = t.screens.active.cursor.page_pin.node;
+    const serial = node.serial;
     t.clearDirty();
     t.deleteLines(1);
+    try testing.expect(!t.screens.active.pages.nodeIsValid(node, serial));
 
     try testing.expect(!t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
@@ -9629,7 +10360,7 @@ test "Terminal: deleteLines across page boundary marks all shifted rows dirty" {
     defer t.deinit(alloc);
 
     const first_page = t.screens.active.pages.pages.first.?;
-    const first_page_nrows = first_page.data.capacity.rows;
+    const first_page_nrows = first_page.capacity().rows;
 
     // Fill up the first page minus 3 rows
     for (0..first_page_nrows - 3) |_| try t.linefeed();
@@ -9650,11 +10381,15 @@ test "Terminal: deleteLines across page boundary marks all shifted rows dirty" {
     try t.printString("5EEEE");
 
     // Verify we now have a second page
-    try testing.expect(first_page.next != null);
+    const second_page = first_page.next.?;
+    const first_serial = first_page.serial;
+    const second_serial = second_page.serial;
 
     t.setCursorPos(1, 1);
     t.clearDirty();
     t.deleteLines(1);
+    try testing.expect(!t.screens.active.pages.nodeIsValid(first_page, first_serial));
+    try testing.expect(!t.screens.active.pages.nodeIsValid(second_page, second_serial));
 
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 0 } }));
     try testing.expect(t.isDirty(.{ .active = .{ .x = 0, .y = 1 } }));
@@ -10244,7 +10979,7 @@ test "Terminal: bold style" {
         const cell = list_cell.cell;
         try testing.expectEqual(@as(u21, 'A'), cell.content.codepoint);
         try testing.expect(cell.style_id != 0);
-        const page = &t.screens.active.cursor.page_pin.node.data;
+        const page = t.screens.active.cursor.page_pin.node.page();
         try testing.expect(page.styles.refCount(page.memory, t.screens.active.cursor.style_id) > 1);
     }
 }
@@ -10268,7 +11003,7 @@ test "Terminal: garbage collect overwritten" {
     }
 
     // verify we have no styles in our style map
-    const page = &t.screens.active.cursor.page_pin.node.data;
+    const page = t.screens.active.cursor.page_pin.node.page();
     try testing.expectEqual(@as(usize, 0), page.styles.count());
 }
 
@@ -10290,7 +11025,7 @@ test "Terminal: do not garbage collect old styles in use" {
     }
 
     // verify we have no styles in our style map
-    const page = &t.screens.active.cursor.page_pin.node.data;
+    const page = t.screens.active.cursor.page_pin.node.page();
     try testing.expectEqual(@as(usize, 1), page.styles.count());
 }
 
@@ -10681,7 +11416,7 @@ test "Terminal: insertBlanks deleting graphemes" {
     try t.print(0x1F467);
 
     // We should have one cell with graphemes
-    const page = &t.screens.active.cursor.page_pin.node.data;
+    const page = t.screens.active.cursor.page_pin.node.page();
     try testing.expectEqual(@as(usize, 1), page.graphemeCount());
 
     t.setCursorPos(1, 1);
@@ -10717,7 +11452,7 @@ test "Terminal: insertBlanks shift graphemes" {
     try t.print(0x1F467);
 
     // We should have one cell with graphemes
-    const page = &t.screens.active.cursor.page_pin.node.data;
+    const page = t.screens.active.cursor.page_pin.node.page();
     try testing.expectEqual(@as(usize, 1), page.graphemeCount());
 
     t.setCursorPos(1, 1);
@@ -10785,7 +11520,7 @@ test "Terminal: insertBlanks shifts hyperlinks" {
         try testing.expect(row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell).?;
+        const id = list_cell.node.page().lookupHyperlink(cell).?;
         try testing.expectEqual(@as(hyperlink.Id, 1), id);
     }
     for (0..2) |x| {
@@ -10795,7 +11530,7 @@ test "Terminal: insertBlanks shifts hyperlinks" {
         } }).?;
         const cell = list_cell.cell;
         try testing.expect(!cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell);
+        const id = list_cell.node.page().lookupHyperlink(cell);
         try testing.expect(id == null);
     }
 }
@@ -10825,7 +11560,7 @@ test "Terminal: insertBlanks pushes hyperlink off end completely" {
         try testing.expect(!row.hyperlink);
         const cell = list_cell.cell;
         try testing.expect(!cell.hyperlink);
-        const id = list_cell.node.data.lookupHyperlink(cell);
+        const id = list_cell.node.page().lookupHyperlink(cell);
         try testing.expect(id == null);
     }
 }
@@ -11398,7 +12133,7 @@ test "Terminal: deleteChars wide char boundary conditions" {
 
     t.setCursorPos(1, 2);
     t.deleteChars(3);
-    t.screens.active.cursor.page_pin.node.data.assertIntegrity();
+    t.screens.active.cursor.page_pin.node.page().assertIntegrity();
 
     {
         const str = try t.plainString(alloc);
@@ -11450,7 +12185,7 @@ test "Terminal: deleteChars wide char wrap boundary conditions" {
 
     t.setCursorPos(2, 2);
     t.deleteChars(3);
-    t.screens.active.cursor.page_pin.node.data.assertIntegrity();
+    t.screens.active.cursor.page_pin.node.page().assertIntegrity();
 
     {
         const str = try t.plainString(alloc);
@@ -11489,7 +12224,7 @@ test "Terminal: deleteChars wide char across right margin" {
 
     t.setCursorPos(1, 2);
     t.deleteChars(1);
-    t.screens.active.cursor.page_pin.node.data.assertIntegrity();
+    t.screens.active.cursor.page_pin.node.page().assertIntegrity();
 
     // NOTE: This behavior is slightly inconsistent with xterm. xterm
     // _visually_ splits the wide character (half the wide character shows
@@ -11591,7 +12326,7 @@ test "Terminal: saveCursor resize" {
 
     t.setCursorPos(1, 10);
     t.saveCursor();
-    try t.resize(alloc, 5, 5);
+    try t.resize(alloc, .{ .cols = 5, .rows = 5 });
     t.restoreCursor();
     try t.print('X');
 
@@ -11650,14 +12385,14 @@ test "Terminal: restoreCursor uses default style on OutOfSpace" {
 
     // Fill the style map to max capacity
     const max_styles = std.math.maxInt(size.CellCountInt);
-    while (t.screens.active.cursor.page_pin.node.data.capacity.styles < max_styles) {
+    while (t.screens.active.cursor.page_pin.node.capacity().styles < max_styles) {
         _ = t.screens.active.increaseCapacity(
             t.screens.active.cursor.page_pin.node,
             .styles,
         ) catch break;
     }
 
-    const page = &t.screens.active.cursor.page_pin.node.data;
+    const page = t.screens.active.cursor.page_pin.node.page();
     try testing.expectEqual(max_styles, page.capacity.styles);
 
     // Fill all style slots using the StyleSet's layout capacity which accounts
@@ -12400,13 +13135,6 @@ fn testPrintSliceDifferential(
             },
             15 => {
                 const v = rand.boolean();
-                // Erase the display first: grapheme clusters created
-                // while mode 2027 was off can trip a pre-existing
-                // debug assert in print()'s cluster walk when the mode
-                // is toggled on (unrelated to printSlice; it reproduces
-                // with per-codepoint print alone).
-                t1.eraseDisplay(.complete, false);
-                t2.eraseDisplay(.complete, false);
                 t1.modes.set(.grapheme_cluster, v);
                 t2.modes.set(.grapheme_cluster, v);
             },
@@ -12473,8 +13201,8 @@ fn testPrintSliceDifferential(
     }
 
     // Page integrity (styles refcounts, grapheme maps, etc.) must hold.
-    try t1.screens.active.cursor.page_pin.node.data.verifyIntegrity(alloc);
-    try t2.screens.active.cursor.page_pin.node.data.verifyIntegrity(alloc);
+    try t1.screens.active.cursor.page_pin.node.page().verifyIntegrity(alloc);
+    try t2.screens.active.cursor.page_pin.node.page().verifyIntegrity(alloc);
 }
 
 test "Terminal: printSlice differential fuzz vs print" {
@@ -13490,6 +14218,64 @@ test "Terminal: cursorIsAtPrompt alternate screen" {
     try testing.expect(!t.cursorIsAtPrompt());
 }
 
+test "Terminal: cursor defaults update current default cursor" {
+    var t = try init(testing.allocator, .{
+        .cols = 10,
+        .rows = 10,
+        .default_cursor_style = .bar,
+        .default_cursor_blink = true,
+    });
+    defer t.deinit(testing.allocator);
+
+    // Initialization applies the configured defaults.
+    try testing.expect(t.cursor.is_default);
+    try testing.expectEqual(.bar, t.screens.active.cursor.cursor_style);
+    try testing.expect(t.modes.get(.cursor_blinking));
+
+    // Configuration changes are immediately visible while the cursor still
+    // follows its defaults.
+    t.setDefaultCursorStyle(.underline);
+    t.setDefaultCursorBlink(false);
+    try testing.expect(t.cursor.is_default);
+    try testing.expectEqual(.underline, t.screens.active.cursor.cursor_style);
+    try testing.expect(!t.modes.get(.cursor_blinking));
+
+    // Null restores the terminal emulator's blinking default.
+    t.setDefaultCursorBlink(null);
+    try testing.expect(t.modes.get(.cursor_blinking));
+}
+
+test "Terminal: cursor defaults do not override explicit cursor" {
+    var t = try init(testing.allocator, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.setCursorStyle(.blinking_bar);
+    try testing.expect(!t.cursor.is_default);
+    try testing.expectEqual(.bar, t.screens.active.cursor.cursor_style);
+    try testing.expect(t.modes.get(.cursor_blinking));
+
+    // New defaults are retained without replacing the explicit appearance.
+    t.setDefaultCursorStyle(.underline);
+    t.setDefaultCursorBlink(false);
+    try testing.expectEqual(.underline, t.cursor.default_style);
+    try testing.expectEqual(false, t.cursor.default_blink);
+    try testing.expectEqual(.bar, t.screens.active.cursor.cursor_style);
+    try testing.expect(t.modes.get(.cursor_blinking));
+
+    // Selecting the default applies the values that changed above.
+    t.setCursorStyle(.default);
+    try testing.expect(t.cursor.is_default);
+    try testing.expectEqual(.underline, t.screens.active.cursor.cursor_style);
+    try testing.expect(!t.modes.get(.cursor_blinking));
+
+    // A full reset also leaves the cursor on the configured defaults.
+    t.setCursorStyle(.steady_block);
+    t.fullReset();
+    try testing.expect(t.cursor.is_default);
+    try testing.expectEqual(.underline, t.screens.active.cursor.cursor_style);
+    try testing.expect(!t.modes.get(.cursor_blinking));
+}
+
 test "Terminal: fullReset with a non-empty pen" {
     var t = try init(testing.allocator, .{ .cols = 80, .rows = 80 });
     defer t.deinit(testing.allocator);
@@ -13616,7 +14402,7 @@ test "Terminal: resize less cols with wide char then print" {
 
     try t.print('x');
     try t.print('😀'); // 0x1F600
-    try t.resize(alloc, 2, 3);
+    try t.resize(alloc, .{ .cols = 2, .rows = 3 });
     t.setCursorPos(1, 2);
     try t.print('😀'); // 0x1F600
 }
@@ -13633,11 +14419,11 @@ test "Terminal: resize with left and right margin set" {
     t.modes.set(.enable_left_and_right_margin, true);
     try t.print('0');
     t.modes.set(.enable_mode_3, true);
-    try t.resize(alloc, cols, rows);
+    try t.resize(alloc, .{ .cols = cols, .rows = rows });
     t.setLeftAndRightMargin(2, 0);
     try t.printRepeat(1850);
     _ = t.modes.restore(.enable_mode_3);
-    try t.resize(alloc, cols, rows);
+    try t.resize(alloc, .{ .cols = cols, .rows = rows });
 }
 
 // https://github.com/mitchellh/ghostty/issues/1343
@@ -13654,7 +14440,7 @@ test "Terminal: resize with wraparound off" {
     try t.print('2');
     try t.print('3');
     const new_cols = 2;
-    try t.resize(alloc, new_cols, rows);
+    try t.resize(alloc, .{ .cols = new_cols, .rows = rows });
 
     const str = try t.plainString(testing.allocator);
     defer testing.allocator.free(str);
@@ -13674,7 +14460,7 @@ test "Terminal: resize with wraparound on" {
     try t.print('2');
     try t.print('3');
     const new_cols = 2;
-    try t.resize(alloc, new_cols, rows);
+    try t.resize(alloc, .{ .cols = new_cols, .rows = rows });
 
     const str = try t.plainString(testing.allocator);
     defer testing.allocator.free(str);
@@ -13698,7 +14484,7 @@ test "Terminal: resize with high unique style per cell" {
         }
     }
 
-    try t.resize(alloc, 60, 30);
+    try t.resize(alloc, .{ .cols = 60, .rows = 30 });
 }
 
 test "Terminal: resize with high unique style per cell with wrapping" {
@@ -13719,7 +14505,7 @@ test "Terminal: resize with high unique style per cell with wrapping" {
         try t.print('x');
     }
 
-    try t.resize(alloc, 60, 30);
+    try t.resize(alloc, .{ .cols = 60, .rows = 30 });
 }
 
 test "Terminal: resize with reflow and saved cursor" {
@@ -13744,7 +14530,7 @@ test "Terminal: resize with reflow and saved cursor" {
     }
 
     t.saveCursor();
-    try t.resize(alloc, 5, 3);
+    try t.resize(alloc, .{ .cols = 5, .rows = 3 });
     t.restoreCursor();
 
     {
@@ -13785,7 +14571,7 @@ test "Terminal: resize with reflow and saved cursor pending wrap" {
     }
 
     t.saveCursor();
-    try t.resize(alloc, 5, 3);
+    try t.resize(alloc, .{ .cols = 5, .rows = 3 });
     t.restoreCursor();
 
     {
@@ -13950,7 +14736,7 @@ test "Terminal: mode 47 copies cursor both directions" {
     // Verify that our style is set
     {
         try testing.expect(t.screens.active.cursor.style_id != style.default_id);
-        const page = &t.screens.active.cursor.page_pin.node.data;
+        const page = t.screens.active.cursor.page_pin.node.page();
         try testing.expectEqual(@as(usize, 1), page.styles.count());
         try testing.expect(page.styles.refCount(page.memory, t.screens.active.cursor.style_id) > 0);
     }
@@ -13965,7 +14751,7 @@ test "Terminal: mode 47 copies cursor both directions" {
     // Verify that our style is still set
     {
         try testing.expect(t.screens.active.cursor.style_id != style.default_id);
-        const page = &t.screens.active.cursor.page_pin.node.data;
+        const page = t.screens.active.cursor.page_pin.node.page();
         try testing.expectEqual(@as(usize, 1), page.styles.count());
         try testing.expect(page.styles.refCount(page.memory, t.screens.active.cursor.style_id) > 0);
     }
@@ -14037,7 +14823,7 @@ test "Terminal: mode 1047 copies cursor both directions" {
     // Verify that our style is set
     {
         try testing.expect(t.screens.active.cursor.style_id != style.default_id);
-        const page = &t.screens.active.cursor.page_pin.node.data;
+        const page = t.screens.active.cursor.page_pin.node.page();
         try testing.expectEqual(@as(usize, 1), page.styles.count());
         try testing.expect(page.styles.refCount(page.memory, t.screens.active.cursor.style_id) > 0);
     }
@@ -14052,7 +14838,7 @@ test "Terminal: mode 1047 copies cursor both directions" {
     // Verify that our style is still set
     {
         try testing.expect(t.screens.active.cursor.style_id != style.default_id);
-        const page = &t.screens.active.cursor.page_pin.node.data;
+        const page = t.screens.active.cursor.page_pin.node.page();
         try testing.expectEqual(@as(usize, 1), page.styles.count());
         try testing.expect(page.styles.refCount(page.memory, t.screens.active.cursor.style_id) > 0);
     }

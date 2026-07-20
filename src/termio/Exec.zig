@@ -1486,6 +1486,10 @@ pub const ReadThread = struct {
                     _ = posix.write(pipeline.idle_write_fd, "i") catch {};
                 }
             }
+
+            // Batch boundary: hand the renderer state mutex off if
+            // the renderer is waiting. See renderer.State.lockDemand.
+            io.renderer_state.yieldToDemand();
         }
     }
 
@@ -1776,6 +1780,11 @@ pub const ReadThread = struct {
                 }
 
                 @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
+
+                // See threadMainPosix: hand the renderer state mutex
+                // off if the renderer is waiting, since this loop
+                // would otherwise starve it under heavy output.
+                io.renderer_state.yieldToDemand();
             }
 
             var quit_bytes: windows.DWORD = 0;
