@@ -14,7 +14,7 @@ zig-out/
 build-cmake/
 CMakeCache.txt
 CMakeFiles/
-/build.zig.zon.bak
+build.zig.zon.bak
 /result*
 /.nixos-test-history
 example/*.wasm
@@ -31,6 +31,6 @@ glad.zip
 vgcore.*
 .sdk-overlay/
 
-
 CLAUDE.md
 .build/
+/sprite_face_test*
