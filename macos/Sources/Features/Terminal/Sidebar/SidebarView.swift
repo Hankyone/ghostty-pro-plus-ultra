@@ -777,19 +777,12 @@ private struct AgentMenuIcon: View {
     let agent: SidebarTabManager.AgentType
 
     var body: some View {
-        Group {
-            if agent.isCustomIcon {
-                Image(agent.icon)
-                    .resizable()
-                    .interpolation(.high)
-                    .scaledToFit()
-                    .frame(width: 14, height: 14)
-                    .fixedSize(horizontal: true, vertical: true)
-            } else {
-                Image(systemName: agent.icon)
-                    .font(.system(size: 14, weight: .medium))
-            }
-        }
+        Image(agent.icon)
+            .resizable()
+            .interpolation(.high)
+            .scaledToFit()
+            .frame(width: 14, height: 14)
+            .fixedSize(horizontal: true, vertical: true)
     }
 }
 

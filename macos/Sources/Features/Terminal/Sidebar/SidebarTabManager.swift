@@ -344,6 +344,7 @@ class SidebarTabManager: ObservableObject {
     enum AgentType: String, CaseIterable {
         case claude
         case codex
+        case opencode
         case grok
         case devin
         case cursor
@@ -355,6 +356,7 @@ class SidebarTabManager: ObservableObject {
             switch self {
             case .claude: return "Claude Code"
             case .codex: return "Codex"
+            case .opencode: return "OpenCode"
             case .grok: return "Grok Build"
             case .devin: return "Devin"
             case .cursor: return "Cursor"
@@ -369,6 +371,7 @@ class SidebarTabManager: ObservableObject {
             switch self {
             case .claude: return "claude"
             case .codex: return "codex"
+            case .opencode: return "opencode"
             case .grok: return "grok"
             case .devin: return "devin"
             case .cursor: return "cursor-agent"
@@ -377,26 +380,17 @@ class SidebarTabManager: ObservableObject {
             }
         }
 
-        /// Menu icon: an asset-catalog image name when `isCustomIcon`, else an
-        /// SF Symbol name.
+        /// Asset-catalog image name for the agent's official menu mark.
         var icon: String {
             switch self {
             case .claude: return "ClaudeIcon"
             case .codex: return "CodexIcon"
+            case .opencode: return "OpenCodeIcon"
             case .grok: return "GrokIcon"
             case .devin: return "DevinIcon"
             case .cursor: return "CursorIcon"
             case .antigravity: return "AntigravityIcon"
-            // No bundled Cline logo yet — fall back to an SF Symbol until a
-            // ClineIcon asset is added.
-            case .cline: return "chevron.left.forwardslash.chevron.right"
-            }
-        }
-
-        var isCustomIcon: Bool {
-            switch self {
-            case .cline: return false
-            case .claude, .codex, .grok, .devin, .cursor, .antigravity: return true
+            case .cline: return "ClineIcon"
             }
         }
 
@@ -405,6 +399,7 @@ class SidebarTabManager: ObservableObject {
             switch self {
             case .claude: return "--dangerously-skip-permissions"
             case .codex: return "--dangerously-bypass-approvals-and-sandbox"
+            case .opencode: return "--auto"
             case .grok: return "--permission-mode bypassPermissions"
             case .devin: return "--permission-mode dangerous"
             case .cursor: return "--yolo"
@@ -445,7 +440,7 @@ class SidebarTabManager: ObservableObject {
                 // Devin exposes no session id in hooks, so there's nothing to
                 // validate — launch its interactive session picker instead.
                 return "devin -r \(permissionFlags)"
-            case .antigravity, .cline:
+            case .opencode, .antigravity, .cline:
                 // No hook-provided session id / resume support yet.
                 return nil
             }
