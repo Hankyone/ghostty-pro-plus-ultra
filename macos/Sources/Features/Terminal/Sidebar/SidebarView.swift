@@ -697,10 +697,12 @@ private struct ProjectHeader: View {
                             Button {
                                 onNewTab(agent)
                             } label: {
-                                HStack(spacing: 6) {
-                                    AgentMenuIcon(agent: agent)
+                                Label {
                                     Text(agent.displayName)
+                                } icon: {
+                                    AgentMenuIcon(agent: agent)
                                 }
+                                .labelStyle(.titleAndIcon)
                             }
                         }
                     }
@@ -711,33 +713,33 @@ private struct ProjectHeader: View {
                         Button {
                             onGitCommit()
                         } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "checkmark.circle")
-                                    .font(.system(size: 14, weight: .medium))
-                                Text(gitActionInProgress ? "Working..." : "Commit")
-                            }
+                            Label(
+                                gitActionInProgress ? "Working..." : "Commit",
+                                systemImage: "checkmark.circle"
+                            )
+                            .labelStyle(.titleAndIcon)
                         }
                         .disabled(gitActionInProgress || group.gitDiffStats == nil)
 
                         Button {
                             onGitPush()
                         } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "arrow.up.circle")
-                                    .font(.system(size: 14, weight: .medium))
-                                Text(gitActionInProgress ? "Working..." : "Push")
-                            }
+                            Label(
+                                gitActionInProgress ? "Working..." : "Push",
+                                systemImage: "arrow.up.circle"
+                            )
+                            .labelStyle(.titleAndIcon)
                         }
                         .disabled(gitActionInProgress)
 
                         Button {
                             onGitCommitAndPush()
                         } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "arrow.up.circle.fill")
-                                    .font(.system(size: 14, weight: .medium))
-                                Text(gitActionInProgress ? "Working..." : "Commit & Push")
-                            }
+                            Label(
+                                gitActionInProgress ? "Working..." : "Commit & Push",
+                                systemImage: "arrow.up.circle.fill"
+                            )
+                            .labelStyle(.titleAndIcon)
                         }
                         .disabled(gitActionInProgress || group.gitDiffStats == nil)
                     }
@@ -751,7 +753,12 @@ private struct ProjectHeader: View {
                     .frame(width: 20, height: 20)
                 }
                 .id(gitActionStatus == .inProgress)
-                .menuStyle(.borderlessButton)
+                // Deliberately not `.borderlessButton`: that legacy style drops
+                // the artwork on every item in the menu it presents, which
+                // silently blanked all the icons below. `.button` + a plain
+                // button style keeps the chrome-free look without that.
+                .menuStyle(.button)
+                .buttonStyle(.plain)
                 .menuIndicator(.hidden)
                 .fixedSize()
                 .opacity(isHovered ? 1 : 0)
@@ -777,12 +784,25 @@ private struct AgentMenuIcon: View {
     let agent: SidebarTabManager.AgentType
 
     var body: some View {
-        Image(agent.icon)
-            .resizable()
-            .interpolation(.high)
-            .scaledToFit()
-            .frame(width: 14, height: 14)
-            .fixedSize(horizontal: true, vertical: true)
+        if let image = Self.menuImage(named: agent.icon) {
+            Image(nsImage: image)
+        } else {
+            // Missing asset: fall back to a generic glyph rather than a gap.
+            Image(systemName: "chevron.left.forwardslash.chevron.right")
+        }
+    }
+
+    /// A menu row sizes its artwork from the image itself — SwiftUI's frame and
+    /// resizing modifiers are dropped when the item crosses into the native
+    /// menu — so hand back a copy that already carries the right size. The
+    /// asset's own template intent is preserved so single-color marks pick up
+    /// the menu's text color while the full-color ones stay full-color.
+    private static func menuImage(named name: String) -> NSImage? {
+        guard let source = NSImage(named: name) else { return nil }
+        guard let copy = source.copy() as? NSImage else { return nil }
+        copy.size = NSSize(width: 14, height: 14)
+        copy.isTemplate = source.isTemplate
+        return copy
     }
 }
 
