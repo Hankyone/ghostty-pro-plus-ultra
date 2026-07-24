@@ -1166,6 +1166,17 @@ const Subprocess = struct {
         }
     }
 
+    /// How long we spend asking politely with SIGHUP before escalating.
+    const KILL_HUP_MS = 500;
+
+    /// How long we keep retrying after escalating to SIGKILL before giving
+    /// up. SIGKILL can't be caught, so anything still alive past this is
+    /// wedged in the kernel and will never be reaped by us.
+    const KILL_FORCE_MS = 1000;
+
+    /// How long we wait between attempts.
+    const KILL_POLL_MS = 10;
+
     fn killPid(pid: c.pid_t) !void {
         const pgid = getpgid(pid) orelse return;
 
@@ -1176,9 +1187,25 @@ const Subprocess = struct {
         // and repeatedly kill the process group until all
         // descendents are well and truly dead. We will not rest
         // until the entire family tree is obliterated.
+        //
+        // We start with SIGHUP so anything that wants to flush state on the
+        // way out gets the chance, but we don't ask forever: a process that
+        // blocks or ignores SIGHUP would otherwise spin this loop for as
+        // long as it likes and hang surface teardown with it. Once the grace
+        // period is up we escalate to SIGKILL, and if even that doesn't take
+        // we bail out instead of spinning. A close is a close.
+        var elapsed_ms: usize = 0;
         while (true) {
-            switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
-                .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
+            const signal: c_int = if (elapsed_ms < KILL_HUP_MS)
+                c.SIGHUP
+            else
+                c.SIGKILL;
+
+            switch (posix.errno(c.killpg(pgid, signal))) {
+                .SUCCESS => log.debug(
+                    "process group signaled pgid={} signal={}",
+                    .{ pgid, signal },
+                ),
                 else => |err| killpg: {
                     if ((comptime builtin.target.os.tag.isDarwin()) and
                         err == .PERM)
@@ -1203,7 +1230,17 @@ const Subprocess = struct {
             };
             log.debug("waitpid result={}", .{res_pid});
             if (res_pid != 0) break;
-            try std.Io.sleep(global.io(), .fromMilliseconds(10), .awake);
+
+            if (elapsed_ms >= KILL_HUP_MS + KILL_FORCE_MS) {
+                log.warn(
+                    "process group survived SIGKILL, abandoning pgid={}",
+                    .{pgid},
+                );
+                return error.KillFailed;
+            }
+
+            try std.Io.sleep(global.io(), .fromMilliseconds(KILL_POLL_MS), .awake);
+            elapsed_ms += KILL_POLL_MS;
         }
     }
 
@@ -2299,4 +2336,41 @@ test "execCommand windows: direct command is passed through unchanged" {
     try testing.expectEqual(2, result.len);
     try testing.expectEqualStrings("C:\\tools\\foo.exe", result[0]);
     try testing.expectEqualStrings("arg with spaces", result[1]);
+}
+
+test "killPid: escalates past a child that ignores SIGHUP" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const c = Subprocess.c;
+
+    const rc = posix.system.fork();
+    const pid: posix.pid_t = switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => |err| return posix.unexpectedErrno(err),
+    };
+
+    if (pid == 0) {
+        // A new session gives us our own process group, so the killpg below
+        // can't reach the test runner. Then ignore SIGHUP so that only an
+        // escalation to SIGKILL can end us.
+        _ = c.setsid();
+        var sa: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &sa, null);
+        // Far longer than the kill window, but still short enough that a
+        // regression here can't wedge the test run for a minute.
+        _ = c.sleep(10);
+        c._exit(0);
+    }
+
+    // No need to wait for that setsid ourselves: killPid resolves the group
+    // through getpgid, which already blocks until the child's group differs
+    // from ours, so it can't signal the test runner's own group.
+    //
+    // SIGHUP can never end this child, so returning at all proves we escalate
+    // to SIGKILL rather than asking politely forever.
+    try Subprocess.killPid(pid);
 }
