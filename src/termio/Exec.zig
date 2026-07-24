@@ -1067,7 +1067,9 @@ const Subprocess = struct {
                 else => return err,
             }
         };
-        errdefer killCommand(&cmd) catch |err| {
+        // No foreground group to chase here: the shell has only just started,
+        // so there is nothing running in front of it yet.
+        errdefer killCommand(&cmd, null) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
@@ -1107,10 +1109,23 @@ const Subprocess = struct {
     pub fn stop(self: *Subprocess) void {
         switch (self.process orelse return) {
             .fork_exec => |*cmd| {
+                // The shell's foreground job gets its own process group, so
+                // signalling the shell's group alone can leave a running build
+                // or editor behind. Ask the pty who holds the foreground while
+                // we still have it.
+                const fg: ?c.pid_t = switch (builtin.os.tag) {
+                    .windows => null,
+                    else => fg: {
+                        const pty = self.pty orelse break :fg null;
+                        const rc = c.tcgetpgrp(pty.master);
+                        break :fg if (rc > 0) rc else null;
+                    },
+                };
+
                 // Note: this will also wait for the command to exit, so
                 // DO NOT call cmd.wait
-                killCommand(cmd) catch |err|
-                    log.err("error sending SIGHUP to command, may hang: {}", .{err});
+                killCommand(cmd, fg) catch |err|
+                    log.err("error killing command, may hang: {}", .{err});
             },
 
             .flatpak => |*cmd| if (comptime build_config.flatpak) {
@@ -1150,7 +1165,7 @@ const Subprocess = struct {
     /// Kill the underlying subprocess. This sends a SIGHUP to the child
     /// process. This also waits for the command to exit and will return the
     /// exit code.
-    fn killCommand(command: *Command) !void {
+    fn killCommand(command: *Command, foreground_pgid: ?c.pid_t) !void {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
                 .windows => {
@@ -1161,7 +1176,7 @@ const Subprocess = struct {
                     _ = try command.wait(false);
                 },
 
-                else => try killPid(pid),
+                else => try killPid(pid, foreground_pgid),
             }
         }
     }
@@ -1177,8 +1192,25 @@ const Subprocess = struct {
     /// How long we wait between attempts.
     const KILL_POLL_MS = 10;
 
-    fn killPid(pid: c.pid_t) !void {
-        const pgid = getpgid(pid) orelse return;
+    /// How long we wait for a freshly forked child to reach its own process
+    /// group before giving up and signalling it individually.
+    const KILL_PGID_WAIT_MS = 250;
+
+    fn killPid(pid: c.pid_t, foreground_pgid: ?c.pid_t) !void {
+        // Prefer signalling the whole process group so the shell's children go
+        // with it. A null pgid means the child never reached its own group, in
+        // which case we can only signal it alone: killpg on our own group
+        // would take Ghostty down too.
+        const pgid: ?c.pid_t = getpgid(pid);
+
+        // Only signal a foreground group that is real, distinct, and not ours.
+        const my_pgid = c.getpgid(0);
+        const fg: ?c.pid_t = fg: {
+            const v = foreground_pgid orelse break :fg null;
+            if (v <= 0 or v == my_pgid) break :fg null;
+            if (pgid) |g| if (v == g) break :fg null;
+            break :fg v;
+        };
 
         // It is possible to send a killpg between the time that
         // our child process calls setsid but before or simultaneous
@@ -1201,23 +1233,32 @@ const Subprocess = struct {
             else
                 c.SIGKILL;
 
-            switch (posix.errno(c.killpg(pgid, signal))) {
+            const kill_rc = if (pgid) |g| c.killpg(g, signal) else c.kill(pid, signal);
+            switch (posix.errno(kill_rc)) {
                 .SUCCESS => log.debug(
-                    "process group signaled pgid={} signal={}",
-                    .{ pgid, signal },
+                    "process signaled pid={} group={} signal={}",
+                    .{ pid, pgid != null, signal },
                 ),
+
+                // Already gone. Fall through to the reap below.
+                .SRCH => {},
+
                 else => |err| killpg: {
                     if ((comptime builtin.target.os.tag.isDarwin()) and
                         err == .PERM)
                     {
-                        log.debug("killpg failed with EPERM, expected on Darwin and ignoring", .{});
+                        log.debug("kill failed with EPERM, expected on Darwin and ignoring", .{});
                         break :killpg;
                     }
 
-                    log.warn("error killing process group pgid={} err={}", .{ pgid, err });
+                    log.warn("error killing pid={} err={}", .{ pid, err });
                     return error.KillFailed;
                 },
             }
+
+            // Best effort. The foreground job isn't our child so we can't
+            // confirm its death, but it must not outlive a deliberate close.
+            if (fg) |g| _ = c.killpg(g, signal);
 
             // See Command.zig wait for why we specify WNOHANG.
             // The gist is that it lets us detect when children
@@ -1233,8 +1274,8 @@ const Subprocess = struct {
 
             if (elapsed_ms >= KILL_HUP_MS + KILL_FORCE_MS) {
                 log.warn(
-                    "process group survived SIGKILL, abandoning pgid={}",
-                    .{pgid},
+                    "process survived SIGKILL, abandoning pid={}",
+                    .{pid},
                 );
                 return error.KillFailed;
             }
@@ -1253,14 +1294,27 @@ const Subprocess = struct {
 
         // We loop while pgid == my_pgid. The expectation if we have a valid
         // pid is that setsid will eventually be called because it is the
-        // FIRST thing the child process does and as far as I can tell,
-        // setsid cannot fail. I'm sure that's not true, but I'd rather
-        // have a bug reported than defensively program against it now.
+        // FIRST thing the child process does.
+        //
+        // But we don't wait forever for it. The pre-exec callback logs a
+        // setsid failure and execs anyway, so a child that fails to leave our
+        // group never will, and an unbounded wait here hangs teardown — which
+        // is exactly the hang the escalation below exists to prevent. On
+        // timeout we return null and the caller signals the pid on its own,
+        // since signalling our own group would take Ghostty with it.
+        var waited_ms: usize = 0;
         while (true) {
             const pgid = c.getpgid(pid);
             if (pgid == my_pgid) {
-                log.warn("pgid is our own, retrying", .{});
-                std.Io.sleep(global.io(), .fromMilliseconds(10), .awake) catch {};
+                if (waited_ms >= KILL_PGID_WAIT_MS) {
+                    log.warn(
+                        "child never left our process group, signalling it alone pid={}",
+                        .{pid},
+                    );
+                    return null;
+                }
+                std.Io.sleep(global.io(), .fromMilliseconds(KILL_POLL_MS), .awake) catch {};
+                waited_ms += KILL_POLL_MS;
                 continue;
             }
 
@@ -2372,5 +2426,38 @@ test "killPid: escalates past a child that ignores SIGHUP" {
     //
     // SIGHUP can never end this child, so returning at all proves we escalate
     // to SIGKILL rather than asking politely forever.
-    try Subprocess.killPid(pid);
+    try Subprocess.killPid(pid, null);
+}
+
+test "killPid: falls back to the pid when the child never leaves our group" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const c = Subprocess.c;
+
+    const rc = posix.system.fork();
+    const pid: posix.pid_t = switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => |err| return posix.unexpectedErrno(err),
+    };
+
+    if (pid == 0) {
+        // Deliberately no setsid, so this child stays in the test runner's
+        // process group — the state the pre-exec path leaves behind when
+        // setsid fails, since it logs and execs anyway. Ignore SIGHUP so only
+        // the escalation can end us.
+        var sa: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &sa, null);
+        _ = c.sleep(10);
+        c._exit(0);
+    }
+
+    // Two things are under test. Returning at all means we bounded the wait
+    // for a process group that never arrives, instead of spinning forever.
+    // The test runner still being alive to observe that means we fell back to
+    // signalling the pid, rather than killpg'ing the group we share with it.
+    try Subprocess.killPid(pid, null);
 }
