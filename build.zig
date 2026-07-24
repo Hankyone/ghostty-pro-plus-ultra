@@ -104,6 +104,11 @@ pub fn build(b: *std.Build) !void {
     const bench = try buildpkg.GhosttyBench.init(b, &deps);
     if (config.emit_bench) bench.install();
 
+    // The per-pane keeper. Always installed: a pane can only be reattached
+    // by the keeper that started it, so this has to ship alongside the app.
+    const keeper = try buildpkg.GhosttyKeeper.init(b, &config);
+    keeper.install();
+
     // Ghostty dist tarball
     const dist = try buildpkg.GhosttyDist.init(b, &config);
     {
