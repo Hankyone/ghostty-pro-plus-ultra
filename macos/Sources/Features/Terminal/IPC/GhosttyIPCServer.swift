@@ -5,7 +5,8 @@ import OSLog
 
 /// A Unix domain socket server that allows external processes to control Ghostty tabs.
 ///
-/// Protocol: newline-delimited JSON over a Unix domain socket at `/tmp/ghostty-{uid}.sock`.
+/// Protocol: newline-delimited JSON over a Unix domain socket at
+/// `/tmp/ghostty-{uid}-{bundle-id}.sock`.
 ///
 /// Request format:
 /// ```json
@@ -50,13 +51,15 @@ final class GhosttyIPCServer {
 
     func start() {
         let uid = getuid()
-        let pid = getpid()
-        socketPath = "/tmp/ghostty-\(uid)-\(pid).sock"
+        socketPath = Self.defaultSocketPath(uid: uid)
 
-        // Clean up stale sockets from dead Ghostty instances
-        Self.cleanupStaleSockets(uid: uid, currentPid: pid)
+        // Sweep sockets left behind by builds that keyed the path on the pid.
+        Self.cleanupStaleSockets(uid: uid, keeping: socketPath)
 
-        // Remove stale socket if it exists (e.g., PID reuse)
+        // The path outlives the app now, so it may well still be on disk —
+        // from our own last run, or from a second copy launched with `open -n`.
+        // Take it over either way: the newest instance is the one holding the
+        // user's tabs, so it's the one surviving shells need to reach.
         unlink(socketPath)
 
         // Create socket
@@ -128,22 +131,41 @@ final class GhosttyIPCServer {
         Self.logger.info("IPC: listening on \(self.socketPath)")
     }
 
+    /// The socket path for this user and this build.
+    ///
+    /// Deliberately free of the pid. A shell can outlive the app that spawned
+    /// it and keeps whatever `GHOSTTY_SOCKET` value it was born with, so a
+    /// pid-keyed path stopped resolving the moment Ghostty restarted. The
+    /// agent shim exits quietly when its socket is missing, so those tabs went
+    /// silent with no error to explain it. Keying on the bundle id instead
+    /// keeps the path stable across restarts while still stopping a debug
+    /// build from taking over the release build's socket.
+    private static func defaultSocketPath(uid: uid_t) -> String {
+        let bundle = Bundle.main.bundleIdentifier ?? "ghostty"
+        return "/tmp/ghostty-\(uid)-\(bundle).sock"
+    }
+
     /// Remove sockets left behind by dead Ghostty instances.
-    /// Matches the pattern `/tmp/ghostty-{uid}-{pid}.sock` and also the
-    /// legacy `/tmp/ghostty-{uid}.sock` (no PID suffix).
-    private static func cleanupStaleSockets(uid: uid_t, currentPid: pid_t) {
+    ///
+    /// Older builds bound `/tmp/ghostty-{uid}-{pid}.sock`, and older ones
+    /// still `/tmp/ghostty-{uid}.sock`. Neither is used now, but copies
+    /// outlive a crash, so sweep any whose owning process is gone.
+    private static func cleanupStaleSockets(uid: uid_t, keeping ourPath: String) {
         let fm = FileManager.default
         let prefix = "ghostty-\(uid)"
         guard let contents = try? fm.contentsOfDirectory(atPath: "/tmp") else { return }
         for name in contents {
             guard name.hasPrefix(prefix) && name.hasSuffix(".sock") else { continue }
             let path = "/tmp/\(name)"
+            guard path != ourPath else { continue }
 
             // Extract PID from the filename if present (ghostty-{uid}-{pid}.sock)
             let afterPrefix = name.dropFirst(prefix.count)
             if afterPrefix.hasPrefix("-"), let dotIndex = afterPrefix.lastIndex(of: ".") {
                 let pidStr = afterPrefix.dropFirst().prefix(upTo: dotIndex)
-                if let pid = Int32(pidStr), pid != currentPid {
+                // Anything that doesn't parse as a pid is another build's
+                // stable path — leave it be, it may well be listening.
+                if let pid = Int32(pidStr) {
                     // Check if the process is still alive
                     if kill(pid, 0) == -1 && errno == ESRCH {
                         unlink(path)
