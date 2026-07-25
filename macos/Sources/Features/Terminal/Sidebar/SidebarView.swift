@@ -221,13 +221,22 @@ struct SidebarView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.clear)
         .safeAreaInset(edge: .bottom) {
-            if !updateViewModel.state.isIdle {
-                HStack {
-                    Spacer()
-                    UpdatePill(model: updateViewModel)
+            VStack(spacing: 0) {
+                if !updateViewModel.state.isIdle {
+                    HStack {
+                        Spacer()
+                        UpdatePill(model: updateViewModel)
+                        Spacer()
+                    }
+                    .padding(.vertical, 8)
+                }
+
+                HStack(spacing: 0) {
+                    SidebarSettingsMenu(tabManager: tabManager, theme: theme)
                     Spacer()
                 }
-                .padding(.vertical, 8)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
             }
         }
         .overlay(SidebarClickOverlay(

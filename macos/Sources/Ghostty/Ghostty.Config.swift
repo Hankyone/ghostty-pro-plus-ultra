@@ -637,6 +637,15 @@ extension Ghostty {
             return v
         }
 
+        /// Whether panes run under a keeper so they survive a restart.
+        var paneKeeper: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "pane-keeper"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var quickTerminalAutoHide: Bool {
             guard let config = self.config else { return true }
             var v = true
