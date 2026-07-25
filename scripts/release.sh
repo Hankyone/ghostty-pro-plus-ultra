@@ -178,6 +178,22 @@ if [ -d "${APP}/Contents/Frameworks/Sparkle.framework" ]; then
         "${APP}/Contents/Frameworks/Sparkle.framework" 2>/dev/null || true
 fi
 
+# Sign the per-pane keeper.
+#
+# It's a Mach-O executable living under Resources, which the app's own
+# signature does not cover, so notarization judges it on its own terms and
+# wants all three of Developer ID, hardened runtime and a secure timestamp.
+# Signing has to happen before the app itself, inside out.
+KEEPER="${APP}/Contents/Resources/ghostty/ghostty-keeper"
+if [ -f "$KEEPER" ]; then
+    /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime --timestamp \
+        "$KEEPER"
+else
+    echo "Error: ghostty-keeper is missing from the bundle."
+    echo "       Panes can't start without it. Aborting rather than shipping."
+    exit 1
+fi
+
 # Sign dock tile plugin
 /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime \
     "${APP}/Contents/PlugIns/DockTilePlugin.plugin"
