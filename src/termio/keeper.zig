@@ -35,17 +35,6 @@ const c = @cImport({
 /// The binary we spawn, relative to the resources directory.
 const keeper_exe = "ghostty-keeper";
 
-/// Set while the whole app is shutting down.
-///
-/// Panes torn down inside that window are detached rather than killed: the
-/// app going away is not the user asking for their shells to end. Closing a
-/// pane on its own still kills, because that *is* the user asking.
-///
-/// Process-global because it describes a process-wide condition, and surfaces
-/// are torn down from more paths than it would be honest to thread a flag
-/// through.
-pub var shutting_down: std.atomic.Value(bool) = .init(false);
-
 /// Panes that came back to a shell that never stopped.
 ///
 /// The host needs this to tell a resumed pane from a fresh one. Both end up

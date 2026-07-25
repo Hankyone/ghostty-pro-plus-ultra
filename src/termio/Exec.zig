@@ -285,19 +285,6 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
 
     if (exec.exited) self.subprocess.externalExit();
 
-    // Serialize the screen before stopping, while the terminal still exists
-    // and the read thread is still quiet. The keeper holds onto this so the
-    // next Ghostty can paint the pane back exactly as it was left rather than
-    // reattaching to a live shell behind a blank screen.
-    if (self.subprocess.keeper_session != null and
-        keeperpkg.shutting_down.load(.acquire))
-    {
-        self.subprocess.detach_snapshot = self.snapshotScreen(td.renderer_state) catch |err| snap: {
-            log.warn("could not serialize screen for detach err={}", .{err});
-            break :snap &.{};
-        };
-    }
-
     self.subprocess.stop();
 
     // Quit our read thread after exiting the subprocess so that
@@ -706,12 +693,6 @@ const Subprocess = struct {
     /// Set once we've asked the keeper to kill, so a second stop is a no-op
     /// the way the fork path's `process = null` makes it one.
     keeper_killed: bool = false,
-
-    /// The screen serialized on the way out, handed to the keeper so the next
-    /// Ghostty can paint it back. Captured in `threadExit`, which is the last
-    /// point the terminal still exists; `stop` runs from there and from
-    /// `deinit`, and by the latter it's gone.
-    detach_snapshot: []const u8 = &.{},
 
     /// Keeper inputs, resolved at init.
     keeper_enabled: bool,
@@ -1327,19 +1308,11 @@ const Subprocess = struct {
         // keeper can kill it and actually confirm it died. Signalling from
         // here could start the job but never finish it.
         if (self.keeper_session) |session| {
+            // Already handed to the keeper by the shutdown path, which claims
+            // the pane precisely so this doesn't then kill what it detached.
             if (!self.keeper_killed) {
                 self.keeper_killed = true;
-
-                // Shutting down isn't a close. Leave the shell running and
-                // let the keeper hold it; we'll come looking for it by pane
-                // id on the next launch.
-                if (keeperpkg.shutting_down.load(.acquire)) {
-                    log.info(
-                        "detaching pane, shell left running shell_pid={}",
-                        .{session.shell_pid},
-                    );
-                    _ = keeperpkg.detach(session, self.detach_snapshot);
-                } else if (!keeperpkg.kill(self.arena.allocator(), session)) {
+                if (!keeperpkg.kill(self.arena.allocator(), session)) {
                     log.warn("keeper could not confirm the shell exited", .{});
                 }
             }

@@ -160,6 +160,12 @@ class AppDelegate: NSObject,
     /// or crash doesn't lose all window state (browser-like crash recovery).
     private var stateFlushTimer: Timer?
 
+    /// Whether the termination in progress should hand persistent terminals
+    /// to their keepers rather than end them. False for a machine shutdown,
+    /// restart or logout: a detached shell outlives the login session and can
+    /// hold logout up, so those end everything for real.
+    private var terminationDetaches = true
+
     /// Signals
     private var signals: [DispatchSourceSignal] = []
 
@@ -417,12 +423,9 @@ class AppDelegate: NSObject,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // Quitting detaches keeper-held panes instead of killing them, so the
-        // shells survive to be picked back up on the next launch. This is set
-        // first thing because everything below can return immediately — the
-        // update branch especially, which is the main reason the feature
-        // exists at all.
-        if let app = ghostty.app { ghostty_app_set_shutting_down(app, true) }
+        // An ordinary quit hands persistent terminals to their keepers rather
+        // than ending them. Assume that until something below says otherwise.
+        terminationDetaches = true
 
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
@@ -457,7 +460,7 @@ class AppDelegate: NSObject,
                     // The machine going down is not a restart we'll come back
                     // from, and a detached shell can outlive the login session
                     // and hold logout up. Kill for real here.
-                    if let app = ghostty.app { ghostty_app_set_shutting_down(app, false) }
+                    terminationDetaches = false
                     return .terminateNow
 
                 default:
@@ -477,7 +480,15 @@ class AppDelegate: NSObject,
         // intact so the next launch can pick them straight back up. Surface
         // teardown isn't guaranteed to run on quit — the process can simply
         // exit — so this can't be left to it.
-        if let app = ghostty.app { ghostty_app_detach_panes(app) }
+        //
+        // Gated on the setting as it stands right now, not on how each pane
+        // started. Someone who turns Persistent Terminals off and quits means
+        // it: without this, panes opened while it was on would still detach
+        // and then never be reclaimed, because the next launch wouldn't go
+        // looking for them. They get killed instead.
+        if terminationDetaches, ghostty.config.paneKeeper, let app = ghostty.app {
+            ghostty_app_detach_panes(app)
+        }
 
         GhosttyIPCServer.shared.stop()
 

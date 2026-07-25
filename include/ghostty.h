@@ -1094,11 +1094,6 @@ GHOSTTY_API void ghostty_app_tick(ghostty_app_t);
 GHOSTTY_API void* ghostty_app_userdata(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
 
-/// Tell the core the app is shutting down, so keeper-held panes are detached
-/// rather than killed and can be picked back up next launch. Call this before
-/// surfaces begin closing.
-GHOSTTY_API void ghostty_app_set_shutting_down(ghostty_app_t, bool);
-
 /// Hand every keeper-held pane to its keeper, screen and all, without ending
 /// any of them. Call at the actual point of no return, not when quit is only
 /// proposed.

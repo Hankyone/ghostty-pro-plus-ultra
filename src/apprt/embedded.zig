@@ -1466,19 +1466,6 @@ pub const CAPI = struct {
         return v.opts.userdata;
     }
 
-    /// Tell the core the whole app is on its way out.
-    ///
-    /// Panes torn down after this are detached rather than killed, so a
-    /// keeper-held shell survives to be picked up on the next launch. Closing
-    /// a pane on its own still kills it — only a real shutdown detaches, and
-    /// only the host knows the difference between the two.
-    ///
-    /// Must be called before surfaces start closing, which on macOS means
-    /// `applicationWillTerminate` at the latest.
-    export fn ghostty_app_set_shutting_down(_: *App, v: bool) void {
-        termio.keeper.shutting_down.store(v, .release);
-    }
-
     /// Hand every keeper-held pane to its keeper, screen and all, without
     /// ending any of them.
     ///
