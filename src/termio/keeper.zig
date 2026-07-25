@@ -184,13 +184,7 @@ pub fn spawn(alloc: Allocator, opts: SpawnOptions) !Session {
     );
 
     const spec = try buildSpec(alloc, socket_path, opts);
-    const exe_path = try std.fmt.allocPrintSentinel(
-        alloc,
-        "{s}/{s}",
-        .{ opts.resources_dir, keeper_exe },
-        0,
-    );
-
+    const exe_path = try findKeeper(alloc, opts.resources_dir);
     const keeper_pid = try spawnProcess(alloc, exe_path, spec);
     errdefer _ = c.kill(keeper_pid, c.SIGKILL);
 
@@ -262,10 +256,162 @@ pub fn kill(alloc: Allocator, session: Session) bool {
     return dead;
 }
 
+/// A pane currently being held, as seen from outside the app.
+pub const HeldPane = struct {
+    /// Caller owns this.
+    id: []const u8,
+    shell_pid: c.pid_t,
+
+    /// False when the socket is there but nothing answers — a keeper that
+    /// died without cleaning up after itself.
+    alive: bool,
+};
+
+/// Every pane a keeper is currently holding for this user.
+///
+/// Normally these resolve themselves: reopening Ghostty picks them back up.
+/// This exists for when they can't be — if the window state naming a pane is
+/// lost, its shell keeps running with nothing able to find it, and there has
+/// to be some way to see that and end it.
+pub fn list(alloc: Allocator) ![]HeldPane {
+    const dir_path = try socketDir(alloc);
+    defer alloc.free(dir_path);
+
+    var dir = std.Io.Dir.openDirAbsolute(
+        global.io(),
+        dir_path,
+        .{ .iterate = true },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return try alloc.alloc(HeldPane, 0),
+        else => return err,
+    };
+    defer dir.close(global.io());
+
+    var out: std.ArrayList(HeldPane) = .empty;
+    errdefer {
+        for (out.items) |p| alloc.free(p.id);
+        out.deinit(alloc);
+    }
+
+    var it = dir.iterate();
+    while (try it.next(global.io())) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".sock")) continue;
+        const id = entry.name[0 .. entry.name.len - ".sock".len];
+        if (id.len == 0) continue;
+
+        const path = try std.fmt.allocPrintSentinel(
+            alloc,
+            "{s}/{s}",
+            .{ dir_path, entry.name },
+            0,
+        );
+        defer alloc.free(path);
+
+        var pane: HeldPane = .{
+            .id = try alloc.dupe(u8, id),
+            .shell_pid = 0,
+            .alive = false,
+        };
+
+        if (connect(path)) |sock| {
+            defer _ = c.close(sock);
+            const req = "{\"method\":\"hello\"}\n";
+            if (c.write(sock, req.ptr, req.len) > 0) {
+                var buf: [256]u8 = undefined;
+                const n = c.read(sock, &buf, buf.len);
+                if (n > 0) {
+                    pane.alive = true;
+                    pane.shell_pid = @intCast(parseUint(buf[0..@intCast(n)], "\"shell_pid\":") orelse 0);
+                }
+            }
+        } else |_| {}
+
+        try out.append(alloc, pane);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+/// End a held pane by id, for the case where no window is going to claim it.
+pub fn killByPaneId(alloc: Allocator, pane_id: []const u8) bool {
+    const dir_path = socketDir(alloc) catch return false;
+    defer alloc.free(dir_path);
+
+    const path = std.fmt.allocPrintSentinel(
+        alloc,
+        "{s}/{s}.sock",
+        .{ dir_path, pane_id },
+        0,
+    ) catch return false;
+    defer alloc.free(path);
+
+    const sock = connect(path) catch {
+        // Nothing listening: the socket is a leftover, so clear it away.
+        _ = c.unlink(path.ptr);
+        return false;
+    };
+    defer _ = c.close(sock);
+
+    const req = "{\"method\":\"kill\"}\n";
+    if (c.write(sock, req.ptr, req.len) < 0) return false;
+
+    var buf: [256]u8 = undefined;
+    const n = c.read(sock, &buf, buf.len);
+    if (n <= 0) return false;
+    return std.mem.indexOf(u8, buf[0..@intCast(n)], "\"dead\":true") != null;
+}
+
 // -- internals -------------------------------------------------------------
 
 fn errnoValue() c_int {
     return c.__error().*;
+}
+
+/// Locate the keeper binary.
+///
+/// The resources directory is the obvious answer and usually right, but it
+/// isn't always resolvable — a debug build detects it by looking for terminfo,
+/// which isn't always where it expects. The keeper ships beside us in the same
+/// bundle either way, so fall back to deriving it from our own path rather
+/// than failing to start a pane over it.
+fn findKeeper(alloc: Allocator, resources_dir: ?[]const u8) ![:0]const u8 {
+    if (resources_dir) |dir| {
+        if (dir.len > 0) {
+            const path = try std.fmt.allocPrintSentinel(
+                alloc,
+                "{s}/{s}",
+                .{ dir, keeper_exe },
+                0,
+            );
+            if (c.access(path.ptr, c.X_OK) == 0) return path;
+            alloc.free(path);
+        }
+    }
+
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = exe_buf[0 .. std.process.executablePath(
+        global.io(),
+        &exe_buf,
+    ) catch return error.KeeperNotFound];
+    const exe_dir = std.fs.path.dirname(exe) orelse return error.KeeperNotFound;
+
+    // Contents/MacOS/ghostty -> Contents/Resources/ghostty/ghostty-keeper, and
+    // the plain sibling layout everything else uses.
+    for ([_][]const u8{
+        "../Resources/ghostty/" ++ keeper_exe,
+        keeper_exe,
+    }) |rel| {
+        const path = try std.fmt.allocPrintSentinel(
+            alloc,
+            "{s}/{s}",
+            .{ exe_dir, rel },
+            0,
+        );
+        if (c.access(path.ptr, c.X_OK) == 0) return path;
+        alloc.free(path);
+    }
+
+    return error.KeeperNotFound;
 }
 
 /// Per-user directory holding one socket per live pane.
@@ -397,7 +543,9 @@ fn spawnProcess(alloc: Allocator, exe_path: [:0]const u8, spec: []const u8) !c.p
             @ptrCast(@constCast(&argv)),
             @ptrCast(@constCast(&envp)),
         );
-        c._exit(127);
+        // Carry the reason out in the exit status; there is nothing else left
+        // to report with at this point.
+        c._exit(@intCast(errnoValue() & 0x7f));
     }
 
     _ = c.close(read_end);
@@ -463,7 +611,10 @@ fn connectAndAttach(
             // A keeper that already died is never going to answer.
             var status: c_int = 0;
             if (c.waitpid(keeper_pid, &status, c.WNOHANG) == keeper_pid) {
-                log.err("keeper exited before it could serve", .{});
+                log.err(
+                    "keeper exited before it could serve status={} socket={s}",
+                    .{ status, socket_path },
+                );
                 return error.KeeperDied;
             }
 

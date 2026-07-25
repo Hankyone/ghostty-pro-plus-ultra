@@ -22,6 +22,7 @@ const show_face = @import("show_face.zig");
 const boo = @import("boo.zig");
 const new_window = @import("new_window.zig");
 const toggle_quick_terminal = @import("toggle_quick_terminal.zig");
+const keepers = @import("keepers.zig");
 const global = @import("../global.zig");
 
 /// Special commands that can be invoked via CLI flags. These are all
@@ -48,6 +49,9 @@ pub const Action = enum {
 
     /// List keybind actions
     @"list-actions",
+
+    /// List panes still held by a keeper, and end them
+    keepers,
 
     /// Wrap `ssh` to configure Ghostty terminal integration on remote hosts
     ssh,
@@ -151,6 +155,7 @@ pub const Action = enum {
             .version => try version.run(alloc),
             .help => try help.run(alloc),
             .@"list-fonts" => try list_fonts.run(alloc),
+            .keepers => try keepers.run(alloc),
             .@"list-keybinds" => try list_keybinds.run(alloc),
             .@"list-themes" => try list_themes.run(alloc),
             .@"list-colors" => try list_colors.run(alloc),
@@ -193,6 +198,7 @@ pub const Action = enum {
                 .version => version.Options,
                 .help => help.Options,
                 .@"list-fonts" => list_fonts.Options,
+                .keepers => keepers.Options,
                 .@"list-keybinds" => list_keybinds.Options,
                 .@"list-themes" => list_themes.Options,
                 .@"list-colors" => list_colors.Options,
