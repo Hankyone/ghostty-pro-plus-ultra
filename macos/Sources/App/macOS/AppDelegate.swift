@@ -417,6 +417,13 @@ class AppDelegate: NSObject,
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Quitting detaches keeper-held panes instead of killing them, so the
+        // shells survive to be picked back up on the next launch. This is set
+        // first thing because everything below can return immediately — the
+        // update branch especially, which is the main reason the feature
+        // exists at all.
+        if let app = ghostty.app { ghostty_app_set_shutting_down(app, true) }
+
         let windows = NSApplication.shared.windows
         if windows.isEmpty { return .terminateNow }
 
@@ -447,6 +454,10 @@ class AppDelegate: NSObject,
             if let why = event.attributeDescriptor(forKeyword: keyword) {
                 switch why.typeCodeValue {
                 case kAEShutDown, kAERestart, kAEReallyLogOut:
+                    // The machine going down is not a restart we'll come back
+                    // from, and a detached shell can outlive the login session
+                    // and hold logout up. Kill for real here.
+                    if let app = ghostty.app { ghostty_app_set_shutting_down(app, false) }
                     return .terminateNow
 
                 default:

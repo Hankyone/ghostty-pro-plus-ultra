@@ -942,9 +942,30 @@ const Subprocess = struct {
             }
         }
 
+        const pane_id = self.pane_id orelse return error.KeeperNeedsPaneId;
+
+        // A keeper may already be holding this pane from a previous run of
+        // Ghostty. If so this pane isn't starting, it's resuming: skip the
+        // spawn entirely and take back the terminal that was left running.
+        if (keeperpkg.attach(alloc, pane_id)) |session| {
+            log.info(
+                "reattached to a running pane pane={s} shell_pid={}",
+                .{ pane_id, session.shell_pid },
+            );
+            self.keeper_session = session;
+            return session.master;
+        } else |err| switch (err) {
+            // Nothing there, which is the normal case for a new pane.
+            error.ConnectFailed => {},
+            else => log.warn(
+                "could not reattach pane={s} err={}, starting fresh",
+                .{ pane_id, err },
+            ),
+        }
+
         const session = try keeperpkg.spawn(alloc, .{
             .resources_dir = self.resources_dir orelse return error.KeeperNotFound,
-            .pane_id = self.pane_id orelse return error.KeeperNeedsPaneId,
+            .pane_id = pane_id,
             .argv = self.args,
             .env = env_list.items,
             .cwd = self.cwd,
@@ -1210,7 +1231,16 @@ const Subprocess = struct {
         if (self.keeper_session) |session| {
             if (!self.keeper_killed) {
                 self.keeper_killed = true;
-                if (!keeperpkg.kill(self.arena.allocator(), session)) {
+
+                // Shutting down isn't a close. Leave the shell running and
+                // let the keeper hold it; we'll come looking for it by pane
+                // id on the next launch.
+                if (keeperpkg.shutting_down.load(.acquire)) {
+                    log.info(
+                        "detaching pane, shell left running shell_pid={}",
+                        .{session.shell_pid},
+                    );
+                } else if (!keeperpkg.kill(self.arena.allocator(), session)) {
                     log.warn("keeper could not confirm the shell exited", .{});
                 }
             }

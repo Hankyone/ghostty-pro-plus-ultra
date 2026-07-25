@@ -1,4 +1,5 @@
 import Cocoa
+import GhosttyKit
 
 protocol TerminalRestorable: Codable {
     static var selfKey: String { get }
@@ -211,6 +212,11 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
     /// and build the appropriate resume command.
     @MainActor
     private static func attemptSessionResume(for surface: Ghostty.SurfaceView) {
+        // A reattached pane's agent never stopped. Typing a resume command
+        // into a running agent doesn't resume anything — it feeds text to a
+        // live session and corrupts it.
+        if wasReattached(surface) { return }
+
         let surfaceId = surface.id
         let store = TabMetadataStore.shared
         let entries = store.entries[surfaceId] ?? [:]
@@ -245,8 +251,20 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
     /// Pre-type the last executed command into a restored surface's prompt,
     /// so the user can press Enter to re-run it. Only fires when there's no
     /// agent session to resume (those are handled by attemptSessionResume).
+    /// Whether this pane came back to a shell that never stopped, in which
+    /// case nothing may be typed into it: whatever the user left running is
+    /// still there, and its prompt is not ours to fill.
+    @MainActor
+    private static func wasReattached(_ surface: Ghostty.SurfaceView) -> Bool {
+        surface.id.uuidString.withCString { ghostty_pane_was_reattached($0) }
+    }
+
     @MainActor
     private static func attemptLastCommandRestore(for surface: Ghostty.SurfaceView) {
+        // Same reasoning as the agent path: a resumed shell already has
+        // whatever the user left at its prompt.
+        if wasReattached(surface) { return }
+
         let surfaceId = surface.id
         let store = TabMetadataStore.shared
         let entries = store.entries[surfaceId] ?? [:]

@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const global = @import("../global.zig");
 
 const log = std.log.scoped(.keeper);
 
@@ -32,6 +33,43 @@ const c = @cImport({
 
 /// The binary we spawn, relative to the resources directory.
 const keeper_exe = "ghostty-keeper";
+
+/// Set while the whole app is shutting down.
+///
+/// Panes torn down inside that window are detached rather than killed: the
+/// app going away is not the user asking for their shells to end. Closing a
+/// pane on its own still kills, because that *is* the user asking.
+///
+/// Process-global because it describes a process-wide condition, and surfaces
+/// are torn down from more paths than it would be honest to thread a flag
+/// through.
+pub var shutting_down: std.atomic.Value(bool) = .init(false);
+
+/// Panes that came back to a shell that never stopped.
+///
+/// The host needs this to tell a resumed pane from a fresh one. Both end up
+/// with a keeper and a socket, so the filesystem can't answer it — but only a
+/// resumed pane already has the user's work in it, and anything that types
+/// into a restored terminal has to leave those alone.
+var reattached_mutex: std.Io.Mutex = .init;
+var reattached: std.StringHashMapUnmanaged(void) = .{};
+
+/// Deliberately leaks each id. There is one per pane per run, and the answer
+/// has to stay available for as long as the pane does.
+fn markReattached(pane_id: []const u8) void {
+    const alloc = std.heap.page_allocator;
+    reattached_mutex.lockUncancelable(global.io());
+    defer reattached_mutex.unlock(global.io());
+    if (reattached.contains(pane_id)) return;
+    const key = alloc.dupe(u8, pane_id) catch return;
+    reattached.put(alloc, key, {}) catch alloc.free(key);
+}
+
+pub fn wasReattached(pane_id: []const u8) bool {
+    reattached_mutex.lockUncancelable(global.io());
+    defer reattached_mutex.unlock(global.io());
+    return reattached.contains(pane_id);
+}
 
 /// How long we wait for a freshly spawned keeper to start listening. Only the
 /// very first connect should ever need to retry.
@@ -120,7 +158,9 @@ pub fn attach(alloc: Allocator, pane_id: []const u8) !Session {
     );
 
     // No keeper pid: we didn't start this one, it predates us.
-    return try attachOnce(alloc, socket_path, 0);
+    const session = try attachOnce(alloc, socket_path, 0);
+    markReattached(pane_id);
+    return session;
 }
 
 /// Ask the keeper to kill the shell and confirm it's gone. Returns true when

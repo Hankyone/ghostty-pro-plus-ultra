@@ -648,16 +648,25 @@ pub fn init(
             std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
         );
 
-        // Identity the keeper files its socket under. The surface id is only
-        // unique within this run, so panes are keeper-held but not yet
-        // reattachable — the apprt has to supply an id that survives a
-        // restart before that can work.
+        // Identity the keeper files its socket under.
+        //
+        // Prefer one the apprt can hand back after a restart, because that is
+        // what makes a pane findable again. Falling back to the surface id
+        // keeps keeper mode working everywhere else, but such a pane can only
+        // be reattached within a single run — which is to say, never.
         var pane_id_buf: [18]u8 = undefined;
-        const pane_id = std.fmt.bufPrint(
-            &pane_id_buf,
-            "{x:0>16}",
-            .{self.id},
-        ) catch unreachable;
+        const pane_id: []const u8 = if (@hasDecl(apprt.Surface, "paneId"))
+            rt_surface.paneId() orelse std.fmt.bufPrint(
+                &pane_id_buf,
+                "{x:0>16}",
+                .{self.id},
+            ) catch unreachable
+        else
+            std.fmt.bufPrint(
+                &pane_id_buf,
+                "{x:0>16}",
+                .{self.id},
+            ) catch unreachable;
 
         // Initialize our IO backend
         var io_exec = try termio.Exec.init(alloc, .{

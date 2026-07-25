@@ -711,7 +711,15 @@ extension Ghostty {
             // Set context
             config.context = context
 
+            // Stable identity for this pane. The same UUID comes back after a
+            // restart, since window restoration persists it, which is what
+            // lets a shell left running by a keeper be found again.
+            let paneID = view.id.uuidString
+
             // Use withCString to ensure strings remain valid for the duration of the closure
+            return try paneID.withCString { cPaneID in
+            config.pane_id = cPaneID
+
             return try workingDirectory.withCString { cWorkingDir in
                 config.working_directory = cWorkingDir
 
@@ -747,6 +755,7 @@ extension Ghostty {
                         }
                     }
                 }
+            }
             }
         }
     }

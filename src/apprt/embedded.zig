@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -422,6 +423,10 @@ pub const Surface = struct {
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
 
+    /// Stable identity for this pane across restarts, if the host gave us
+    /// one. Read by the core when deciding whether a pane can be reattached.
+    pane_id: ?[:0]const u8 = null,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -437,6 +442,15 @@ pub const Surface = struct {
 
         /// The font size to inherit. If 0, default font size will be used.
         font_size: f32 = 0,
+
+        /// A stable identity for this pane, unique per surface and — this is
+        /// the part that matters — the same value again after a restart.
+        ///
+        /// It's what lets a pane held by a keeper be found and picked back up
+        /// on the next launch. On macOS this is the surface UUID that window
+        /// restoration already persists. Without it, panes can still be run
+        /// under a keeper but never reattached.
+        pane_id: ?[*:0]const u8 = null,
 
         /// The working directory to load into.
         working_directory: ?[*:0]const u8 = null,
@@ -528,6 +542,16 @@ pub const Surface = struct {
             }
         }
 
+        // Remember the pane identity before the core surface is built: the
+        // core reads it back while starting its io, to decide whether there
+        // is a keeper out there already holding this pane.
+        if (opts.pane_id) |c_id| {
+            const id = std.mem.sliceTo(c_id, 0);
+            if (id.len > 0) {
+                self.pane_id = try app.core_app.alloc.dupeZ(u8, id);
+            }
+        }
+
         // If we have a command from the options then we set it.
         if (opts.command) |c_command| {
             const cmd = std.mem.sliceTo(c_command, 0);
@@ -601,6 +625,7 @@ pub const Surface = struct {
 
         // Free our title
         if (self.title) |v| self.app.core_app.alloc.free(v);
+        if (self.pane_id) |v| self.app.core_app.alloc.free(v);
 
         // Remove ourselves from the list of known surfaces in the app.
         self.app.core_app.deleteSurface(self);
@@ -949,6 +974,13 @@ pub const Surface = struct {
             .working_directory = working_directory,
             .context = context,
         };
+    }
+
+    /// The host-supplied identity for this pane, stable across restarts.
+    /// Null when the host doesn't track one, in which case panes can't be
+    /// reattached.
+    pub fn paneId(self: *const Surface) ?[]const u8 {
+        return self.pane_id;
     }
 
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
@@ -1432,6 +1464,28 @@ pub const CAPI = struct {
     /// Return the userdata associated with the app.
     export fn ghostty_app_userdata(v: *App) ?*anyopaque {
         return v.opts.userdata;
+    }
+
+    /// Tell the core the whole app is on its way out.
+    ///
+    /// Panes torn down after this are detached rather than killed, so a
+    /// keeper-held shell survives to be picked up on the next launch. Closing
+    /// a pane on its own still kills it — only a real shutdown detaches, and
+    /// only the host knows the difference between the two.
+    ///
+    /// Must be called before surfaces start closing, which on macOS means
+    /// `applicationWillTerminate` at the latest.
+    export fn ghostty_app_set_shutting_down(_: *App, v: bool) void {
+        termio.keeper.shutting_down.store(v, .release);
+    }
+
+    /// Whether the pane with this id came back to a shell that never stopped.
+    ///
+    /// Anything that types into a restored terminal — replaying a last command,
+    /// resuming an agent — must check this first. A resumed pane already has
+    /// the user's live session in it, and typing into that corrupts it.
+    export fn ghostty_pane_was_reattached(id: [*:0]const u8) bool {
+        return termio.keeper.wasReattached(std.mem.sliceTo(id, 0));
     }
 
     export fn ghostty_app_free(v: *App) void {

@@ -470,6 +470,9 @@ typedef struct {
   void* userdata;
   double scale_factor;
   float font_size;
+  /// Stable identity for this pane, the same value again after a restart.
+  /// Required for a pane to be reattachable; NULL is fine otherwise.
+  const char* pane_id;
   const char* working_directory;
   const char* command;
   ghostty_env_var_s* env_vars;
@@ -1090,6 +1093,16 @@ GHOSTTY_API void ghostty_app_free(ghostty_app_t);
 GHOSTTY_API void ghostty_app_tick(ghostty_app_t);
 GHOSTTY_API void* ghostty_app_userdata(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
+
+/// Tell the core the app is shutting down, so keeper-held panes are detached
+/// rather than killed and can be picked back up next launch. Call this before
+/// surfaces begin closing.
+GHOSTTY_API void ghostty_app_set_shutting_down(ghostty_app_t, bool);
+
+/// Whether the pane with this id came back to a shell that never stopped.
+/// Anything that types into a restored terminal must check this first: a
+/// resumed pane already holds a live session.
+GHOSTTY_API bool ghostty_pane_was_reattached(const char*);
 GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
 GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
 GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);
