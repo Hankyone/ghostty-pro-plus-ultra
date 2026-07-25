@@ -48,6 +48,25 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     exit 1
 fi
 
+# Check the notarization credential before doing anything expensive.
+#
+# Notarization happens after the Zig build, the Xcode build, signing and DMG
+# creation — a quarter of an hour in. A missing keychain profile used to fail
+# there, having already pushed main, which is a miserable way to find out.
+if ! xcrun notarytool history --keychain-profile "notarytool-profile" >/dev/null 2>&1; then
+    echo "Error: no usable notarization credential."
+    echo
+    echo "The keychain profile 'notarytool-profile' is missing or invalid, so"
+    echo "notarization would fail after the whole build. Recreate it with an"
+    echo "app-specific password from appleid.apple.com:"
+    echo
+    echo "  xcrun notarytool store-credentials notarytool-profile \\"
+    echo "      --apple-id ${APPLE_ID} --team-id ${TEAM_ID}"
+    echo
+    echo "Then run this script again."
+    exit 1
+fi
+
 # --- Pull latest from origin and upstream ---
 echo "==> Pulling latest from origin..."
 git pull origin main --ff-only 2>/dev/null || {
