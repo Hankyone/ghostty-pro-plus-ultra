@@ -26,7 +26,14 @@ pub fn init(b: *std.Build, cfg: *const Config) !GhosttyKeeper {
     return .{ .exe = exe };
 }
 
+/// Installed into the resources directory rather than bin, because that is
+/// the one place the app can find at runtime on every platform: the macOS
+/// Xcode project already copies `share/ghostty` into the bundle, and
+/// `resourcesDir` resolves to it.
 pub fn install(self: *const GhosttyKeeper) void {
     const b = self.exe.step.owner;
-    b.installArtifact(self.exe);
+    const step = b.addInstallArtifact(self.exe, .{
+        .dest_dir = .{ .override = .{ .custom = "share/ghostty" } },
+    });
+    b.getInstallStep().dependOn(&step.step);
 }

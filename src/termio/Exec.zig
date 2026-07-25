@@ -22,6 +22,7 @@ const shell_integration = @import("shell_integration.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
 const Command = @import("../Command.zig");
+const keeperpkg = @import("keeper.zig");
 const SegmentedPool = @import("../datastruct/main.zig").SegmentedPool;
 const ptypkg = @import("../pty.zig");
 const Pty = ptypkg.Pty;
@@ -104,8 +105,14 @@ pub fn threadEnter(
     };
     errdefer self.subprocess.stop();
 
-    // Watcher to detect subprocess exit
-    var process: ?xev.Process = if (self.subprocess.process) |v| switch (v) {
+    // Watcher to detect subprocess exit.
+    //
+    // In keeper mode the shell is not our child, so we can't reap it — but we
+    // can still be told when it exits, which is all the UI needs. The keeper
+    // is the authority on exit status.
+    var process: ?xev.Process = if (self.subprocess.keeper_session) |session|
+        try xev.Process.init(@intCast(session.shell_pid))
+    else if (self.subprocess.process) |v| switch (v) {
         .fork_exec => |cmd| try xev.Process.init(
             cmd.pid orelse return error.ProcessNoPid,
         ),
@@ -559,6 +566,16 @@ pub const ThreadData = struct {
 };
 
 pub const Config = struct {
+    /// Run this pane's shell under a keeper process instead of forking it
+    /// ourselves, so it can outlive us. Requires `pane_id`: without a stable
+    /// identifier there would be no way to find the pane again, which is the
+    /// only reason to pay for a keeper at all.
+    keeper: bool = false,
+
+    /// Stable identity for this pane across restarts. On macOS this is the
+    /// surface UUID that window restoration already persists.
+    pane_id: ?[]const u8 = null,
+
     command: ?configpkg.Command = null,
     env: EnvMap,
     env_override: configpkg.RepeatableStringMap = .{},
@@ -588,6 +605,20 @@ const Subprocess = struct {
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
+
+    /// Set when this pane is held by a keeper. Mutually exclusive with
+    /// `pty`/`process`: the keeper owns both of those, and we only borrow the
+    /// master fd from it.
+    keeper_session: ?keeperpkg.Session = null,
+
+    /// Set once we've asked the keeper to kill, so a second stop is a no-op
+    /// the way the fork path's `process = null` makes it one.
+    keeper_killed: bool = false,
+
+    /// Keeper inputs, resolved at init.
+    keeper_enabled: bool,
+    pane_id: ?[]const u8,
+    resources_dir: ?[]const u8,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -860,11 +891,27 @@ const Subprocess = struct {
         // https://github.com/ghostty-org/ghostty/discussions/7769
         if (cwd) |pwd| try env.put("PWD", pwd);
 
+        // A keeper is only useful if we can find this pane again later, so
+        // it takes both the flag and a stable id.
+        const keeper_enabled = cfg.keeper and cfg.pane_id != null;
+        const pane_id: ?[]const u8 = if (cfg.pane_id) |v|
+            try alloc.dupe(u8, v)
+        else
+            null;
+        const resources_dir: ?[]const u8 = if (cfg.resources_dir) |v|
+            try alloc.dupe(u8, v)
+        else
+            null;
+
         return .{
             .arena = arena,
             .env = env,
             .cwd = cwd,
             .args = args,
+
+            .keeper_enabled = keeper_enabled,
+            .pane_id = pane_id,
+            .resources_dir = resources_dir,
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
@@ -875,10 +922,53 @@ const Subprocess = struct {
         };
     }
 
+    /// Hand this pane to a keeper and take back the pty master.
+    ///
+    /// The environment is assembled here exactly as it would be for a direct
+    /// fork — shell integration and all — and passed through verbatim, so the
+    /// keeper stays ignorant of anything Ghostty-specific.
+    fn startKeeper(self: *Subprocess) !Pty.Fd {
+        const alloc = self.arena.allocator();
+
+        var env_list: std.ArrayList([]const u8) = .empty;
+        if (self.env) |*env| {
+            var it = env.iterator();
+            while (it.next()) |pair| {
+                try env_list.append(alloc, try std.fmt.allocPrint(
+                    alloc,
+                    "{s}={s}",
+                    .{ pair.key_ptr.*, pair.value_ptr.* },
+                ));
+            }
+        }
+
+        const session = try keeperpkg.spawn(alloc, .{
+            .resources_dir = self.resources_dir orelse return error.KeeperNotFound,
+            .pane_id = self.pane_id orelse return error.KeeperNeedsPaneId,
+            .argv = self.args,
+            .env = env_list.items,
+            .cwd = self.cwd,
+            .rows = std.math.cast(u16, self.grid_size.rows) orelse 24,
+            .cols = std.math.cast(u16, self.grid_size.columns) orelse 80,
+            .width_px = std.math.cast(u16, self.screen_size.width) orelse 0,
+            .height_px = std.math.cast(u16, self.screen_size.height) orelse 0,
+        });
+
+        self.keeper_session = session;
+        return session.master;
+    }
+
     /// Clean up the subprocess. This will stop the subprocess if it is started.
     pub fn deinit(self: *Subprocess) void {
         self.stop();
         if (self.pty) |*pty| pty.deinit();
+
+        // In keeper mode we own only the borrowed master; the keeper closed
+        // its own copy when it exited.
+        if (self.keeper_session) |session| {
+            _ = posix.system.close(session.master);
+            self.keeper_session = null;
+        }
         if (self.env) |*env| env.deinit();
         self.arena.deinit();
         self.* = undefined;
@@ -891,6 +981,13 @@ const Subprocess = struct {
         write: Pty.Fd,
     } {
         assert(self.pty == null and self.process == null);
+
+        // Keeper mode: a separate process opens the pty and forks the shell,
+        // so it can hold both after we're gone. We only borrow the master.
+        if (self.keeper_enabled) {
+            const fd = try self.startKeeper();
+            return .{ .read = fd, .write = fd };
+        }
 
         // This function is funny because on POSIX systems it can
         // fail in the forked process. This is flipped to true if
@@ -1107,6 +1204,19 @@ const Subprocess = struct {
     /// for it to terminate, so it will not block.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
+        // Keeper mode: the shell is the keeper's child, not ours, so only the
+        // keeper can kill it and actually confirm it died. Signalling from
+        // here could start the job but never finish it.
+        if (self.keeper_session) |session| {
+            if (!self.keeper_killed) {
+                self.keeper_killed = true;
+                if (!keeperpkg.kill(self.arena.allocator(), session)) {
+                    log.warn("keeper could not confirm the shell exited", .{});
+                }
+            }
+            return;
+        }
+
         switch (self.process orelse return) {
             .fork_exec => |*cmd| {
                 // The shell's foreground job gets its own process group, so

@@ -648,8 +648,21 @@ pub fn init(
             std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
         );
 
+        // Identity the keeper files its socket under. The surface id is only
+        // unique within this run, so panes are keeper-held but not yet
+        // reattachable — the apprt has to supply an id that survives a
+        // restart before that can work.
+        var pane_id_buf: [18]u8 = undefined;
+        const pane_id = std.fmt.bufPrint(
+            &pane_id_buf,
+            "{x:0>16}",
+            .{self.id},
+        ) catch unreachable;
+
         // Initialize our IO backend
         var io_exec = try termio.Exec.init(alloc, .{
+            .keeper = config.@"pane-keeper",
+            .pane_id = pane_id,
             .command = command,
             .env = env,
             .env_override = config.env,

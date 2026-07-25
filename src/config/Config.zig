@@ -2531,6 +2531,22 @@ keybind: Keybinds = .{},
 /// running.
 @"confirm-close-surface": ConfirmCloseSurface = .true,
 
+/// Run each pane's shell under a small keeper process instead of starting it
+/// directly, so that it can outlive Ghostty.
+///
+/// This is the foundation for picking panes back up after a restart: the
+/// keeper owns the terminal and the shell, so quitting Ghostty — or crashing,
+/// or installing an update — no longer ends them.
+///
+/// Closing a pane still kills its shell, exactly as it does without this. The
+/// only difference is who does the killing: the keeper, which as the shell's
+/// parent is the only process that can confirm it actually died.
+///
+/// Costs one small resident process per open pane.
+///
+/// Experimental, and off by default.
+@"pane-keeper": bool = false,
+
 /// Whether or not to quit after the last surface is closed.
 ///
 /// This defaults to `false` on macOS since that is standard behavior for
