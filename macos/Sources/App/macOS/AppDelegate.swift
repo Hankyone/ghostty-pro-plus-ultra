@@ -473,6 +473,12 @@ class AppDelegate: NSObject,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Point of no return: hand keeper-held panes over with their screens
+        // intact so the next launch can pick them straight back up. Surface
+        // teardown isn't guaranteed to run on quit — the process can simply
+        // exit — so this can't be left to it.
+        if let app = ghostty.app { ghostty_app_detach_panes(app) }
+
         GhosttyIPCServer.shared.stop()
 
         // We have no notifications we want to persist after death,

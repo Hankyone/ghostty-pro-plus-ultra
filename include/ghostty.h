@@ -1099,6 +1099,11 @@ GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
 /// surfaces begin closing.
 GHOSTTY_API void ghostty_app_set_shutting_down(ghostty_app_t, bool);
 
+/// Hand every keeper-held pane to its keeper, screen and all, without ending
+/// any of them. Call at the actual point of no return, not when quit is only
+/// proposed.
+GHOSTTY_API void ghostty_app_detach_panes(ghostty_app_t);
+
 /// Whether the pane with this id came back to a shell that never stopped.
 /// Anything that types into a restored terminal must check this first: a
 /// resumed pane already holds a live session.

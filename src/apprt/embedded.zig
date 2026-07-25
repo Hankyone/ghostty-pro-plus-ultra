@@ -1479,6 +1479,19 @@ pub const CAPI = struct {
         termio.keeper.shutting_down.store(v, .release);
     }
 
+    /// Hand every keeper-held pane to its keeper, screen and all, without
+    /// ending any of them.
+    ///
+    /// Call this at the actual point of no return — `applicationWillTerminate`
+    /// — not when quit is merely proposed. A detached keeper starts reading
+    /// the pty again, so doing this while the app carries on would have it
+    /// stealing output from a live window.
+    export fn ghostty_app_detach_panes(v: *App) void {
+        for (v.core_app.surfaces.items) |surface| {
+            surface.core_surface.detachKeeper();
+        }
+    }
+
     /// Whether the pane with this id came back to a shell that never stopped.
     ///
     /// Anything that types into a restored terminal — replaying a last command,

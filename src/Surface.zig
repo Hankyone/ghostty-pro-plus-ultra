@@ -812,6 +812,14 @@ pub fn init(
     app.first = false;
 }
 
+/// Hand this pane to its keeper without ending it, so it can be picked back
+/// up next launch. No-op unless the pane is keeper-held.
+pub fn detachKeeper(self: *Surface) void {
+    switch (self.io.backend) {
+        .exec => |*exec| exec.detachForShutdown(&self.renderer_state),
+    }
+}
+
 pub fn deinit(self: *Surface) void {
     // Stop search thread
     if (self.search) |*s| s.deinit();

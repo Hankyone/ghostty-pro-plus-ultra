@@ -79,6 +79,15 @@ const SpawnSpec = struct {
     height_px: u16 = 0,
 };
 
+/// How much output we keep from a detached pane before dropping the oldest.
+/// Anything past this is gone; the client is told how much it missed.
+const ring_capacity: usize = 1 << 20;
+
+/// Refuse a snapshot larger than this. A pane's screen and scrollback
+/// serialize well under it, and the cap stops a runaway client from making us
+/// hold arbitrary memory for days.
+const snapshot_max: usize = 8 << 20;
+
 /// Everything the keeper owns once it's running.
 const Keeper = struct {
     alloc: std.mem.Allocator,
@@ -96,6 +105,23 @@ const Keeper = struct {
     exit_status: c_int = 0,
 
     listener: c_int = -1,
+
+    /// True while a client holds the pane. We must not read the pty then —
+    /// the bytes are theirs, and two readers would split the stream. While
+    /// nobody holds it we must read, or the shell blocks once the kernel's
+    /// buffer fills.
+    attached: bool = false,
+
+    /// The screen as it was when the last client detached, serialized by
+    /// Ghostty and opaque to us. We store and return it; we never parse it.
+    /// That is what keeps this process ignorant of terminal semantics and so
+    /// safe to leave running across an upgrade.
+    snapshot: []u8 = &.{},
+
+    /// Output produced while nobody was attached, oldest dropped first.
+    ring: []u8 = &.{},
+    ring_len: usize = 0,
+    dropped: usize = 0,
 };
 
 pub fn main() !void {
@@ -261,6 +287,54 @@ fn checkDirectory(path: []const u8) !void {
     if ((st.st_mode & 0o077) != 0) return error.SocketDirTooOpen;
 }
 
+/// Append output produced while detached, dropping the oldest to make room.
+///
+/// Dropping is the lesser evil: the alternative is to stop reading, which
+/// blocks the user's job the moment the kernel buffer fills — for days, if
+/// that's how long they're away. The client is told the byte count it missed
+/// so it can say so, rather than silently showing a corrupt screen.
+fn bufferOutput(self: *Keeper, bytes: []const u8) void {
+    if (self.ring.len == 0) {
+        self.ring = self.alloc.alloc(u8, ring_capacity) catch return;
+    }
+
+    var data = bytes;
+    if (data.len >= self.ring.len) {
+        self.dropped += self.ring_len + (data.len - self.ring.len);
+        data = data[data.len - self.ring.len ..];
+        @memcpy(self.ring[0..data.len], data);
+        self.ring_len = data.len;
+        return;
+    }
+
+    if (self.ring_len + data.len > self.ring.len) {
+        const overflow = self.ring_len + data.len - self.ring.len;
+        std.mem.copyForwards(u8, self.ring[0 .. self.ring_len - overflow], self.ring[overflow..self.ring_len]);
+        self.ring_len -= overflow;
+        self.dropped += overflow;
+    }
+
+    @memcpy(self.ring[self.ring_len..][0..data.len], data);
+    self.ring_len += data.len;
+}
+
+/// Drain whatever the shell has produced while nobody is holding the pane.
+fn drainPty(self: *Keeper) void {
+    var buf: [16384]u8 = undefined;
+    while (true) {
+        var fds = [_]c.struct_pollfd{.{
+            .fd = self.master,
+            .events = c.POLLIN,
+            .revents = 0,
+        }};
+        if (c.poll(&fds, 1, 0) <= 0) return;
+
+        const n = c.read(self.master, &buf, buf.len);
+        if (n <= 0) return;
+        bufferOutput(self, buf[0..@intCast(n)]);
+    }
+}
+
 /// Accept and serve control connections until the shell is gone.
 fn serve(self: *Keeper) !void {
     while (true) {
@@ -269,6 +343,9 @@ fn serve(self: *Keeper) !void {
             log.info("shell exited status={}", .{self.exit_status});
             return;
         }
+
+        // Nobody attached means nobody is reading the shell but us.
+        if (!self.attached) drainPty(self);
 
         var fds = [_]c.struct_pollfd{.{
             .fd = self.listener,
@@ -308,13 +385,28 @@ fn handleClient(self: *Keeper, client: c_int) !void {
         if (n <= 0) return; // peer gone
         len += @intCast(n);
 
-        // Handle every complete line we have.
+        // Handle every complete line we have. A request may be followed by a
+        // raw payload, some of which is already sitting in this buffer, so
+        // hand that over and let the handler say how much of it it took.
         while (std.mem.indexOfScalar(u8, buf[0..len], '\n')) |idx| {
             const line = buf[0..idx];
-            const done = try handleRequest(self, client, line);
+            const body_start = idx + 1;
 
-            const rest = len - (idx + 1);
-            std.mem.copyForwards(u8, buf[0..rest], buf[idx + 1 ..][0..rest]);
+            var consumed: usize = 0;
+            const done = try handleRequest(
+                self,
+                client,
+                line,
+                buf[body_start..len],
+                &consumed,
+            );
+
+            const rest = len - body_start - consumed;
+            std.mem.copyForwards(
+                u8,
+                buf[0..rest],
+                buf[body_start + consumed ..][0..rest],
+            );
             len = rest;
 
             if (done) return;
@@ -329,7 +421,17 @@ const Request = struct {
 };
 
 /// Returns true when the connection should be closed afterward.
-fn handleRequest(self: *Keeper, client: c_int, line: []const u8) !bool {
+///
+/// `pending` is whatever already arrived after the request line; a handler
+/// that expects a payload takes what it needs from there first and reports
+/// how much through `consumed`.
+fn handleRequest(
+    self: *Keeper,
+    client: c_int,
+    line: []const u8,
+    pending: []const u8,
+    consumed: *usize,
+) !bool {
     const parsed = std.json.parseFromSlice(
         Request,
         self.alloc,
@@ -360,16 +462,66 @@ fn handleRequest(self: *Keeper, client: c_int, line: []const u8) !bool {
             return true;
         }
 
+        // Take everything the shell said while nobody was listening, then
+        // stop reading: from here the client owns the stream.
+        drainPty(self);
+        self.attached = true;
+
+        const replay_len = self.snapshot.len + self.ring_len;
         var out: [256]u8 = undefined;
         const msg = try std.fmt.bufPrint(
             &out,
-            "{{\"ok\":true,\"shell_pid\":{d}}}\n",
-            .{self.shell_pid},
+            "{{\"ok\":true,\"shell_pid\":{d},\"replay_len\":{d},\"dropped\":{d}}}\n",
+            .{ self.shell_pid, replay_len, self.dropped },
         );
+
         // The fd rides along with the reply so the client can't observe one
         // without the other.
         try sendFd(client, self.master, msg);
+
+        // Screen first, then everything since: replaying them in the other
+        // order would paint stale content over fresh.
+        if (self.snapshot.len > 0) try writeAll(client, self.snapshot);
+        if (self.ring_len > 0) try writeAll(client, self.ring[0..self.ring_len]);
+
+        // Consumed. Anything from here belongs to the attached client.
+        self.ring_len = 0;
+        self.dropped = 0;
         return false;
+    }
+
+    if (std.mem.eql(u8, method, "detach")) {
+        // The client hands back the screen as it stands so we can give it to
+        // whoever attaches next — including a Ghostty from a later build,
+        // which is why it stays an opaque blob to us.
+        const snap_len = parseUint(line, "\"len\":") orelse 0;
+        if (snap_len > snapshot_max) {
+            try reply(client, "{\"ok\":false,\"error\":\"snapshot too large\"}");
+            return true;
+        }
+
+        if (self.snapshot.len > 0) self.alloc.free(self.snapshot);
+        self.snapshot = &.{};
+
+        if (snap_len > 0) {
+            const buf = try self.alloc.alloc(u8, snap_len);
+            errdefer self.alloc.free(buf);
+
+            const from_pending = @min(pending.len, snap_len);
+            @memcpy(buf[0..from_pending], pending[0..from_pending]);
+            consumed.* = from_pending;
+            if (from_pending < snap_len) try readExactly(client, buf[from_pending..]);
+
+            self.snapshot = buf;
+        }
+
+        // Anything buffered predates this snapshot, so it's already in it.
+        self.ring_len = 0;
+        self.dropped = 0;
+        self.attached = false;
+
+        try reply(client, "{\"ok\":true}");
+        return true;
     }
 
     if (std.mem.eql(u8, method, "kill")) {
@@ -390,8 +542,38 @@ fn handleRequest(self: *Keeper, client: c_int, line: []const u8) !bool {
 }
 
 fn reply(client: c_int, msg: []const u8) !void {
-    if (c.write(client, msg.ptr, msg.len) < 0) return error.WriteFailed;
-    if (c.write(client, "\n", 1) < 0) return error.WriteFailed;
+    try writeAll(client, msg);
+    try writeAll(client, "\n");
+}
+
+fn writeAll(fd: c_int, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = c.write(fd, bytes[off..].ptr, bytes.len - off);
+        if (n <= 0) return error.WriteFailed;
+        off += @intCast(n);
+    }
+}
+
+fn readExactly(fd: c_int, buf: []u8) !void {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const n = c.read(fd, buf[off..].ptr, buf.len - off);
+        if (n <= 0) return error.ReadFailed;
+        off += @intCast(n);
+    }
+}
+
+/// Pull a number out of a JSON line without a parser, so a newer client
+/// adding fields can never stop an older keeper from reading the one it
+/// needs.
+fn parseUint(line: []const u8, key: []const u8) ?usize {
+    const idx = std.mem.indexOf(u8, line, key) orelse return null;
+    const rest = line[idx + key.len ..];
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
 }
 
 /// A control message carrying exactly one fd, laid out by hand because the

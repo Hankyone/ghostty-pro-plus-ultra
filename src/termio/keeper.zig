@@ -29,6 +29,7 @@ const c = @cImport({
     @cInclude("sys/wait.h");
     @cInclude("signal.h");
     @cInclude("errno.h");
+    @cInclude("sys/time.h");
 });
 
 /// The binary we spawn, relative to the resources directory.
@@ -76,6 +77,52 @@ pub fn wasReattached(pane_id: []const u8) bool {
 const connect_timeout_ms: usize = 2000;
 const connect_poll_ms: usize = 5;
 
+/// Hand the keeper the screen as it stands and leave the shell running.
+///
+/// Called when the app is going away rather than the pane being closed. The
+/// blob is whatever Ghostty's formatter produced; the keeper stores it
+/// without looking inside and returns it to whoever attaches next, which may
+/// well be a different build of Ghostty after an update.
+pub fn detach(session: Session, snapshot: []const u8) bool {
+    const sock = connect(session.socket_path) catch {
+        log.warn("keeper unreachable at detach; pane keeps running anyway", .{});
+        return false;
+    };
+    defer _ = c.close(sock);
+
+    var header: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &header,
+        "{{\"method\":\"detach\",\"len\":{d}}}\n",
+        .{snapshot.len},
+    ) catch return false;
+
+    if (!writeAll(sock, msg)) return false;
+    if (snapshot.len > 0 and !writeAll(sock, snapshot)) return false;
+
+    // Wait for the ack so we know the snapshot landed before we exit — but
+    // only for as long as the socket timeout allows. A pane whose screen we
+    // couldn't hand over still keeps running; a quit that never finishes is
+    // the worse outcome by far.
+    var buf: [128]u8 = undefined;
+    const n = c.read(sock, &buf, buf.len);
+    if (n <= 0) {
+        log.warn("keeper did not acknowledge the detach in time", .{});
+        return false;
+    }
+    return std.mem.indexOf(u8, buf[0..@intCast(n)], "\"ok\":true") != null;
+}
+
+fn writeAll(fd: c_int, bytes: []const u8) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = c.write(fd, bytes[off..].ptr, bytes.len - off);
+        if (n <= 0) return false;
+        off += @intCast(n);
+    }
+    return true;
+}
+
 /// A pane held by a keeper.
 pub const Session = struct {
     /// The pty master, ours to use directly.
@@ -90,6 +137,15 @@ pub const Session = struct {
 
     /// Owned by the caller's arena.
     socket_path: [:0]const u8,
+
+    /// The screen this pane was left with, plus anything it printed while
+    /// nobody was attached. Feed it to the terminal before reading the fd.
+    /// Empty for a pane that has just been started.
+    replay: []const u8 = &.{},
+
+    /// Bytes the keeper had to drop while detached, if the pane produced
+    /// more output than it could hold.
+    dropped: usize = 0,
 };
 
 pub const SpawnOptions = struct {
@@ -357,10 +413,28 @@ fn spawnProcess(alloc: Allocator, exe_path: [:0]const u8, spec: []const u8) !c.p
     return pid;
 }
 
+/// Nothing we ask a keeper may block us indefinitely.
+///
+/// These calls happen on the app thread, including while quitting, and a
+/// keeper that is wedged or slow must cost us a moment rather than the ability
+/// to exit. Every operation here is a short local round trip, so a couple of
+/// seconds is already far beyond generous.
+const io_timeout_ms: usize = 2000;
+
+fn setTimeouts(sock: c_int) void {
+    var tv: c.struct_timeval = .{
+        .tv_sec = @intCast(io_timeout_ms / 1000),
+        .tv_usec = @intCast((io_timeout_ms % 1000) * 1000),
+    };
+    _ = c.setsockopt(sock, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
+    _ = c.setsockopt(sock, c.SOL_SOCKET, c.SO_SNDTIMEO, &tv, @sizeOf(c.struct_timeval));
+}
+
 fn connect(path: [:0]const u8) !c_int {
     const sock = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
     if (sock < 0) return error.SocketFailed;
     errdefer _ = c.close(sock);
+    setTimeouts(sock);
 
     var addr: c.sockaddr_un = std.mem.zeroes(c.sockaddr_un);
     addr.sun_family = c.AF_UNIX;
@@ -410,8 +484,6 @@ fn attachOnce(
     socket_path: [:0]const u8,
     keeper_pid: c.pid_t,
 ) !Session {
-    _ = alloc;
-
     const sock = try connect(socket_path);
     defer _ = c.close(sock);
 
@@ -437,26 +509,49 @@ fn attachOnce(
     // Ours now, and it must not leak into any shell we start later.
     _ = c.fcntl(master, c.F_SETFD, c.FD_CLOEXEC);
 
+    const got = buf[0..@intCast(n)];
+    const line_end = std.mem.indexOfScalar(u8, got, '\n') orelse got.len;
+    const head = got[0..line_end];
+
+    // The screen the keeper was holding, plus anything the shell said while
+    // nobody was listening. Some of it already arrived with the reply.
+    const replay_len = parseUint(head, "\"replay_len\":") orelse 0;
+    var replay: []u8 = &.{};
+    if (replay_len > 0) {
+        replay = try alloc.alloc(u8, replay_len);
+        const already = if (line_end < got.len) got[line_end + 1 ..] else got[0..0];
+        const from_head = @min(already.len, replay_len);
+        @memcpy(replay[0..from_head], already[0..from_head]);
+
+        var off = from_head;
+        while (off < replay_len) {
+            const r = c.read(sock, replay[off..].ptr, replay_len - off);
+            if (r <= 0) return error.ShortReplay;
+            off += @intCast(r);
+        }
+    }
+
     return .{
         .master = master,
-        .shell_pid = parseShellPid(buf[0..@intCast(n)]) orelse 0,
+        .shell_pid = @intCast(parseUint(head, "\"shell_pid\":") orelse 0),
         .keeper_pid = keeper_pid,
         .socket_path = socket_path,
+        .replay = replay,
+        .dropped = parseUint(head, "\"dropped\":") orelse 0,
     };
 }
 
-/// Pull the shell pid out of the attach reply without a JSON parser, so a
-/// newer keeper adding fields can't break an older reader.
-fn parseShellPid(reply: []const u8) ?c.pid_t {
-    const key = "\"shell_pid\":";
+/// Pull a number out of a reply without a JSON parser, so a newer keeper
+/// adding fields can't break an older reader.
+fn parseUint(reply: []const u8, key: []const u8) ?usize {
     const idx = std.mem.indexOf(u8, reply, key) orelse return null;
-    var rest = reply[idx + key.len ..];
+    const rest = reply[idx + key.len ..];
 
     var end: usize = 0;
     while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
     if (end == 0) return null;
 
-    return std.fmt.parseInt(c.pid_t, rest[0..end], 10) catch null;
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
 }
 
 /// A control message carrying exactly one fd. Laid out by hand because the

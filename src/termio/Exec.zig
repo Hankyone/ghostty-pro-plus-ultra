@@ -144,6 +144,20 @@ pub fn threadEnter(
     var termios_timer = try xev.Timer.init();
     errdefer termios_timer.deinit();
 
+    // Paint back whatever this pane was left showing, plus anything it
+    // printed while nobody was attached. This has to happen before the read
+    // thread starts, or replayed output would race live output and interleave.
+    if (self.subprocess.keeper_session) |session| {
+        if (session.replay.len > 0) {
+            io.processOutput(session.replay);
+            log.info("replayed {d} bytes into reattached pane", .{session.replay.len});
+        }
+        if (session.dropped > 0) log.warn(
+            "keeper dropped {d} bytes while detached; scrollback is short by that much",
+            .{session.dropped},
+        );
+    }
+
     // Start our read thread
     const read_thread = try std.Thread.spawn(
         .{},
@@ -201,11 +215,89 @@ pub fn threadEnter(
     }
 }
 
+/// Serialize the pane's screen as the escape sequences that reproduce it.
+///
+/// VT bytes rather than any internal representation, deliberately: this blob
+/// is stored by a keeper that will hand it to whatever Ghostty is installed
+/// next, and escape sequences are the one format both ends are guaranteed to
+/// still agree on after an update.
+///
+/// Note this covers the active screen. A pane sitting in a full-screen app
+/// comes back showing that app, and the shell screen underneath it is not
+/// preserved — the app repaints on the resize that follows the reattach.
+fn snapshotScreen(self: *Exec, renderer_state: *renderer.State) ![]const u8 {
+    const alloc = self.subprocess.arena.allocator();
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    {
+        renderer_state.mutex.lockUncancelable(global.io());
+        defer renderer_state.mutex.unlock(global.io());
+
+        var buf: [4096]u8 = undefined;
+        var writer: std.Io.Writer.Allocating = .fromArrayList(alloc, &out);
+        defer out = writer.toArrayList();
+        _ = &buf;
+
+        var formatter: terminal.formatter.TerminalFormatter = .init(
+            renderer_state.terminal,
+            .{ .emit = .vt },
+        );
+        formatter.extra = .all;
+        try formatter.format(&writer.writer);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Snapshot this pane and hand it to its keeper, leaving the shell running.
+///
+/// Called from the app thread as the app goes away, because surface teardown
+/// isn't guaranteed to happen at all on quit — the process can simply exit.
+/// Shells survive that either way, since the keeper holds them, but the
+/// screen would be lost, and a pane that comes back blank behind a live shell
+/// isn't what "as if I never closed it" means.
+///
+/// Only the terminal is shared with the io thread, and that's taken under the
+/// renderer lock.
+pub fn detachForShutdown(self: *Exec, renderer_state: *renderer.State) void {
+    const session = self.subprocess.keeper_session orelse return;
+    if (self.subprocess.keeper_killed) return;
+
+    // Claim the pane so the teardown that may follow doesn't kill what we
+    // just handed over.
+    self.subprocess.keeper_killed = true;
+
+    const snapshot = self.snapshotScreen(renderer_state) catch |err| snap: {
+        log.warn("could not serialize screen for detach err={}", .{err});
+        break :snap &.{};
+    };
+
+    if (!keeperpkg.detach(session, snapshot)) {
+        log.warn("keeper did not confirm the detach; pane keeps running", .{});
+    }
+}
+
 pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     assert(td.backend == .exec);
     const exec = &td.backend.exec;
 
     if (exec.exited) self.subprocess.externalExit();
+
+    // Serialize the screen before stopping, while the terminal still exists
+    // and the read thread is still quiet. The keeper holds onto this so the
+    // next Ghostty can paint the pane back exactly as it was left rather than
+    // reattaching to a live shell behind a blank screen.
+    if (self.subprocess.keeper_session != null and
+        keeperpkg.shutting_down.load(.acquire))
+    {
+        self.subprocess.detach_snapshot = self.snapshotScreen(td.renderer_state) catch |err| snap: {
+            log.warn("could not serialize screen for detach err={}", .{err});
+            break :snap &.{};
+        };
+    }
+
     self.subprocess.stop();
 
     // Quit our read thread after exiting the subprocess so that
@@ -614,6 +706,12 @@ const Subprocess = struct {
     /// Set once we've asked the keeper to kill, so a second stop is a no-op
     /// the way the fork path's `process = null` makes it one.
     keeper_killed: bool = false,
+
+    /// The screen serialized on the way out, handed to the keeper so the next
+    /// Ghostty can paint it back. Captured in `threadExit`, which is the last
+    /// point the terminal still exists; `stop` runs from there and from
+    /// `deinit`, and by the latter it's gone.
+    detach_snapshot: []const u8 = &.{},
 
     /// Keeper inputs, resolved at init.
     keeper_enabled: bool,
@@ -1240,6 +1338,7 @@ const Subprocess = struct {
                         "detaching pane, shell left running shell_pid={}",
                         .{session.shell_pid},
                     );
+                    _ = keeperpkg.detach(session, self.detach_snapshot);
                 } else if (!keeperpkg.kill(self.arena.allocator(), session)) {
                     log.warn("keeper could not confirm the shell exited", .{});
                 }
