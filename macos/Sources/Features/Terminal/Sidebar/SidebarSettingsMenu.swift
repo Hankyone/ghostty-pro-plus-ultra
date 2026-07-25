@@ -4,115 +4,200 @@ import AppKit
 /// The cog at the bottom of the sidebar: the handful of things this fork adds
 /// on top of Ghostty, in the one place you'd look for them.
 ///
-/// Kept deliberately small. Anything that belongs in Ghostty's own config file
-/// stays there; this is only for settings we've added and the couple of
-/// actions that are awkward to reach otherwise.
+/// Built as an AppKit menu rather than SwiftUI's `Menu`. SwiftUI's version is
+/// bridged into a native menu on macOS but only exposes a fraction of what a
+/// menu row can do: no tooltips, no subtitle lines, no say in whether an icon
+/// survives the system's image policy. This menu wants all three, so it drives
+/// `NSMenu` directly.
 struct SidebarSettingsMenu: View {
     @ObservedObject var tabManager: SidebarTabManager
     let theme: SidebarTheme
 
     @State private var isHovered = false
-    @State private var paneKeeper = false
-    @State private var writeFailed = false
-
-    private var appDelegate: AppDelegate? {
-        NSApp.delegate as? AppDelegate
-    }
 
     var body: some View {
-        Menu {
-            Button {
-                tabManager.createNewTab(projectRoot: NSHomeDirectory())
-            } label: {
-                Label("New Terminal in Home", systemImage: "house")
-                    .labelStyle(.titleAndIcon)
-            }
-            .help("Opens a tab in your home folder, ignoring the current tab's directory.")
-
-            Divider()
-
-            // A checkmark rather than a Toggle: menu items bridged into a
-            // native menu render a Toggle as a plain row, with nothing to say
-            // whether it's on.
-            Button {
-                togglePaneKeeper()
-            } label: {
-                Label(
-                    "Keep Terminals Running After Quit",
-                    systemImage: paneKeeper ? "checkmark.circle.fill" : "circle"
-                )
-                .labelStyle(.titleAndIcon)
-            }
-            // The caveats are the part people get bitten by, so they belong
-            // here rather than in a doc nobody opens.
-            .help(paneKeeper
-                ? """
-                On. Quitting leaves your shells running and reopening puts \
-                them back with their output. Closing a tab still ends it, and \
-                shutting down or logging out ends everything. Each terminal \
-                costs one small background process.
-                """
-                : """
-                Off. Quitting ends every shell. Turn this on and they keep \
-                running instead, so reopening restores them exactly as you \
-                left them — including across an app update. Takes effect for \
-                terminals opened from now on.
-                """)
-
-            if writeFailed {
-                Text("Couldn't write your config file — check permissions")
-            }
-
-            Divider()
-
-            Button {
-                appDelegate?.updateController.checkForUpdates()
-            } label: {
-                Label("Check for Updates…", systemImage: "arrow.down.circle")
-                    .labelStyle(.titleAndIcon)
-            }
-            .help("Asks now instead of waiting for the automatic check.")
-        } label: {
-            ZStack {
-                Color.clear
-                Image(systemName: "gearshape")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(
-                        isHovered ? theme.foreground : theme.foreground.opacity(0.6)
-                    )
-            }
+        SettingsMenuButton(tabManager: tabManager)
             .frame(width: 22, height: 22)
-        }
-        // Not `.borderlessButton`: that style drops the artwork on every item
-        // in the menu it presents.
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("Ghostty Pro Plus Ultra settings")
-        .onHover { isHovered = $0 }
-        .onAppear { refresh() }
+            .opacity(isHovered ? 1 : 0.75)
+            .onHover { isHovered = $0 }
+            .help("Ghostty Pro Plus Ultra settings")
+    }
+}
+
+/// The cog button and its menu.
+private struct SettingsMenuButton: NSViewRepresentable {
+    let tabManager: SidebarTabManager
+
+    func makeNSView(context: Context) -> NSButton {
+        let button = NSButton()
+        button.bezelStyle = .inline
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.image = NSImage(
+            systemSymbolName: "gearshape",
+            accessibilityDescription: "Settings"
+        )?.withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
+        button.contentTintColor = .secondaryLabelColor
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.showMenu(_:))
+        return button
     }
 
-    private func refresh() {
-        paneKeeper = appDelegate?.ghostty.config.paneKeeper ?? false
+    func updateNSView(_ nsView: NSButton, context: Context) {
+        context.coordinator.tabManager = tabManager
     }
 
-    /// Flip the setting in the user's config file, then reload so it takes
-    /// effect without a restart.
-    ///
-    /// Existing panes keep whatever they started as — a running shell can't be
-    /// moved under a keeper after the fact — so this applies to panes opened
-    /// from here on, and fully after the next restart.
-    private func togglePaneKeeper() {
-        let next = !paneKeeper
-        guard ForkSettings.write(key: "pane-keeper", value: next ? "true" : "false") else {
-            writeFailed = true
-            return
+    func makeCoordinator() -> Coordinator {
+        Coordinator(tabManager: tabManager)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var tabManager: SidebarTabManager
+
+        init(tabManager: SidebarTabManager) {
+            self.tabManager = tabManager
         }
 
-        writeFailed = false
-        paneKeeper = next
-        appDelegate?.ghostty.reloadConfig()
+        private var appDelegate: AppDelegate? {
+            NSApp.delegate as? AppDelegate
+        }
+
+        private var persistentTerminals: Bool {
+            appDelegate?.ghostty.config.paneKeeper ?? false
+        }
+
+        @objc func showMenu(_ sender: NSButton) {
+            let menu = NSMenu()
+            menu.autoenablesItems = false
+            // No checkmark gutter. With only one item that carries state,
+            // the column costs every row an indent to say nothing; the
+            // toggle shows a checkmark in its own icon slot instead.
+            menu.showsStateColumn = false
+
+            add(
+                to: menu,
+                title: "New Terminal in Home",
+                symbol: "house",
+                tooltip: "Opens a tab in your home folder, ignoring the current tab's directory.",
+                action: #selector(newHomeTerminal)
+            )
+
+            menu.addItem(.separator())
+
+            let on = persistentTerminals
+            let toggle = add(
+                to: menu,
+                title: "Persistent Terminals",
+                // Same circle in both states, filled with a checkmark when
+                // on. Two glyphs that share a shape read as one switch; two
+                // unrelated glyphs just read as two different things.
+                symbol: on ? "checkmark.circle.fill" : "circle",
+                tooltip: on
+                    ? """
+                    On. Quitting leaves your terminals running and reopening puts them \
+                    back with their output, including across an app update.
+
+                    Closing a tab still ends it. Shutting down or logging out ends \
+                    everything. Terminals already open are unaffected. Costs one small \
+                    background process per terminal.
+                    """
+                    : """
+                    Off. Quitting ends every terminal.
+
+                    Turn this on and they keep running instead, so reopening Ghostty \
+                    restores them exactly as you left them — same processes, same \
+                    output on screen — including across an app update.
+
+                    Applies to terminals opened from now on.
+                    """,
+                action: #selector(togglePersistentTerminals)
+            )
+            // Subtitles arrived in 14.4 and the deployment target is older;
+            // without one the tooltip still carries the detail.
+            if #available(macOS 14.4, *) {
+                toggle.subtitle = "Survive quitting and reopening"
+            }
+
+            menu.addItem(.separator())
+
+            add(
+                to: menu,
+                title: "Check for Updates…",
+                symbol: "arrow.down.circle",
+                tooltip: "Asks now instead of waiting for the automatic check.",
+                action: #selector(checkForUpdates)
+            )
+
+            // Below the cog, so the menu doesn't cover the sidebar.
+            menu.popUp(
+                positioning: nil,
+                at: NSPoint(x: 0, y: sender.bounds.height + 4),
+                in: sender
+            )
+        }
+
+        @discardableResult
+        private func add(
+            to menu: NSMenu,
+            title: String,
+            symbol: String,
+            tooltip: String,
+            action: Selector
+        ) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.toolTip = tooltip
+            item.image = NSImage(
+                systemSymbolName: symbol,
+                accessibilityDescription: nil
+            )
+            // macOS 27 hides symbol images in menus unless the item asks for
+            // them. Ours identify the three actions at a glance, so they stay.
+            if #available(macOS 27.0, *) {
+                item.preferredImageVisibility = .visible
+            }
+            menu.addItem(item)
+            return item
+        }
+
+        // MARK: - Actions
+
+        @objc private func newHomeTerminal() {
+            tabManager.createNewTab(projectRoot: NSHomeDirectory())
+        }
+
+        @objc private func checkForUpdates() {
+            appDelegate?.updateController.checkForUpdates()
+        }
+
+        /// Flip the setting in the user's config file, then reload so it takes
+        /// effect without a restart.
+        ///
+        /// Terminals already open keep whatever they started as — a running
+        /// shell can't be moved under a keeper after the fact — so this
+        /// applies to ones opened from here on.
+        @objc private func togglePersistentTerminals() {
+            let next = !persistentTerminals
+            guard ForkSettings.write(
+                key: "pane-keeper",
+                value: next ? "true" : "false"
+            ) else {
+                let alert = NSAlert()
+                alert.messageText = "Couldn't save that setting"
+                alert.informativeText = """
+                Your Ghostty config file couldn't be written:
+
+                \(ForkSettings.configPath)
+
+                Check its permissions, or set `pane-keeper` there by hand.
+                """
+                alert.alertStyle = .warning
+                alert.runModal()
+                return
+            }
+
+            appDelegate?.ghostty.reloadConfig()
+        }
     }
 }
