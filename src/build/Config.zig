@@ -138,11 +138,15 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
 
     //---------------------------------------------------------------
     // Target-specific properties
+    // This fork is Apple Silicon only, so the xcframework is native by
+    // default. Building the universal one meant compiling the whole core
+    // twice and lipo'ing it, for a slice nothing here can run. Pass
+    // `-Dxcframework-target=universal` if you ever need Intel back.
     config.xcframework_target = b.option(
         XCFrameworkTarget,
         "xcframework-target",
         "The target for the xcframework.",
-    ) orelse .universal;
+    ) orelse .native;
 
     //---------------------------------------------------------------
     // Comptime Interfaces
