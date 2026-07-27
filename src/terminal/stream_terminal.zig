@@ -4,6 +4,7 @@ const testing = std.testing;
 const apc = @import("apc.zig");
 const clipboard = @import("clipboard.zig");
 const csi = @import("csi.zig");
+const dcs = @import("dcs.zig");
 const device_attributes = @import("device_attributes.zig");
 const device_status = @import("device_status.zig");
 const stream = @import("stream.zig");
@@ -59,6 +60,9 @@ pub const Handler = struct {
     /// to send commands to the terminal emulator. This is used by
     /// the kitty graphics protocol.
     apc_handler: apc.Handler = .{},
+
+    /// The DCS command handler maintains state for DCS queries.
+    dcs_handler: dcs.Handler = .{},
 
     pub const Effects = struct {
         /// Called when the terminal needs to write data back to the pty,
@@ -145,6 +149,7 @@ pub const Handler = struct {
 
     pub fn deinit(self: *Handler) void {
         self.apc_handler.deinit();
+        self.dcs_handler.deinit();
     }
 
     /// Resize the terminal and apply any side effects (if supported)
@@ -327,12 +332,9 @@ pub const Handler = struct {
                 log.warn("error handling clipboard write err={}", .{err});
             },
 
-            // No supported DCS commands have any terminal-modifying effects,
-            // but they may in the future. For now we just ignore it.
-            .dcs_hook,
-            .dcs_put,
-            .dcs_unhook,
-            => {},
+            .dcs_hook => try self.dcsHook(value),
+            .dcs_put => try self.dcsPut(value),
+            .dcs_unhook => try self.dcsUnhook(),
 
             // Have no terminal-modifying effect
             .show_desktop_notification,
@@ -346,6 +348,47 @@ pub const Handler = struct {
     inline fn writePty(self: *Handler, data: [:0]const u8) void {
         const func = self.effects.write_pty orelse return;
         func(self, data);
+    }
+
+    fn dcsHook(self: *Handler, value: Action.Value(.dcs_hook)) !void {
+        var cmd = self.dcs_handler.hook(
+            self.terminal.gpa(),
+            value,
+        ) orelse return;
+        defer cmd.deinit();
+        try self.dcsCommand(&cmd);
+    }
+
+    fn dcsPut(self: *Handler, value: u8) !void {
+        var cmd = self.dcs_handler.put(value) orelse return;
+        defer cmd.deinit();
+        try self.dcsCommand(&cmd);
+    }
+
+    fn dcsUnhook(self: *Handler) !void {
+        var cmd = self.dcs_handler.unhook() orelse return;
+        defer cmd.deinit();
+        try self.dcsCommand(&cmd);
+    }
+
+    fn dcsCommand(self: *Handler, cmd: *dcs.Command) !void {
+        switch (cmd.*) {
+            .decrqss => |request| {
+                var response: [
+                    dcs.Command.DECRQSS.max_response_bytes + 1
+                ]u8 = undefined;
+                const encoded = try request.encode(
+                    self.terminal,
+                    response[0 .. response.len - 1],
+                );
+                response[encoded.len] = 0;
+                self.writePty(response[0..encoded.len :0]);
+            },
+
+            .tmux,
+            .xtgettcap,
+            => {},
+        }
     }
 
     fn bell(self: *Handler) void {
@@ -1312,6 +1355,94 @@ test "attributes" {
     const str = try t.plainString(testing.allocator);
     defer testing.allocator.free(str);
     try testing.expectEqualStrings("Bold", str);
+}
+
+test "DECRQSS responses" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [dcs.Command.DECRQSS.max_response_bytes]u8 = undefined;
+        var response_len: usize = 0;
+        var calls: usize = 0;
+
+        fn reset() void {
+            response_len = 0;
+            calls = 0;
+        }
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(response[0..data.len], data);
+            response_len = data.len;
+            calls += 1;
+        }
+
+        fn expectResponse(expected: []const u8) !void {
+            try testing.expectEqual(@as(usize, 1), calls);
+            try testing.expectEqualStrings(
+                expected,
+                response[0..response_len],
+            );
+            reset();
+        }
+    };
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // SGR
+    s.nextSlice("\x1B[1m\x1BP$qm\x1B\\");
+    try S.expectResponse("\x1BP1$r0;1m\x1B\\");
+
+    // Requests larger than the parser's fixed request buffer are ignored,
+    // and the next DCS command must still be processed normally.
+    s.nextSlice("\x1BP$qfoo\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.calls);
+    try testing.expect(!s.handler.semantic_failure);
+    s.nextSlice("\x1BP$qm\x1B\\");
+    try S.expectResponse("\x1BP1$r0;1m\x1B\\");
+}
+
+test "DECRQSS without write effect is ignored" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+    defer s.deinit();
+
+    s.nextSlice("\x1BP$qm\x1B\\");
+    try testing.expect(!s.handler.semantic_failure);
+}
+
+test "DCS command memory is released" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .initAlloc(testing.allocator, .init(&t));
+
+    // A completed, unsupported command transfers its allocation to Command;
+    // dcsCommand must release it even though stream_terminal ignores it.
+    s.nextSlice("\x1BP+q536D756C78\x1B\\");
+
+    // An incomplete command remains owned by the handler and must be released
+    // when the stream is deinitialized. testing.allocator detects either leak.
+    s.nextSlice("\x1BP+q536D756C78");
+    s.deinit();
 }
 
 test "DECALN screen alignment" {

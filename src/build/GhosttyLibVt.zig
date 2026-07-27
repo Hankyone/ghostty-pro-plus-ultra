@@ -247,6 +247,19 @@ fn initLib(
         // Zig's ubsan emits /exclude-symbols linker directives that
         // are incompatible with the MSVC linker (LNK4229).
         lib.bundle_ubsan_rt = false;
+
+        if (kind == .static) {
+            if (target.result.abi == .msvc) {
+                // Zig's compiler runtime doesn't provide MSVC's security
+                // cookie symbols when libc is linked. Disable stack-protector
+                // generation so static consumers don't need BufferOverflowU.
+                lib.root_module.stack_protector = false;
+            }
+
+            // The Zig standard library uses NT and kernel32 symbols.
+            lib.root_module.linkSystemLibrary("ntdll", .{});
+            lib.root_module.linkSystemLibrary("kernel32", .{});
+        }
     }
 
     if (lib.rootModuleTarget().abi.isAndroid()) {

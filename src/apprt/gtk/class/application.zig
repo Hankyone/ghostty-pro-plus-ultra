@@ -1471,6 +1471,14 @@ pub const Application = extern struct {
             self,
             .{},
         );
+
+        _ = GlobalShortcuts.signals.@"bind-failed".connect(
+            priv.global_shortcuts,
+            *Application,
+            globalShortcutBindFailed,
+            self,
+            .{},
+        );
     }
 
     fn activate(self: *Self) callconv(.c) void {
@@ -1677,6 +1685,41 @@ pub const Application = extern struct {
         self.core().performAllAction(self.rt(), action.*) catch |err| {
             log.warn("failed to perform action={}", .{err});
         };
+    }
+
+    /// May fire before any window exists, hence a desktop notification
+    /// rather than a toast.
+    fn globalShortcutBindFailed(
+        _: *GlobalShortcuts,
+        failure: *const GlobalShortcuts.BindFailed,
+        self: *Self,
+    ) callconv(.c) void {
+        var label_buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&label_buf);
+        const label: []const u8 = label: {
+            const ok = key.labelFromTrigger(&writer, failure.trigger) catch false;
+            break :label if (ok) writer.buffered() else "?";
+        };
+
+        const detail: [*:0]const u8 = detail: {
+            if (failure.message[0] != 0) break :detail failure.message;
+            break :detail if (failure.revoked)
+                i18n._("The keybind was revoked by the system.")
+            else
+                i18n._("The keybind was denied by the system.");
+        };
+
+        var body_buf: [512]u8 = undefined;
+        const body = std.fmt.bufPrintZ(
+            &body_buf,
+            "{s}: {s}",
+            .{ label, detail },
+        ) catch return;
+
+        Action.desktopNotification(self, .app, .{
+            .title = std.mem.span(i18n._("Global keybind unavailable")),
+            .body = body,
+        });
     }
 
     fn actionReloadConfig(

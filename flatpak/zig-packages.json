@@ -73,9 +73,9 @@
   },
   {
     "type": "archive",
-    "url": "https://deps.files.ghostty.org/ghostty-themes-release-20260713-155359-c3968b3.tgz",
-    "dest": "vendor/p/N-V-__8AALZGBAAS5NLVH-c8eC-6VtCdcH-9nUvVfUSkWS__",
-    "sha256": "14b3044bef67a3cb83523973bd16d3aa0fb0096ddd1e0ecba3916d14d6d67f20"
+    "url": "https://deps.files.ghostty.org/ghostty-themes-release-20260720-153658-97e244c.tgz",
+    "dest": "vendor/p/N-V-__8AAGxKBAAjYkT1jYUiOZDXQuj0u34ndIjAWxiR1KX9",
+    "sha256": "7329d0e2e958ee8404e516a6550bd07334edc611334a73f84d50477daa459f0c"
   },
   {
     "type": "archive",
@@ -139,9 +139,9 @@
   },
   {
     "type": "archive",
-    "url": "https://deps.files.ghostty.org/translate_c-a916baf225a3cfc93a982225462db612604ae290.tar.gz",
-    "dest": "vendor/p/translate_c-0.0.0-Q_BUWj8_BwCr4na219OimiKKj4IVSq0aKtMXCQmIk4AB",
-    "sha256": "4fd2a2b21dbc49c22bea6854a59a7568dc77183760531ace3cf8da1267696afd"
+    "url": "https://codeberg.org/vancluever/translate-c/archive/80f8b6e4f45a303268717d8e5f4f91d7837138bb.tar.gz",
+    "dest": "vendor/p/translate_c-0.0.0-Q_BUWmU6BwB_9JKG2l2W7i_mhmYWeRseTGBEHi_YlV5f",
+    "sha256": "38c9e59d58f36e3481f6fa38f11fe59c63c12492fccf399ca56f3dfcce17b53e"
   },
   {
     "type": "archive",

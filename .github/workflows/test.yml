@@ -742,6 +742,10 @@ jobs:
       - name: Build libghostty-vt
         run: zig build -Demit-lib-vt
 
+      - name: Test static linking
+        working-directory: example/c-vt-static
+        run: zig build
+
   build-libghostty-windows-gnu:
     runs-on: namespace-profile-ghostty-windows
     timeout-minutes: 45

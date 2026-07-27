@@ -206,11 +206,11 @@ in
       };
     }
     {
-      name = "N-V-__8AALZGBAAS5NLVH-c8eC-6VtCdcH-9nUvVfUSkWS__";
+      name = "N-V-__8AAGxKBAAjYkT1jYUiOZDXQuj0u34ndIjAWxiR1KX9";
       path = fetchZigArtifact {
         name = "iterm2_themes";
-        url = "https://deps.files.ghostty.org/ghostty-themes-release-20260713-155359-c3968b3.tgz";
-        hash = "sha256-FLMES+9no8uDUjlzvRbTqg+wCW3dHg7Lo5FtFNbWfyA=";
+        url = "https://deps.files.ghostty.org/ghostty-themes-release-20260720-153658-97e244c.tgz";
+        hash = "sha256-cynQ4ulY7oQE5RamVQvQczTtxhEzSnP4TVBHfapFnww=";
         unpack = false;
       };
     }
@@ -305,11 +305,11 @@ in
       };
     }
     {
-      name = "translate_c-0.0.0-Q_BUWj8_BwCr4na219OimiKKj4IVSq0aKtMXCQmIk4AB";
+      name = "translate_c-0.0.0-Q_BUWmU6BwB_9JKG2l2W7i_mhmYWeRseTGBEHi_YlV5f";
       path = fetchZigArtifact {
         name = "translate_c";
-        url = "https://deps.files.ghostty.org/translate_c-a916baf225a3cfc93a982225462db612604ae290.tar.gz";
-        hash = "sha256-i7TSSiLU9YGtLtEjgVqy2jSnKLDTeKHX+EFuXEMXJ+U=";
+        url = "https://codeberg.org/vancluever/translate-c/archive/80f8b6e4f45a303268717d8e5f4f91d7837138bb.tar.gz";
+        hash = "sha256-fB7OsZ2PIijMzVMYg8SzDBtTKX7IZHbEvPuBTdyGtWk=";
         unpack = true;
       };
     }

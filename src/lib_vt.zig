@@ -141,10 +141,25 @@ pub const unicode = struct {
     pub const graphemeWidth = unicode_pkg.graphemeWidth;
 };
 
+/// Used for MSVC builds (see below)
+var msvc_fltused: c_int = 1;
+
 comptime {
     // If we're building the C library (vs. the Zig module) then
     // we want to reference the C API so that it gets exported.
     if (@import("root") == lib) {
+        // MSVC requires this marker whenever floating-point code is present.
+        // Zig's compiler_rt only provides it when libc is not linked.
+        if (builtin.os.tag == .windows and
+            builtin.abi == .msvc and
+            builtin.link_mode == .static)
+        {
+            @export(
+                &msvc_fltused,
+                .{ .name = "_fltused" },
+            );
+        }
+
         // Force-reference our memset override so its export is
         // emitted. This must stay inside the root guard so that
         // downstream Zig module consumers don't get the override
