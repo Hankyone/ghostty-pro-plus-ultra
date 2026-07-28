@@ -1427,7 +1427,7 @@ test "incremental updates match full rebuild" {
     var t = try Terminal.init(io, alloc, .{
         .cols = 20,
         .rows = 8,
-        .max_scrollback = 500,
+        .max_scrollback_bytes = 500,
     });
     defer t.deinit(alloc);
 
@@ -2010,7 +2010,7 @@ test "linkCells with scrollback spanning pages" {
     var t = try Terminal.init(io, alloc, .{
         .cols = page.std_capacity.cols,
         .rows = viewport_rows,
-        .max_scrollback = 10_000,
+        .max_scrollback_bytes = 10_000,
     });
     defer t.deinit(alloc);
 

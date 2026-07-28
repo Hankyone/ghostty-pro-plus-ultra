@@ -41,6 +41,7 @@ const ClipboardCodepointMap = @import("ClipboardCodepointMap.zig");
 const KeyRemapSet = @import("../input/key_mods.zig").RemapSet;
 pub const WindowPaddingBalance = @import("../renderer/size.zig").PaddingBalance;
 const string = @import("string.zig");
+const Limit = @import("limit.zig").Limit;
 
 // We do this instead of importing all of terminal/main.zig to
 // limit the dependency graph. This is important because some things
@@ -95,6 +96,10 @@ pub const compatibility = std.StaticStringMap(
     // Ghostty 1.3 rename the "window" option to "new-window".
     // See: https://github.com/ghostty-org/ghostty/pull/9764
     .{ "macos-dock-drop-behavior", compatMacOSDockDropBehavior },
+
+    // Ghostty 1.4 renamed `scrollback-limit` to `scrollback-limit-bytes`
+    // when `scrollback-limit-lines` was added so the units are explicit.
+    .{ "scrollback-limit", cli.compatibilityRenamed(Config, "scrollback-limit-bytes") },
 });
 
 /// Set Ghostty's graphical user interface language to a language other than the
@@ -1390,11 +1395,32 @@ input: RepeatableReadableIO = .{},
 ///
 /// This size is per terminal surface, not for the entire application.
 ///
-/// It is not currently possible to set an unlimited scrollback buffer.
-/// This is a future planned feature.
+/// A separate maximum can be set with `scrollback-limit-lines`; if both limits
+/// are set, then the first one reached will determine when scrollback is
+/// removed.
+///
+/// The default is 50 MB. Set this to `unlimited` to remove the byte limit.
 ///
 /// This can be changed at runtime but will only affect new terminal surfaces.
-@"scrollback-limit": usize = 50_000_000, // 50MB
+@"scrollback-limit-bytes": Limit(usize, 50_000_000) = .default,
+
+/// The maximum number of lines of scrollback to retain. This excludes
+/// the active screen. Soft-wrapped lines count as multiple lines.
+///
+/// This limit is an estimate. Internally, Ghostty will only trim lines
+/// up to the minimum allocation unit that is used internally (called a
+/// "page"). The size of a page depends on how many styles, graphemes, etc.
+/// take up the screen. In practice, this can be anywhere from a handful to
+/// a couple hundred lines. Importantly, memory is capped either way.
+/// This means that the actual limited lines will likely be slightly
+/// higher in practice.
+///
+/// The default is `unlimited`. A separate maximum can be set with
+/// `scrollback-limit-bytes`; if both limits are set, then the first one reached
+/// will determine when scrollback is removed.
+///
+/// This can be changed at runtime but will only affect new terminal surfaces.
+@"scrollback-limit-lines": Limit(usize, std.math.maxInt(usize)) = .default,
 
 /// Whether to compress scrollback pages while the terminal is idle.
 ///
@@ -10854,6 +10880,94 @@ test "theme specifying light/dark sets theme usage in conditional state" {
         try testing.expect(cfg.@"window-theme" == .system);
         try testing.expect(cfg._conditional_set.contains(.theme));
     }
+}
+
+test "scrollback limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try testing.expectEqual(
+        @as(usize, 50_000_000),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-lines".value,
+    );
+
+    var it: TestIterator = .{ .data = &.{
+        "--scrollback-limit-bytes=1234",
+        "--scrollback-limit-lines=567",
+    } };
+    try cfg.loadIter(alloc, &it);
+
+    try testing.expectEqual(
+        @as(usize, 1234),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+    try testing.expectEqual(
+        @as(usize, 567),
+        cfg.@"scrollback-limit-lines".value,
+    );
+
+    var unlimited_it: TestIterator = .{ .data = &.{
+        "--scrollback-limit-bytes=unlimited",
+        "--scrollback-limit-lines=unlimited",
+    } };
+    try cfg.loadIter(alloc, &unlimited_it);
+
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-lines".value,
+    );
+
+    var reset_it: TestIterator = .{ .data = &.{
+        "--scrollback-limit-bytes=",
+        "--scrollback-limit-lines=",
+    } };
+    try cfg.loadIter(alloc, &reset_it);
+
+    try testing.expectEqual(
+        @as(usize, 50_000_000),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-lines".value,
+    );
+}
+
+test "compatibility: scrollback-limit renamed to bytes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    var it: TestIterator = .{ .data = &.{
+        "--scrollback-limit=1234",
+    } };
+    try cfg.loadIter(alloc, &it);
+
+    try testing.expectEqual(
+        @as(usize, 1234),
+        cfg.@"scrollback-limit-bytes".value,
+    );
+
+    var unlimited_it: TestIterator = .{ .data = &.{
+        "--scrollback-limit=unlimited",
+    } };
+    try cfg.loadIter(alloc, &unlimited_it);
+
+    try testing.expectEqual(
+        std.math.maxInt(usize),
+        cfg.@"scrollback-limit-bytes".value,
+    );
 }
 
 test "compatibility: gtk-single-instance desktop" {
