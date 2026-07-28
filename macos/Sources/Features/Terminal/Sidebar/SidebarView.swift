@@ -123,7 +123,7 @@ struct SidebarView: View {
     @ObservedObject private var dragState = SidebarDragState.shared
     @State private var hoveredTabID: ObjectIdentifier?
     @State private var hoveredGroupID: String?
-    @State private var tabCardFrames: [ObjectIdentifier: CGRect] = [:]
+    @State private var tabCardFrames = SidebarCardFrames()
     fileprivate static let scrollCoordinateSpace = "SidebarScrollCoordinateSpace"
 
     private var isDragActive: Bool {
@@ -153,7 +153,6 @@ struct SidebarView: View {
                         dragGeneration: $dragState.dragGeneration,
                         hoveredTabID: $hoveredTabID,
                         hoveredGroupID: $hoveredGroupID,
-                        tabCardFrames: $tabCardFrames,
                         isCollapsed: tabManager.collapsedProjects.contains(group.id)
                     )
                     .opacity(dragState.draggingGroupID == group.id ? 0.4 : 1.0)
@@ -217,7 +216,13 @@ struct SidebarView: View {
                 }
             }
         }
-        .onPreferenceChange(SidebarCardFramePreferenceKey.self) { tabCardFrames = $0 }
+        // Written into a box rather than SwiftUI state on purpose. Row frames
+        // change on every frame of a collapse or scroll, and publishing them
+        // re-evaluated the whole sidebar each time — which is what made
+        // collapsing feel heavy regardless of how many tabs were in the group.
+        // Nothing draws from these; the click overlay reads them when a click
+        // actually arrives.
+        .onPreferenceChange(SidebarCardFramePreferenceKey.self) { tabCardFrames.value = $0 }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.clear)
         .safeAreaInset(edge: .bottom) {
@@ -240,11 +245,16 @@ struct SidebarView: View {
             }
         }
         .overlay(SidebarClickOverlay(
-            tabCardFrames: tabCardFrames,
+            frames: tabCardFrames,
             onBlankSpaceDoubleClick: { tabManager.createNewTab(projectRoot: NSHomeDirectory()) },
             onTabDoubleClick: { tabID in
                 if let tab = tabManager.tabs.first(where: { $0.id == tabID }) {
                     tabManager.promptRenameTab(tab)
+                }
+            },
+            onTabMiddleClick: { tabID in
+                if let tab = tabManager.tabs.first(where: { $0.id == tabID }) {
+                    tabManager.closeTab(tab)
                 }
             }
         ))
@@ -255,6 +265,11 @@ struct SidebarView: View {
 
 /// A collapsible section for a project group with T3 Code-style vertical line indicator.
 private struct ProjectSection: View {
+    /// Shared by the section and its chevron so the header and the rows move
+    /// on one clock. Short on purpose — a disclosure is an acknowledgement,
+    /// not a scene change, and anything longer starts to read as hesitation.
+    static let collapseAnimation: Animation = .easeOut(duration: 0.13)
+
     let group: SidebarTabManager.ProjectGroup
     @ObservedObject var tabManager: SidebarTabManager
     let theme: SidebarTheme
@@ -266,7 +281,6 @@ private struct ProjectSection: View {
     @Binding var dragGeneration: Int
     @Binding var hoveredTabID: ObjectIdentifier?
     @Binding var hoveredGroupID: String?
-    @Binding var tabCardFrames: [ObjectIdentifier: CGRect]
     let isCollapsed: Bool
 
     /// Creates a drag item provider that resets all drag state when the
@@ -296,7 +310,10 @@ private struct ProjectSection: View {
         VStack(alignment: .leading, spacing: 0) {
             // Project header
             Button {
-                withAnimation(.easeOut(duration: 0.18)) {
+                // One animation for the whole change, driven from here so the
+                // groups below this one move in step with it rather than
+                // snapping into their new positions.
+                withAnimation(Self.collapseAnimation) {
                     tabManager.toggleProjectCollapsed(group.id)
                 }
             } label: {
@@ -386,19 +403,15 @@ private struct ProjectSection: View {
                         .frame(width: 1)
                 }
                 .padding(.leading, 4)
-                .transition(
-                    .asymmetric(
-                        insertion: .opacity.combined(with: .move(edge: .top)),
-                        // Removal (collapse): fade only, no upward slide.
-                        // The slide causes content to overflow above the
-                        // project header and past the sidebar's top edge.
-                        removal: .opacity
-                    )
-                )
+                // Fade only, both directions. The section's height is already
+                // animating; sliding the rows at the same time is a second
+                // motion competing with the first, which is what made opening
+                // feel heavier than closing. Sliding on the way out also
+                // overflowed the rows past the top of the sidebar.
+                .transition(.opacity)
             }
         }
         .padding(.bottom, 2)
-        .animation(.easeOut(duration: 0.18), value: isCollapsed)
     }
 
 }
@@ -525,9 +538,6 @@ private struct ThreadRow: View {
                 )
             }
         }
-        .overlay(MiddleClickOverlay {
-            tabManager.closeTab(tab)
-        })
         .contentShape(.dragPreview, RoundedRectangle(cornerRadius: 6))
         .onDrag {
             draggingGroupID = nil
@@ -634,7 +644,7 @@ private struct ProjectHeader: View {
                 .font(.system(size: 14, weight: .medium))
                 .foregroundColor(theme.secondaryText.opacity(0.7))
                 .rotationEffect(.degrees(isCollapsed ? 0 : 90))
-                .animation(.easeInOut(duration: 0.15), value: isCollapsed)
+                .animation(ProjectSection.collapseAnimation, value: isCollapsed)
                 .frame(width: 14, height: 14)
 
             // Favicon or folder icon
@@ -1163,43 +1173,14 @@ private extension View {
 // MARK: - MiddleClickOverlay
 
 /// Transparent NSView overlay that captures middle-click (button 2) events.
-private struct MiddleClickOverlay: NSViewRepresentable {
-    var action: () -> Void
-
-    func makeNSView(context: Context) -> MiddleClickView {
-        MiddleClickView(action: action)
-    }
-
-    func updateNSView(_ nsView: MiddleClickView, context: Context) {
-        nsView.action = action
-    }
-
-    class MiddleClickView: NSView {
-        var action: () -> Void
-
-        init(action: @escaping () -> Void) {
-            self.action = action
-            super.init(frame: .zero)
-        }
-
-        required init?(coder: NSCoder) { fatalError() }
-
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            if let event = NSApp.currentEvent,
-               event.type == .otherMouseDown || event.type == .otherMouseUp {
-                return super.hitTest(point)
-            }
-            return nil
-        }
-
-        override func otherMouseUp(with event: NSEvent) {
-            if event.buttonNumber == 2 {
-                action()
-            } else {
-                super.otherMouseUp(with: event)
-            }
-        }
-    }
+/// Where each tab row currently sits, for hit-testing clicks.
+///
+/// Deliberately a reference type held outside SwiftUI's dependency graph:
+/// these change continuously while the sidebar animates, and nothing on
+/// screen is drawn from them, so a view has no business being invalidated
+/// when they move. Main thread only, like everything else in the sidebar.
+private final class SidebarCardFrames: @unchecked Sendable {
+    var value: [ObjectIdentifier: CGRect] = [:]
 }
 
 private struct SidebarCardFramePreferenceKey: PreferenceKey {
@@ -1212,33 +1193,44 @@ private struct SidebarCardFramePreferenceKey: PreferenceKey {
 
 // MARK: - SidebarClickOverlay
 
-/// Transparent NSView overlay that recognizes double-click actions without
-/// taking pointer events away from SwiftUI. Single-click selection stays on
-/// the row's mouse-up tap so pressing a nonselected row can become a drag
-/// without replacing its hosting window in the middle of the gesture.
+/// Transparent NSView overlay that recognizes double-click and middle-click
+/// actions without taking pointer events away from SwiftUI. Single-click
+/// selection stays on the row's mouse-up tap so pressing a nonselected row can
+/// become a drag without replacing its hosting window mid-gesture.
+///
+/// One overlay for the whole sidebar, not one per row. Every AppKit view
+/// embedded in SwiftUI has to be repositioned individually on each frame of an
+/// animation, so a per-row view multiplies that cost by the number of rows —
+/// which is precisely what made collapsing a group drag down everything below
+/// it. This view already knows where each row sits, so it can answer for all
+/// of them.
 private struct SidebarClickOverlay: NSViewRepresentable {
-    var tabCardFrames: [ObjectIdentifier: CGRect]
+    var frames: SidebarCardFrames
     var onBlankSpaceDoubleClick: () -> Void
     var onTabDoubleClick: (ObjectIdentifier) -> Void
+    var onTabMiddleClick: (ObjectIdentifier) -> Void
 
     func makeNSView(context: Context) -> ClickView {
         ClickView(
-            tabCardFrames: tabCardFrames,
+            frames: frames,
             onBlankSpaceDoubleClick: onBlankSpaceDoubleClick,
-            onTabDoubleClick: onTabDoubleClick
+            onTabDoubleClick: onTabDoubleClick,
+            onTabMiddleClick: onTabMiddleClick
         )
     }
 
     func updateNSView(_ nsView: ClickView, context: Context) {
-        nsView.tabCardFrames = tabCardFrames
+        nsView.frames = frames
         nsView.onBlankSpaceDoubleClick = onBlankSpaceDoubleClick
         nsView.onTabDoubleClick = onTabDoubleClick
+        nsView.onTabMiddleClick = onTabMiddleClick
     }
 
     class ClickView: NSView {
-        var tabCardFrames: [ObjectIdentifier: CGRect]
+        var frames: SidebarCardFrames
         var onBlankSpaceDoubleClick: () -> Void
         var onTabDoubleClick: (ObjectIdentifier) -> Void
+        var onTabMiddleClick: (ObjectIdentifier) -> Void
         private var eventMonitor: Any?
         /// Timestamp of the last handled double-click, used to debounce
         /// duplicate events that can arrive when multiple sidebar hosting
@@ -1247,13 +1239,15 @@ private struct SidebarClickOverlay: NSViewRepresentable {
         private var lastHandledClickTime: TimeInterval = 0
 
         init(
-            tabCardFrames: [ObjectIdentifier: CGRect],
+            frames: SidebarCardFrames,
             onBlankSpaceDoubleClick: @escaping () -> Void,
-            onTabDoubleClick: @escaping (ObjectIdentifier) -> Void
+            onTabDoubleClick: @escaping (ObjectIdentifier) -> Void,
+            onTabMiddleClick: @escaping (ObjectIdentifier) -> Void
         ) {
-            self.tabCardFrames = tabCardFrames
+            self.frames = frames
             self.onBlankSpaceDoubleClick = onBlankSpaceDoubleClick
             self.onTabDoubleClick = onTabDoubleClick
+            self.onTabMiddleClick = onTabMiddleClick
             super.init(frame: .zero)
         }
 
@@ -1264,8 +1258,14 @@ private struct SidebarClickOverlay: NSViewRepresentable {
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             if window != nil && eventMonitor == nil {
-                eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
-                    self?.handleMouseDown(event)
+                eventMonitor = NSEvent.addLocalMonitorForEvents(
+                    matching: [.leftMouseDown, .otherMouseUp]
+                ) { [weak self] event in
+                    if event.type == .otherMouseUp {
+                        self?.handleMiddleMouseUp(event)
+                    } else {
+                        self?.handleMouseDown(event)
+                    }
                     return event
                 }
             } else if window == nil, let monitor = eventMonitor {
@@ -1282,7 +1282,7 @@ private struct SidebarClickOverlay: NSViewRepresentable {
             let locationInView = convert(event.locationInWindow, from: nil)
             guard bounds.contains(locationInView) else { return }
 
-            let hitTab = tabCardFrames.first(where: { $0.value.contains(locationInView) })?.key
+            let hitTab = frames.value.first(where: { $0.value.contains(locationInView) })?.key
 
             guard event.clickCount == 2 else { return }
             // Debounce: ignore double-clicks within 400ms of a previously
@@ -1298,6 +1298,23 @@ private struct SidebarClickOverlay: NSViewRepresentable {
             } else {
                 onBlankSpaceDoubleClick()
             }
+        }
+
+        /// Middle-click closes the row under the pointer. Blank space is
+        /// ignored — there's nothing there to close.
+        private func handleMiddleMouseUp(_ event: NSEvent) {
+            guard event.buttonNumber == 2,
+                  let myWindow = self.window,
+                  myWindow.isKeyWindow,
+                  event.window === myWindow else { return }
+
+            let locationInView = convert(event.locationInWindow, from: nil)
+            guard bounds.contains(locationInView) else { return }
+
+            guard let hitTab = frames.value.first(
+                where: { $0.value.contains(locationInView) }
+            )?.key else { return }
+            onTabMiddleClick(hitTab)
         }
 
         override func hitTest(_ point: NSPoint) -> NSView? {

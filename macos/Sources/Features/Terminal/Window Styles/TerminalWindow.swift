@@ -607,6 +607,25 @@ class TerminalWindow: NSWindow {
             return
         }
 
+        // Bail out early when there is nothing to do. This runs from `update()`,
+        // which AppKit calls on every pass of the event loop — during any
+        // animation that's once per displayed frame — and everything below
+        // walks the whole view tree hunting for private AppKit views by class
+        // name. Reaching the titlebar through the backdrop already installed
+        // in it answers the same question for free.
+        //
+        // Fullscreen is excluded: the titlebar lives in a separate window
+        // there and can be rebuilt underneath us, so it takes the long path.
+        if !styleMask.contains(.fullScreen),
+           let backdrop = sidebarTitlebarBackdropView,
+           let installedIn = backdrop.superview,
+           sidebarTitleLabel?.superview === installedIn,
+           sidebarTitlebarWidthConstraint?.constant == sidebarTitlebarWidth,
+           sidebarTitleLabelLeadingConstraint?.constant == sidebarTitlebarWidth + 12,
+           sidebarTitleLabel?.stringValue == title {
+            return
+        }
+
         guard let titlebarView = titlebarContainer?.firstDescendant(withClassName: "NSTitlebarView") else {
             return
         }
