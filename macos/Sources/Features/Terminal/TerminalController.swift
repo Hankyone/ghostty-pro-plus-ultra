@@ -748,7 +748,20 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             }
         }
 
+        // Closing the visible tab hands selection to whichever window AppKit
+        // happens to raise, which is the most recently fronted one and has
+        // nothing to do with where the tab sat in the sidebar. Take the row
+        // directly above instead, so selection walks the list the way it
+        // reads. Decided before the close, while the sidebar still exists.
+        let replacement: NSWindow? = tabGroup.selectedWindow === window
+            ? sidebarTabManager?.tabAdjacentInDisplayOrder(to: window)
+            : nil
+
         window.close()
+
+        if let replacement, tabGroup.windows.contains(replacement) {
+            tabGroup.selectedWindow = replacement
+        }
     }
 
     private func closeOtherTabsImmediately() {

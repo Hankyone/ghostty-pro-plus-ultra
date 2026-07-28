@@ -515,10 +515,19 @@ class SidebarTabManager: ObservableObject {
 
     func closeTab(_ tab: TabItem) {
         guard let controller = tab.window.windowController as? TerminalController else { return }
-        if let surfaceId = tab.surfaceId?.uuidString {
-            store.removeTabsFromManualOrder([surfaceId])
-        }
         controller.closeTab(nil)
+    }
+
+    /// The window shown directly above `window` in the sidebar, or the one
+    /// below it when `window` is the very first row. Nil if it's the only tab.
+    ///
+    /// Used to choose which tab takes over when the visible one closes.
+    func tabAdjacentInDisplayOrder(to window: NSWindow) -> NSWindow? {
+        let ordered = projectGroups.flatMap(\.tabs)
+        let id = ObjectIdentifier(window)
+        guard let index = ordered.firstIndex(where: { $0.id == id }) else { return nil }
+        if index > 0 { return ordered[index - 1].window }
+        return ordered.count > 1 ? ordered[1].window : nil
     }
 
     func renameTab(_ tab: TabItem, to newTitle: String) {
@@ -536,10 +545,6 @@ class SidebarTabManager: ObservableObject {
         guard let window else { return }
         let tabWindows = store.orderedTabWindows(for: window)
         guard tabWindows.count > 1 else { return }
-        let idsToRemove = tabWindows
-            .filter { ObjectIdentifier($0) != tab.id }
-            .compactMap { store.tabOrderKey(for: $0) }
-        store.removeTabsFromManualOrder(idsToRemove)
         for w in tabWindows where ObjectIdentifier(w) != tab.id {
             if let controller = w.windowController as? TerminalController {
                 controller.closeTab(nil)
@@ -553,7 +558,6 @@ class SidebarTabManager: ObservableObject {
         guard tabWindows.count > 1 else { return }
         guard let idx = tabWindows.firstIndex(where: { ObjectIdentifier($0) == tab.id }) else { return }
         let tabsToClose = Array(tabWindows[(idx + 1)...])
-        store.removeTabsFromManualOrder(tabsToClose.compactMap { store.tabOrderKey(for: $0) })
         for w in tabsToClose {
             if let controller = w.windowController as? TerminalController {
                 controller.closeTab(nil)

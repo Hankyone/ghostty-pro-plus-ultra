@@ -794,16 +794,6 @@ final class SidebarStore {
         manualTabOrder = order
     }
 
-    /// Remove closed tabs from the persisted order immediately.
-    func removeTabsFromManualOrder(_ ids: [String]) {
-        let idSet = Set(ids)
-        guard !idSet.isEmpty else { return }
-        let filtered = manualTabOrder.filter { !idSet.contains($0) }
-        if filtered != manualTabOrder {
-            manualTabOrder = filtered
-        }
-    }
-
     // MARK: - Sorting & Grouping
 
     var projectSortMode: SortMode {
