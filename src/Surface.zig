@@ -154,6 +154,10 @@ child_exited: bool = false,
 /// to let us know.
 focused: bool = true,
 
+/// Whether this surface may be visible. Unknown visibility is considered
+/// visible so reporting remains conservative.
+visible: bool = true,
+
 /// Used to determine whether to continuously scroll.
 selection_scroll_active: bool = false,
 
@@ -3340,9 +3344,27 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    // Avoid duplicate renderer and visibility reports.
+    if (self.visible == visible) return;
+    self.visible = visible;
+
+    // Update the terminal state for synchronous queries, then notify the IO
+    // thread so it can emit a mode 2033 report when enabled.
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    self.io.terminal.flags.visible = visible;
+    const report_visibility = self.io.terminal.modes.get(.report_visibility);
+    self.renderer_state.mutex.unlock(global.io());
+    if (report_visibility) {
+        self.queueIo(.{ .visibility_report = .{
+            .visible = visible,
+            .force = false,
+        } }, .unlocked);
+    }
+
     _ = self.renderer_thread.mailbox.push(global.io(), .{
         .visible = visible,
     }, .{ .forever = {} });
+
     try self.queueRender();
 }
 

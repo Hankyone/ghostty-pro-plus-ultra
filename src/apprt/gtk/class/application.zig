@@ -6,6 +6,7 @@ const adw = @import("adw");
 const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
+const glibunix = @import("glibunix");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
@@ -1417,7 +1418,7 @@ pub const Application = extern struct {
     fn startupSignals(self: *Self) void {
         const priv = self.private();
         assert(priv.signal_source == null);
-        priv.signal_source = glib.unixSignalAdd(
+        priv.signal_source = glibunix.signalAdd(
             @intFromEnum(std.posix.SIG.USR2),
             handleSigusr2,
             self,

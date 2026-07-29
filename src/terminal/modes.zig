@@ -282,6 +282,7 @@ const entries: []const ModeEntry = &.{
     .{ .name = "synchronized_output", .value = 2026 },
     .{ .name = "grapheme_cluster", .value = 2027 },
     .{ .name = "report_color_scheme", .value = 2031 },
+    .{ .name = "report_visibility", .value = 2033 },
     .{ .name = "in_band_size_reports", .value = 2048 },
 };
 

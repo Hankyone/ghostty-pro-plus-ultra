@@ -117,6 +117,10 @@ flags: packed struct {
     /// True if the window is focused.
     focused: bool = true,
 
+    /// True if the terminal view may be visible. Unknown visibility is
+    /// represented as visible so callers behave conservatively.
+    visible: bool = true,
+
     /// True if the terminal is in a password entry mode. This is set
     /// to true based on termios state. This is set
     /// to true based on termios state.
@@ -4645,8 +4649,13 @@ pub fn fullReset(self: *Terminal) void {
     self.screens.active.reset();
 
     // Rest our basic state
+    const visible = self.flags.visible;
     self.modes.reset();
-    self.flags = .{};
+    self.flags = .{
+        // Visibility belongs to the view rather than terminal state, so a
+        // terminal reset must not make a hidden view potentially visible.
+        .visible = visible,
+    };
     self.tabstops.reset(TABSTOP_INTERVAL);
     self.previous_char = null;
     self.pwd.clearRetainingCapacity();

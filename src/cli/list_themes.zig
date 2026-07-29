@@ -241,6 +241,7 @@ const Preview = struct {
     allocator: std.mem.Allocator,
     should_quit: bool,
     tty: vaxis.Tty,
+    env_map: std.process.Environ.Map,
     vx: vaxis.Vaxis,
     mouse: ?vaxis.Mouse,
     themes: []ThemeListElement,
@@ -264,16 +265,15 @@ const Preview = struct {
         theme_filter: ColorScheme,
         buf: []u8,
     ) !*Preview {
-        var env_map = try global.environMap();
-        defer env_map.deinit();
-
         const self = try allocator.create(Preview);
+        errdefer allocator.destroy(self);
 
         self.* = .{
             .allocator = allocator,
             .should_quit = false,
             .tty = try .init(global.io(), buf),
-            .vx = try vaxis.init(global.io(), allocator, &env_map, .{}),
+            .env_map = try global.environMap(),
+            .vx = undefined,
             .mouse = null,
             .themes = themes,
             .filtered = try .initCapacity(allocator, themes.len),
@@ -285,6 +285,7 @@ const Preview = struct {
             .text_input = .init(allocator),
             .theme_filter = theme_filter,
         };
+        self.vx = try vaxis.init(global.io(), allocator, &self.env_map, .{});
 
         try self.updateFiltered();
 
@@ -296,14 +297,17 @@ const Preview = struct {
         self.filtered.deinit(allocator);
         self.text_input.deinit();
         self.vx.deinit(allocator, self.tty.writer());
+        self.env_map.deinit();
         self.tty.deinit();
         allocator.destroy(self);
     }
 
     pub fn run(self: *Preview) !void {
         var loop: vaxis.Loop(Event) = .init(global.io(), &self.tty, &self.vx);
-        const writer = self.tty.writer();
+        try loop.start();
+        defer loop.stop();
 
+        const writer = self.tty.writer();
         try self.vx.enterAltScreen(writer);
         try self.vx.setTitle(writer, "👻 Ghostty Theme Preview 👻");
         try self.vx.queryTerminal(writer, .fromSeconds(1));

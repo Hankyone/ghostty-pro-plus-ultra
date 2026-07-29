@@ -3324,7 +3324,7 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.updateMapped(true);
-        self.updateOcclusion(true);
+        self.updateOcclusion();
     }
 
     fn glareaUnmap(
@@ -3332,7 +3332,7 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.updateMapped(false);
-        self.updateOcclusion(false);
+        self.updateOcclusion();
     }
 
     fn updateMapped(self: *Self, mapped: bool) void {
@@ -3341,11 +3341,21 @@ pub const Surface = extern struct {
         self.as(gobject.Object).notifyByPspec(properties.mapped.impl.param_spec);
     }
 
-    fn updateOcclusion(self: *Self, visible: bool) void {
+    /// Update the core surface visibility based on both GTK widget and
+    /// toplevel state. This is public so the window can call it when its
+    /// suspended state changes.
+    pub fn updateOcclusion(self: *Self) void {
         const surface = self.core() orelse return;
+        const visible = self.private().mapped and !self.windowSuspended();
         surface.occlusionCallback(visible) catch |err| {
             log.warn("error in occlusion callback err={}", .{err});
         };
+    }
+
+    fn windowSuspended(self: *Self) bool {
+        const native = self.as(gtk.Widget).getNative() orelse return false;
+        const window = gobject.ext.cast(gtk.Window, native) orelse return false;
+        return window.isSuspended() != 0;
     }
 
     fn glareaRender(

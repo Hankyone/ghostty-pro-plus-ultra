@@ -723,6 +723,30 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     try self.queueWrite(td, writer.buffered(), false);
 }
 
+/// Sends a visibility report to the pty. Unforced reports are only sent while
+/// DEC mode 2033 is enabled.
+pub fn visibilityReport(
+    self: *Termio,
+    td: *ThreadData,
+    visible: bool,
+    force: bool,
+) !void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    if (!force and !self.renderer_state.terminal.modes.get(.report_visibility)) {
+        return;
+    }
+
+    var buf: [terminalpkg.device_status.max_visibility_report_encode_size]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try terminalpkg.device_status.encodeVisibilityReport(
+        &writer,
+        if (visible) .potentially_visible else .not_visible,
+    );
+    try self.queueWrite(td, writer.buffered(), false);
+}
+
 /// ThreadData is the data created and stored in the termio thread
 /// when the thread is started and destroyed when the thread is
 /// stopped.

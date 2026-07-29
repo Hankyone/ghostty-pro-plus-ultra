@@ -256,8 +256,10 @@ rjwittams
 rmengelbrecht
 rmunn
 rockorager
+ronijacobson
 rpfaeffle
 ruoyouz
+ruseel
 sahilkmishra
 samasaur1
 sandydoo
@@ -288,6 +290,7 @@ uzaaft
 vancluever
 vaughanandrews
 -vectorpeak Stupid bot cosplaying as a maintainer
+vegerot
 viruslobster
 vlsi
 voidnv

@@ -507,7 +507,22 @@ pub const Handler = struct {
                 buf[writer.end] = 0;
                 self.writePty(buf[0..writer.end :0]);
             },
+
+            .visibility => self.sendVisibilityReport(),
         }
+    }
+
+    fn sendVisibilityReport(self: *Handler) void {
+        const write_pty = self.effects.write_pty orelse return;
+
+        var buf: [device_status.max_visibility_report_encode_size + 1]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(buf[0..device_status.max_visibility_report_encode_size]);
+        device_status.encodeVisibilityReport(
+            &writer,
+            if (self.terminal.flags.visible) .potentially_visible else .not_visible,
+        ) catch return;
+        buf[writer.end] = 0;
+        write_pty(self, buf[0..writer.end :0]);
     }
 
     fn reportEnquiry(self: *Handler) void {
@@ -703,6 +718,8 @@ pub const Handler = struct {
             .in_band_size_reports,
             .focus_event,
             => {},
+
+            .report_visibility => if (enabled) self.sendVisibilityReport(),
 
             .mouse_event_x10 => {
                 if (enabled) {
@@ -2939,6 +2956,57 @@ test "device status: color scheme without callback" {
     try testing.expect(S.written == null);
 }
 
+test "visibility reports" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: ?[]const u8 = null;
+        var count: usize = 0;
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            if (written) |old| testing.allocator.free(old);
+            written = testing.allocator.dupe(u8, data) catch @panic("OOM");
+            count += 1;
+        }
+    };
+    S.written = null;
+    S.count = 0;
+    defer if (S.written) |old| testing.allocator.free(old);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+
+    var s: Stream = .initAlloc(testing.allocator, handler);
+    defer s.deinit();
+
+    // Mode 2033 is supported and initially disabled.
+    s.nextSlice("\x1B[?2033$p");
+    try testing.expectEqualStrings("\x1B[?2033;2$y", S.written.?);
+
+    // A one-shot query reports the current state without enabling the mode.
+    s.nextSlice("\x1B[?998n");
+    try testing.expectEqualStrings("\x1B[?999;1n", S.written.?);
+    try testing.expect(!t.modes.get(.report_visibility));
+
+    // Enabling always sends an immediate report, even when already enabled.
+    t.flags.visible = false;
+    s.nextSlice("\x1B[?2033h");
+    try testing.expectEqualStrings("\x1B[?999;2n", S.written.?);
+    const count = S.count;
+    s.nextSlice("\x1B[?2033h");
+    try testing.expectEqual(count + 1, S.count);
+
+    // Disabling sends no report.
+    s.nextSlice("\x1B[?2033l");
+    try testing.expectEqual(count + 1, S.count);
+
+    // A terminal reset preserves the view's externally owned visibility.
+    s.nextSlice("\x1Bc");
+    s.nextSlice("\x1B[?998n");
+    try testing.expectEqualStrings("\x1B[?999;2n", S.written.?);
+}
+
 test "device status: readonly ignores all" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
@@ -2950,6 +3018,7 @@ test "device status: readonly ignores all" {
     s.nextSlice("\x1B[5n");
     s.nextSlice("\x1B[6n");
     s.nextSlice("\x1B[?996n");
+    s.nextSlice("\x1B[?998n");
 
     // Terminal should still be functional
     s.nextSlice("Test");

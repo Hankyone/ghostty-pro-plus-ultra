@@ -704,6 +704,13 @@ pub const StreamHandler = struct {
                 .size_report = .mode_2048,
             }),
 
+            .report_visibility => if (enabled) self.messageWriter(.{
+                .visibility_report = .{
+                    .visible = self.terminal.flags.visible,
+                    .force = true,
+                },
+            }),
+
             .focus_event => if (enabled) self.messageWriter(.{
                 .focused = self.terminal.flags.focused,
             }),
@@ -820,6 +827,11 @@ pub const StreamHandler = struct {
             },
 
             .color_scheme => self.messageWriter(.{ .color_scheme_report = .{ .force = true } }),
+
+            .visibility => self.messageWriter(.{ .visibility_report = .{
+                .visible = self.terminal.flags.visible,
+                .force = true,
+            } }),
         }
     }
 
