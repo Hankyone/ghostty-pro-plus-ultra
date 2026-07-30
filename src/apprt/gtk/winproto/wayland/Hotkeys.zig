@@ -16,10 +16,7 @@ const log = std.log.scoped(.winproto_wayland_hotkeys);
 
 alloc: Allocator,
 app_id: [:0]const u8,
-
-/// Entries must have stable addresses: the hotkey listeners point to them.
-arena: std.heap.ArenaAllocator,
-entries: std.ArrayList(*Entry) = .empty,
+entries: std.ArrayList(Entry) = .empty,
 
 const Entry = struct {
     /// Null once the binding was denied or revoked.
@@ -28,13 +25,47 @@ const Entry = struct {
     action: Binding.Action,
     shortcuts: *GlobalShortcuts,
 
-    fn fail(entry: *Entry, message: [*:0]const u8, revoked: bool) void {
-        entry.hotkey.?.destroy();
-        entry.hotkey = null;
+    fn deinit(self: *Entry) void {
+        if (self.hotkey) |hotkey| hotkey.destroy();
+    }
 
-        entry.shortcuts.emitBindFailed(&.{
-            .trigger = entry.trigger,
-            .action = entry.action,
+    fn bind(
+        self: *Entry,
+        manager: *vicinae.HotkeyManagerV1,
+        app_id: [:0]const u8,
+    ) !void {
+        // The only time this will return an error is when
+        // `trigger.key` is `catch_all`, which is guarded
+        // in the public `bind` function
+        const keysym = key.keysymFromTrigger(self.trigger) orelse unreachable;
+
+        var desc_buf: [256]u8 = undefined;
+        const desc = std.fmt.bufPrintZ(&desc_buf, "{f}", .{self.action}) catch "";
+
+        const hotkey = try manager.bind(
+            keysym,
+            .{
+                .shift = self.trigger.mods.shift,
+                .ctrl = self.trigger.mods.ctrl,
+                .alt = self.trigger.mods.alt,
+                .super = self.trigger.mods.super,
+            },
+            null,
+            app_id.ptr,
+            desc.ptr,
+        );
+        errdefer hotkey.destroy();
+        hotkey.setListener(*Entry, hotkeyListener, self);
+        self.hotkey = hotkey;
+    }
+
+    fn fail(self: *Entry, message: [*:0]const u8, revoked: bool) void {
+        self.hotkey.?.destroy();
+        self.hotkey = null;
+
+        self.shortcuts.emitBindFailed(&.{
+            .trigger = self.trigger,
+            .action = self.action,
             .message = message,
             .revoked = revoked,
         });
@@ -45,7 +76,6 @@ pub fn init(alloc: Allocator, app_id: [:0]const u8) Allocator.Error!Hotkeys {
     return .{
         .alloc = alloc,
         .app_id = try alloc.dupeZ(u8, app_id),
-        .arena = .init(alloc),
     };
 }
 
@@ -53,17 +83,12 @@ pub fn init(alloc: Allocator, app_id: [:0]const u8) Allocator.Error!Hotkeys {
 /// called after deinit during application teardown.
 pub fn deinit(self: *Hotkeys) void {
     self.clear();
-    self.arena.deinit();
-    self.arena = .init(self.alloc);
     self.alloc.free(self.app_id);
 }
 
 pub fn clear(self: *Hotkeys) void {
-    for (self.entries.items) |entry| {
-        if (entry.hotkey) |hotkey| hotkey.destroy();
-    }
-    _ = self.arena.reset(.retain_capacity);
-    self.entries = .empty;
+    for (self.entries.items) |*entry| entry.deinit();
+    self.entries.clearRetainingCapacity();
 }
 
 pub fn bind(
@@ -81,58 +106,30 @@ pub fn bind(
             inline .leaf, .leaf_chained => |leaf| leaf.generic(),
         };
         if (!leaf.flags.global) continue;
+        // Catch all global keybinds don't really make sense
+        if (entry.key_ptr.key == .catch_all) continue;
 
         // Only single-action global keybinds are supported, as in the
         // portal implementation.
         const actions = leaf.actionsSlice();
         if (actions.len != 1) continue;
 
-        self.bindOne(manager, shortcuts, entry.key_ptr.*, actions[0]) catch |err| {
+        self.entries.append(self.alloc, .{
+            .hotkey = null,
+            .trigger = entry.key_ptr.*,
+            .action = actions[0],
+            .shortcuts = shortcuts,
+        }) catch {};
+    }
+
+    for (self.entries.items) |*entry| {
+        entry.bind(manager, self.app_id) catch |err| {
             log.warn("failed to request hotkey trigger={f} err={}", .{
-                entry.key_ptr.*,
+                entry.trigger,
                 err,
             });
         };
     }
-}
-
-fn bindOne(
-    self: *Hotkeys,
-    manager: *vicinae.HotkeyManagerV1,
-    shortcuts: *GlobalShortcuts,
-    trigger: Binding.Trigger,
-    action: Binding.Action,
-) !void {
-    const keysym = key.keysymFromTrigger(trigger) orelse return error.NoKeysym;
-
-    var desc_buf: [256]u8 = undefined;
-    const description = std.fmt.bufPrintZ(&desc_buf, "{f}", .{action}) catch "";
-
-    const alloc = self.arena.allocator();
-    const entry = try alloc.create(Entry);
-
-    const hotkey = try manager.bind(
-        keysym,
-        .{
-            .shift = trigger.mods.shift,
-            .ctrl = trigger.mods.ctrl,
-            .alt = trigger.mods.alt,
-            .super = trigger.mods.super,
-        },
-        null,
-        self.app_id.ptr,
-        description.ptr,
-    );
-    errdefer hotkey.destroy();
-
-    entry.* = .{
-        .hotkey = hotkey,
-        .trigger = trigger,
-        .action = action,
-        .shortcuts = shortcuts,
-    };
-    hotkey.setListener(*Entry, hotkeyListener, entry);
-    try self.entries.append(alloc, entry);
 }
 
 fn hotkeyListener(

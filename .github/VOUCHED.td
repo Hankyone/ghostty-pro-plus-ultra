@@ -113,6 +113,7 @@ escalonc
 eunos-1128
 exlee
 -f1813483-netizen
+fallintoplace
 faukah
 filip7
 flou
@@ -269,6 +270,7 @@ secrus
 seruman
 seyoungjeong
 silveirapf
+simonbcn
 slsrepo
 sunshine-syz
 svmhdvn
