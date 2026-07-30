@@ -89,6 +89,11 @@ const NullPty = struct {
         _ = size;
     }
 
+    pub fn setSizeFd(fd: Fd, size: winsize) SetSizeError!void {
+        _ = fd;
+        _ = size;
+    }
+
     pub const ChildPreExecError = error{};
 
     pub fn childPreExec(self: Pty) ChildPreExecError!void {
@@ -219,7 +224,17 @@ const PosixPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        if (c.ioctl(self.master, c.TIOCSWINSZ, @intFromPtr(&size)) < 0)
+        return setSizeFd(self.master, size);
+    }
+
+    /// Set the size of a pty we only hold the master end of.
+    ///
+    /// Resizing is a property of the terminal device, not of whoever opened
+    /// it, so the master fd alone is enough. Keeper mode needs this: the
+    /// `Pty` that owns both ends lives in another process and all we borrow
+    /// is the master.
+    pub fn setSizeFd(fd: Fd, size: winsize) SetSizeError!void {
+        if (c.ioctl(fd, c.TIOCSWINSZ, @intFromPtr(&size)) < 0)
             return error.IoctlFailed;
     }
 
@@ -480,6 +495,15 @@ const WindowsPty = struct {
 
         if (result != windows.S_OK) return error.ResizeFailed;
         self.size = size;
+    }
+
+    /// Resizing a ConPTY goes through its pseudo console handle, which only
+    /// the process that created it holds, so there is nothing a borrowed
+    /// handle can do here. Keeper mode is POSIX-only, so nothing calls this.
+    pub fn setSizeFd(fd: Fd, size: winsize) SetSizeError!void {
+        _ = fd;
+        _ = size;
+        return error.ResizeFailed;
     }
 
     /// Get information about the process(es) attached to the PTY. Returns

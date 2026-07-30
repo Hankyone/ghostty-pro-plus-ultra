@@ -1360,17 +1360,26 @@ const Subprocess = struct {
         self.grid_size = grid_size;
         self.screen_size = screen_size;
 
+        // It is theoretically possible for the grid or screen size to
+        // exceed u16, although the terminal in that case isn't very
+        // usable. This should be protected upstream but we still clamp
+        // in case there is a bad caller which has happened before.
+        const size: ptypkg.winsize = .{
+            .ws_row = std.math.cast(u16, grid_size.rows) orelse std.math.maxInt(u16),
+            .ws_col = std.math.cast(u16, grid_size.columns) orelse std.math.maxInt(u16),
+            .ws_xpixel = std.math.cast(u16, screen_size.width) orelse std.math.maxInt(u16),
+            .ws_ypixel = std.math.cast(u16, screen_size.height) orelse std.math.maxInt(u16),
+        };
+
         if (self.pty) |*pty| {
-            // It is theoretically possible for the grid or screen size to
-            // exceed u16, although the terminal in that case isn't very
-            // usable. This should be protected upstream but we still clamp
-            // in case there is a bad caller which has happened before.
-            try pty.setSize(.{
-                .ws_row = std.math.cast(u16, grid_size.rows) orelse std.math.maxInt(u16),
-                .ws_col = std.math.cast(u16, grid_size.columns) orelse std.math.maxInt(u16),
-                .ws_xpixel = std.math.cast(u16, screen_size.width) orelse std.math.maxInt(u16),
-                .ws_ypixel = std.math.cast(u16, screen_size.height) orelse std.math.maxInt(u16),
-            });
+            try pty.setSize(size);
+        } else if (self.keeper_session) |session| {
+            // A keeper-held pane has no `Pty` of its own — the keeper opened it
+            // and we only borrow the master. Skipping the resize here left the
+            // shell stuck at whatever size it was spawned with for the life of
+            // the pane, so every window resize moved the terminal's edges
+            // without telling the program inside about them.
+            try Pty.setSizeFd(session.master, size);
         }
     }
 
