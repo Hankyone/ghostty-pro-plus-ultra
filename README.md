@@ -20,7 +20,7 @@ A T3 Code-inspired sidebar that replaces the native tab bar. Terminals are autom
 
 ### AI Agent Integration
 
-Built-in support for Claude Code, Codex, Grok, Devin, Cursor, and Antigravity. The sidebar shows live status for each agent session — pulsing blue while working, orange when waiting for input, green when done. Each project header has a button to launch a new session or resume a recent one directly from the sidebar. Antigravity has no hook system, so it gets launch support and the built-in process-running indicator but no live status tracking or session resume.
+Built-in support for Claude Code, Codex, Grok, OpenCode, Devin, Cline, Cursor and Antigravity. The sidebar shows live status for each session: an open ring while the model is reasoning, a square while a tool runs, orange when it is waiting on you, green when a turn finished while you were elsewhere. Hovering names the running tool. Each project header has a button to launch a new session or resume a recent one directly from the sidebar. See [Agent Status](#agent-status) for which agents report which states.
 
 ### Git Integration
 
@@ -30,125 +30,42 @@ Each project header shows live git diff stats (`+N -N`) that update as you edit 
 
 Browser-like session persistence — quit and reopen, and everything comes back. Working directories, tab titles, colors, sidebar metadata, and agent resume commands are all preserved across restarts.
 
-### Hook Setup
+### Agent Status
 
-The sidebar integration is powered by hooks that push status updates via `ghosttyctl`. Requires `jq` in your PATH.
+No setup. Install an agent, run it in a tab, and the sidebar follows along.
 
-**Claude Code:**
+Status is read from the record each agent already keeps of its own
+conversation, so there is nothing to register and nothing that can drift out
+of sync with what is on screen. Six of the eight are read this way:
 
-```bash
-# 1. Copy the hook script
-mkdir -p ~/.claude/hooks
-cp cli/ghostty-sidebar-hook.sh ~/.claude/hooks/ghostty-sidebar.sh
+| Agent | Read from | Reports |
+| --- | --- | --- |
+| Grok | Session event log | Thinking, tool, waiting for you, finished |
+| Codex | Session event log | Thinking, tool, working, finished, aborted |
+| Claude | Session transcript | Thinking, tool, working, finished |
+| OpenCode | Session database | Working, finished |
+| Devin | Session database | Running tool, whose turn it is |
+| Cline | Session database | Its own status field |
 
-# 2. Register hooks in Claude Code settings (merges with existing settings)
-python3 -c "
-import json, os
-p = os.path.expanduser('~/.claude/settings.json')
-s = json.load(open(p)) if os.path.exists(p) else {}
-cmd = 'bash ~/.claude/hooks/ghostty-sidebar.sh'
-entry = [{'hooks': [{'type': 'command', 'command': cmd}]}]
-s['hooks'] = {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','Notification','Stop','StopFailure','SessionEnd']}
-json.dump(s, open(p, 'w'), indent=2)
-print('Hooks installed.')
-"
-```
+Cursor and Antigravity keep their conversations in formats we do not read
+yet; both show the built-in process indicator instead.
 
-**Codex:**
+Reading is cheap by design. One file handle and one kernel watch per live
+session, nothing polls, and each read looks only at the tail of the file.
 
-```bash
-# Register hooks in Codex settings (merges with existing settings)
-python3 -c "
-import json, os
-p = os.path.expanduser('~/.codex/hooks.json')
-s = json.load(open(p)) if os.path.exists(p) else {}
-cmd = 'bash $(pwd)/cli/ghostty-codex-hook.sh'
-entry = [{'hooks': [{'type': 'command', 'command': cmd}]}]
-s['hooks'] = {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','PostToolUse','Stop']}
-json.dump(s, open(p, 'w'), indent=2)
-print('Hooks installed.')
-"
-```
+**Claude only:** a wrapper earlier in `PATH` passes Claude Code a settings
+file at launch, which is how the sidebar learns the session id and when an
+approval prompt is waiting. It is written automatically, applies only inside
+this app, and steps aside if you have wired up ghostty hooks yourself. It
+needs `jq`.
 
-**Grok:**
+> **Upgrading from an older version?** Earlier releases asked you to install
+> hooks permanently into `~/.claude/settings.json`. Those fired in every
+> terminal on the machine, not just this one. They are removed automatically
+> on first launch; only entries pointing at our own scripts are touched, and
+> the original file is kept beside it as `settings.json.pre-ghostty-shim`.
+> The scripts left in `~/.claude/hooks/` are inert and can be deleted.
 
-```bash
-# Create the hooks directory and register hooks
-mkdir -p ~/.grok/hooks
-python3 -c "
-import json, os
-p = os.path.expanduser('~/.grok/hooks/ghostty-sidebar.json')
-cmd = 'bash $(pwd)/cli/ghostty-grok-hook.sh'
-entry = [{'hooks': [{'type': 'command', 'command': cmd}]}]
-s = {'hooks': {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','PostToolUse','Stop','StopFailure','SessionEnd']}}
-json.dump(s, open(p, 'w'), indent=2)
-print('Hooks installed.')
-"
-```
-
-> **Note:** Grok reads `~/.claude/settings.json` hooks by default (Claude
-> compatibility). To avoid the Claude sidebar hook firing when you run Grok,
-> either disable Claude hook scanning in `~/.grok/config.toml`:
-> ```toml
-> [compat.claude]
-> hooks = false
-> ```
-> Or use a single shared hook script that detects the agent from the payload.
-
-**Devin:**
-
-```bash
-# Register hooks in Devin user config (merges with existing settings)
-python3 -c "
-import json, os
-p = os.path.expanduser('~/.config/devin/config.json')
-s = json.load(open(p)) if os.path.exists(p) else {}
-cmd = 'bash $(pwd)/cli/ghostty-devin-hook.sh'
-entry = [{'hooks': [{'type': 'command', 'command': cmd}]}]
-s['hooks'] = {e: entry for e in ['SessionStart','UserPromptSubmit','PreToolUse','PostToolUse','Stop','SessionEnd']}
-json.dump(s, open(p, 'w'), indent=2)
-print('Hooks installed.')
-"
-```
-
-> **Note:** Like Grok, Devin reads `~/.claude/settings.json` hooks by default.
-> To avoid the Claude sidebar hook firing when you run Devin, disable Claude
-> config import in `~/.config/devin/config.json`:
-> ```json
-> { "read_config_from": { "claude": false } }
-> ```
-
-**Cursor:**
-
-```bash
-# Register hooks in Cursor user config
-# Cursor reads ~/.cursor/hooks.json
-python3 -c "
-import json, os
-p = os.path.expanduser('~/.cursor/hooks.json')
-s = json.load(open(p)) if os.path.exists(p) else {}
-cmd = 'bash $(pwd)/cli/ghostty-cursor-hook.sh'
-hooks = s.setdefault('hooks', {})
-for e in ['sessionStart','beforeSubmitPrompt','preToolUse','postToolUse','stop','sessionEnd']:
-    hooks[e] = [{'command': cmd}]
-s['version'] = 1
-json.dump(s, open(p, 'w'), indent=2)
-print('Hooks installed.')
-"
-```
-
-> **Note:** Cursor supports Claude Code-compatible hooks natively. If you also
-> have Claude hooks in `~/.claude/settings.json`, Cursor will map them
-> automatically (e.g. `Stop` → `stop`, `SessionStart` → `sessionStart`). To
-> avoid double-firing, either use only the Cursor-native config above or
-> disable Claude config import.
-
-**Antigravity:**
-
-No hook setup needed — Antigravity doesn't support hooks. It appears in the
-launch menu with `--dangerously-skip-permissions` and gets the built-in
-process-running indicator (pulsing orange dot) but no live status tracking
-or session resume.
 
 ### CLI
 
