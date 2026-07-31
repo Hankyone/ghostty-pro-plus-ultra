@@ -114,6 +114,12 @@ final class AgentTranscriptWatcher: ObservableObject {
                 if existing.sessionId == subject.sessionId,
                    existing.agent == subject.agent {
                     existing.directory = subject.directory
+                    // Look again if we came up empty. Agents create their
+                    // record on the first prompt, not at launch, so the first
+                    // attempt almost always finds nothing — and only ever
+                    // trying once meant a tab that was searched too early
+                    // stayed unwatched for the life of the session.
+                    if existing.url == nil { resolve(surfaceId: subject.surfaceId) }
                     continue
                 }
                 // The tab moved to a different session, so the old file is
@@ -154,8 +160,10 @@ final class AgentTranscriptWatcher: ObservableObject {
 
         let agent = watcher.agent
         let sessionId = watcher.sessionId
+        let directory = watcher.directory
         ioQueue.async { [weak self] in
-            let found = Self.locateTranscript(agent: agent, sessionId: sessionId)
+            let found = Self.locateTranscript(
+                agent: agent, sessionId: sessionId, directory: directory)
             Task { @MainActor in
                 guard let self,
                       let watcher = self.watchers[surfaceId],
@@ -177,7 +185,8 @@ final class AgentTranscriptWatcher: ObservableObject {
     /// keep using hooks.
     private nonisolated static func locateTranscript(
         agent: SidebarTabManager.AgentType,
-        sessionId: String
+        sessionId: String,
+        directory: String?
     ) -> URL? {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let fm = FileManager.default
@@ -202,37 +211,64 @@ final class AgentTranscriptWatcher: ObservableObject {
 
         case .codex:
             // ~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<session>.jsonl.
-            // Walk newest day first: a session we care about is a session
-            // someone is using right now.
             let sessions = home.appendingPathComponent(".codex/sessions", isDirectory: true)
-            let suffix = "-\(sessionId).jsonl"
             guard let walker = fm.enumerator(
                 at: sessions,
-                includingPropertiesForKeys: [.isRegularFileKey],
+                includingPropertiesForKeys: [.contentModificationDateKey],
                 options: [.skipsHiddenFiles]
             ) else { return nil }
-            for case let url as URL in walker {
-                if url.lastPathComponent.hasSuffix(suffix) { return url }
+
+            if !sessionId.isEmpty {
+                let suffix = "-\(sessionId).jsonl"
+                for case let url as URL in walker
+                where url.lastPathComponent.hasSuffix(suffix) { return url }
+                return nil
             }
+
+            // Codex never tells us its session id, so fall back to the newest
+            // rollout that started in this directory. Its first line is a
+            // metadata record naming the directory, which is cheap to read.
+            guard let directory else { return nil }
+            let rollouts = (walker.allObjects as? [URL] ?? [])
+                .filter { $0.pathExtension == "jsonl" }
+                .sorted { modified($0) > modified($1) }
+                .prefix(recentRolloutsToScan)
+            for url in rollouts where rolloutDirectory(url) == directory { return url }
             return nil
 
         case .grok:
-            // ~/.grok/sessions/<url-encoded cwd>/<session>/events.jsonl. The
-            // directory is keyed by working directory, but the session id is
-            // unique, so search for it rather than reproduce the encoding.
+            // ~/.grok/sessions/<url-encoded cwd>/<session>/events.jsonl.
             let sessions = home.appendingPathComponent(".grok/sessions", isDirectory: true)
-            guard let dirs = try? fm.contentsOfDirectory(
-                at: sessions,
-                includingPropertiesForKeys: nil,
+
+            if !sessionId.isEmpty {
+                guard let dirs = try? fm.contentsOfDirectory(
+                    at: sessions, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+                ) else { return nil }
+                for dir in dirs {
+                    let candidate = dir
+                        .appendingPathComponent(sessionId, isDirectory: true)
+                        .appendingPathComponent("events.jsonl")
+                    if fm.fileExists(atPath: candidate.path) { return candidate }
+                }
+                return nil
+            }
+
+            // Grok keys its sessions by working directory already, with the
+            // path percent-encoded into a single component, so the folder is
+            // computable and only the newest session inside it is needed.
+            guard let directory else { return nil }
+            let encoded = directory.replacingOccurrences(of: "/", with: "%2F")
+            let folder = sessions.appendingPathComponent(encoded, isDirectory: true)
+            guard let candidates = try? fm.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: [.contentModificationDateKey],
                 options: [.skipsHiddenFiles]
             ) else { return nil }
-            for dir in dirs {
-                let candidate = dir
-                    .appendingPathComponent(sessionId, isDirectory: true)
-                    .appendingPathComponent("events.jsonl")
-                if fm.fileExists(atPath: candidate.path) { return candidate }
-            }
-            return nil
+            return candidates
+                .map { $0.appendingPathComponent("events.jsonl") }
+                .filter { fm.fileExists(atPath: $0.path) }
+                .sorted { modified($0) > modified($1) }
+                .first
 
         case .devin, .cline, .opencode:
             // These keep the conversation in a database rather than a log.
@@ -247,6 +283,34 @@ final class AgentTranscriptWatcher: ObservableObject {
         default:
             return nil
         }
+    }
+
+    /// How many recent Codex rollouts to open when searching by directory.
+    /// Bounded because the folder holds every session ever run.
+    private nonisolated static let recentRolloutsToScan = 40
+
+    private nonisolated static func modified(_ url: URL) -> Date {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate ?? .distantPast
+    }
+
+    /// The directory a Codex rollout was started in, from its first line.
+    ///
+    /// That line is Codex's session metadata and it is far larger than it
+    /// looks — it carries the base instructions and the whole tool schema,
+    /// and runs past 45K in practice. Reading a token-sized chunk finds no
+    /// line break at all and quietly answers "no idea", which is how every
+    /// Codex tab went unmatched.
+    private nonisolated static func rolloutDirectory(_ url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 256 * 1024),
+              let newline = head.firstIndex(of: UInt8(ascii: "\n")),
+              let object = try? JSONSerialization.jsonObject(
+                with: head[head.startIndex..<newline]) as? [String: Any],
+              let payload = object["payload"] as? [String: Any]
+        else { return nil }
+        return payload["cwd"] as? String
     }
 
     // MARK: - Following the file
