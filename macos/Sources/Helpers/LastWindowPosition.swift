@@ -6,6 +6,18 @@ class LastWindowPosition {
 
     private let positionKey = "NSWindowLastPosition"
 
+    /// Coalesces the write. Dragging a window emits a move notification per
+    /// displayed frame, and every window in a tab group gets its own, so a
+    /// naive save turns one drag into hundreds of preference writes — each of
+    /// which goes through CFPreferences and lands in a plist. That is enough
+    /// to make dragging a window with many tabs visibly lag behind the mouse.
+    ///
+    /// Only the final resting place matters, so the frame is remembered
+    /// immediately and written once things settle.
+    private var pendingWrite: DispatchWorkItem?
+    private var pendingRect: [Double]?
+    private static let writeDelay: DispatchTimeInterval = .milliseconds(250)
+
     @discardableResult
     func save(_ window: NSWindow?) -> Bool {
         // We should only save the frame if the window is visible.
@@ -13,10 +25,39 @@ class LastWindowPosition {
         // with the wrong one when window decorations change while creating,
         // e.g. adding a toolbar affects the window's frame.
         guard let window, window.isVisible else { return false }
+
+        // Every window in a tab group shares one frame, so letting each of
+        // them report it is the same answer over and over. Only the one on
+        // screen speaks for the group.
+        if let group = window.tabGroup,
+           group.windows.count > 1,
+           group.selectedWindow !== window {
+            return false
+        }
+
         let frame = window.frame
-        let rect = [frame.origin.x, frame.origin.y, frame.size.width, frame.size.height]
-        UserDefaults.ghostty.set(rect, forKey: positionKey)
+        pendingRect = [frame.origin.x, frame.origin.y, frame.size.width, frame.size.height]
+
+        pendingWrite?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let rect = self.pendingRect else { return }
+            self.pendingWrite = nil
+            UserDefaults.ghostty.set(rect, forKey: self.positionKey)
+        }
+        pendingWrite = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.writeDelay, execute: work)
         return true
+    }
+
+    /// Write anything still pending right now.
+    ///
+    /// Called on the way out, since a coalesced write that never happens is a
+    /// window that reopens somewhere else.
+    func flush() {
+        guard let rect = pendingRect, pendingWrite != nil else { return }
+        pendingWrite?.cancel()
+        pendingWrite = nil
+        UserDefaults.ghostty.set(rect, forKey: positionKey)
     }
 
     /// Restores a previously saved window frame (or parts of it) onto the given window.

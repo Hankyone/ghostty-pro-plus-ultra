@@ -476,6 +476,10 @@ class AppDelegate: NSObject,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // The window frame is written lazily while dragging. Anything still
+        // waiting has to land now or the next launch reopens somewhere stale.
+        LastWindowPosition.shared.flush()
+
         // Point of no return: hand keeper-held panes over with their screens
         // intact so the next launch can pick them straight back up. Surface
         // teardown isn't guaranteed to run on quit — the process can simply
