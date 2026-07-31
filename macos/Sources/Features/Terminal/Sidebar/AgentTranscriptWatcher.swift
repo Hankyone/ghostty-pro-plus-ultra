@@ -52,6 +52,8 @@ final class AgentTranscriptWatcher: ObservableObject {
     private final class Watcher {
         let agent: SidebarTabManager.AgentType
         let sessionId: String
+        /// The tab's working directory, for the agents joined on it.
+        var directory: String?
         var url: URL?
         var source: DispatchSourceFileSystemObject?
         var descriptor: CInt = -1
@@ -82,7 +84,10 @@ final class AgentTranscriptWatcher: ObservableObject {
     struct Subject {
         let surfaceId: UUID
         let agent: SidebarTabManager.AgentType
+        /// Empty for the agents we join on directory instead, because they
+        /// never tell us which session a tab is running.
         let sessionId: String
+        let directory: String?
     }
 
     /// Bring the set of watched sessions in line with what the sidebar sees.
@@ -97,7 +102,10 @@ final class AgentTranscriptWatcher: ObservableObject {
             if let existing = watchers[subject.surfaceId] {
                 // Same session still running: nothing to do.
                 if existing.sessionId == subject.sessionId,
-                   existing.agent == subject.agent { continue }
+                   existing.agent == subject.agent {
+                    existing.directory = subject.directory
+                    continue
+                }
                 // The tab moved to a different session, so the old file is
                 // no longer about this tab.
                 stop(surfaceId: subject.surfaceId)
@@ -112,6 +120,7 @@ final class AgentTranscriptWatcher: ObservableObject {
 
     private func start(_ subject: Subject) {
         let watcher = Watcher(agent: subject.agent, sessionId: subject.sessionId)
+        watcher.directory = subject.directory
         watchers[subject.surfaceId] = watcher
         resolve(surfaceId: subject.surfaceId)
     }
@@ -197,6 +206,16 @@ final class AgentTranscriptWatcher: ObservableObject {
             }
             return nil
 
+        case .devin, .cline:
+            // These keep the conversation in a database rather than a log.
+            // Watch its write-ahead journal, which is what actually moves
+            // during a session, and fall back to the database file itself
+            // when no journal exists yet.
+            guard let location = AgentSessionDatabase.location(for: agent) else { return nil }
+            if fm.fileExists(atPath: location.journal.path) { return location.journal }
+            if fm.fileExists(atPath: location.database.path) { return location.database }
+            return nil
+
         default:
             return nil
         }
@@ -256,9 +275,18 @@ final class AgentTranscriptWatcher: ObservableObject {
         guard let watcher = watchers[surfaceId], let url = watcher.url else { return }
         let agent = watcher.agent
         let sessionId = watcher.sessionId
+        let directory = watcher.directory
 
         ioQueue.async { [weak self] in
-            let derived = Self.deriveActivity(agent: agent, transcript: url)
+            let derived: Activity?
+            switch agent {
+            case .devin, .cline:
+                derived = directory.flatMap {
+                    AgentSessionDatabase.activity(agent: agent, directory: $0)
+                }
+            default:
+                derived = Self.deriveActivity(agent: agent, transcript: url)
+            }
             Task { @MainActor in
                 guard let self,
                       let watcher = self.watchers[surfaceId],

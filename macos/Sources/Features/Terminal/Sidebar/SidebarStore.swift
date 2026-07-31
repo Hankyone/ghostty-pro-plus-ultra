@@ -384,14 +384,19 @@ final class SidebarStore {
 
             // A transcript is only findable once the agent has told us which
             // session it is running, which the session key already carries.
-            if let sid, let agent,
-               let session = entries.first(where: { $0.key == agent.sessionKey })?.value,
-               !session.isEmpty {
-                transcriptSubjects.append(.init(
-                    surfaceId: sid,
-                    agent: agent,
-                    sessionId: session
-                ))
+            if let sid, let agent {
+                let session = entries.first(where: { $0.key == agent.sessionKey })?.value ?? ""
+                // Devin and Cline never report a session id, so they are found
+                // by working directory instead and need no id to start.
+                let joinsOnDirectory = (agent == .devin || agent == .cline)
+                if !session.isEmpty || joinsOnDirectory {
+                    transcriptSubjects.append(.init(
+                        surfaceId: sid,
+                        agent: agent,
+                        sessionId: session,
+                        directory: pwd.map { ($0 as NSString).expandingTildeInPath }
+                    ))
+                }
             }
             let activity = sid.flatMap { watcher.activity[$0] }
 
