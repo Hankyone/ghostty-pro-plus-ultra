@@ -156,6 +156,21 @@ pub fn threadEnter(
             "keeper dropped {d} bytes while detached; scrollback is short by that much",
             .{session.dropped},
         );
+
+        // Nothing has asked the program inside to draw itself again.
+        //
+        // A reattached pane comes back showing whatever it last drew, laid out
+        // for the size it drew at, and the program has no idea it was ever
+        // away. The obvious prompt to repaint would be a size change, but
+        // there isn't one: the pty already carries the right size by the time
+        // we get here, and the kernel only signals on a change. So a window
+        // that came back at a different size than it left showed a full-screen
+        // app frozen at the old geometry until the user happened to drag the
+        // window, which is a poor definition of "as if I never closed it".
+        //
+        // Change the size and change it straight back. The program sees a
+        // resize, redraws, and lands correct.
+        self.subprocess.nudgeForRepaint();
     }
 
     // Start our read thread
@@ -1355,19 +1370,34 @@ const Subprocess = struct {
         self.process = null;
     }
 
-    /// Resize the pty subprocess. This is safe to call anytime.
-    pub fn resize(
+    /// Make whatever is running redraw itself, by changing the terminal size
+    /// and immediately putting it back.
+    ///
+    /// Only useful for a pane we just reattached to, where the size is already
+    /// right and so no size change is coming to prompt a repaint. One row is
+    /// enough to raise the signal, and the correct size follows before
+    /// anything can act on the wrong one.
+    pub fn nudgeForRepaint(self: *Subprocess) void {
+        if (self.keeper_session == null) return;
+        if (self.grid_size.rows <= 1) return;
+
+        var shrunk = self.grid_size;
+        shrunk.rows -= 1;
+        self.applySize(shrunk, self.screen_size) catch |err| {
+            log.warn("could not nudge reattached pane err={}", .{err});
+            return;
+        };
+        self.applySize(self.grid_size, self.screen_size) catch |err| {
+            log.err("failed to restore size after nudge err={}", .{err});
+        };
+    }
+
+    /// Push a size to the pty without recording it as the size we want.
+    fn applySize(
         self: *Subprocess,
         grid_size: renderer.GridSize,
         screen_size: renderer.ScreenSize,
     ) !void {
-        self.grid_size = grid_size;
-        self.screen_size = screen_size;
-
-        // It is theoretically possible for the grid or screen size to
-        // exceed u16, although the terminal in that case isn't very
-        // usable. This should be protected upstream but we still clamp
-        // in case there is a bad caller which has happened before.
         const size: ptypkg.winsize = .{
             .ws_row = std.math.cast(u16, grid_size.rows) orelse std.math.maxInt(u16),
             .ws_col = std.math.cast(u16, grid_size.columns) orelse std.math.maxInt(u16),
@@ -1378,13 +1408,25 @@ const Subprocess = struct {
         if (self.pty) |*pty| {
             try pty.setSize(size);
         } else if (self.keeper_session) |session| {
-            // A keeper-held pane has no `Pty` of its own — the keeper opened it
-            // and we only borrow the master. Skipping the resize here left the
-            // shell stuck at whatever size it was spawned with for the life of
-            // the pane, so every window resize moved the terminal's edges
-            // without telling the program inside about them.
             try Pty.setSizeFd(session.master, size);
         }
+    }
+
+    /// Resize the pty subprocess. This is safe to call anytime.
+    pub fn resize(
+        self: *Subprocess,
+        grid_size: renderer.GridSize,
+        screen_size: renderer.ScreenSize,
+    ) !void {
+        self.grid_size = grid_size;
+        self.screen_size = screen_size;
+
+        // A keeper-held pane has no `Pty` of its own — the keeper opened it
+        // and we only borrow the master. Skipping the resize here left the
+        // shell stuck at whatever size it was spawned with for the life of
+        // the pane, so every window resize moved the terminal's edges without
+        // telling the program inside about them.
+        try self.applySize(grid_size, screen_size);
     }
 
     /// Kill the underlying subprocess. This sends a SIGHUP to the child
