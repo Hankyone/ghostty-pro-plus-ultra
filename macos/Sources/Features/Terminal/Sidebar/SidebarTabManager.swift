@@ -133,6 +133,18 @@ class SidebarTabManager: ObservableObject {
         /// Whether this is the Home group for tabs in the home directory.
         var isHomeGroup: Bool { id == "__home__" }
 
+        /// Where a terminal launched from this group's header should open.
+        ///
+        /// Home has no project root, but it does have an obvious folder, and
+        /// falling through to "wherever the last tab happened to be" is the
+        /// one answer nobody means when they click the header that says Home.
+        /// Other stays inherited: it is a bag of unrelated directories, so
+        /// there is nothing to point at.
+        var launchDirectory: String? {
+            if let projectRoot { return projectRoot }
+            return isHomeGroup ? NSHomeDirectory() : nil
+        }
+
         static func == (lhs: ProjectGroup, rhs: ProjectGroup) -> Bool {
             lhs.id == rhs.id && lhs.name == rhs.name
                 && lhs.tabs == rhs.tabs

@@ -323,7 +323,7 @@ private struct ProjectSection: View {
                     isCollapsed: isCollapsed,
                     isHovered: hoveredGroupID == group.id,
                     onNewTab: { agent in
-                        tabManager.createNewTab(agent: agent, projectRoot: group.projectRoot)
+                        tabManager.createNewTab(agent: agent, projectRoot: group.launchDirectory)
                     },
                     onGitCommit: group.projectRoot != nil ? {
                         tabManager.gitCommit(projectRoot: group.projectRoot!)
