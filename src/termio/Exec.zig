@@ -694,6 +694,10 @@ const Subprocess = struct {
     /// the way the fork path's `process = null` makes it one.
     keeper_killed: bool = false,
 
+    /// Storage for the slave name in keeper mode, where the `Pty` that would
+    /// normally own this buffer lives in another process.
+    keeper_tty_name_buf: [std.fs.max_path_bytes:0]u8 = undefined,
+
     /// Keeper inputs, resolved at init.
     keeper_enabled: bool,
     pane_id: ?[]const u8,
@@ -1565,8 +1569,19 @@ const Subprocess = struct {
     /// Returns `null` if there was an error getting the information or the
     /// information is not available on a particular platform.
     pub fn getProcessInfo(self: *Subprocess, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
-        const pty = &(self.pty orelse return null);
-        return pty.getProcessInfo(info);
+        if (self.pty) |*pty| return pty.getProcessInfo(info);
+
+        // A keeper-held pane has no `Pty` of its own, only the borrowed
+        // master, and both of these questions are answered by the master
+        // alone. Without this the whole API went quiet the moment
+        // `pane-keeper` was on, which takes with it any way of knowing what
+        // is actually running in a tab.
+        if (self.keeper_session) |session| return switch (info) {
+            .foreground_pid => Pty.foregroundPidFd(session.master),
+            .tty_name => Pty.ttyNameFd(session.master, &self.keeper_tty_name_buf),
+        };
+
+        return null;
     }
 };
 

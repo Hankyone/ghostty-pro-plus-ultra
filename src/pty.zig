@@ -106,6 +106,14 @@ const NullPty = struct {
     pub fn getProcessInfo(_: *Pty, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
         return null;
     }
+
+    pub fn foregroundPidFd(_: Fd) ?u64 {
+        return null;
+    }
+
+    pub fn ttyNameFd(_: Fd, _: *[std.fs.max_path_bytes:0]u8) ?[:0]const u8 {
+        return null;
+    }
 };
 
 /// Posix PTY creation and management. This is just a thin layer on top
@@ -283,26 +291,57 @@ const PosixPty = struct {
     /// Get information about the process(es) attached to the PTY. Returns
     /// `null` if there was an error getting the information or the information
     /// is not available on a particular platform.
-    pub fn getProcessInfo(self: *PosixPty, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
-        return switch (info) {
-            .foreground_pid => {
-                switch (builtin.os.tag) {
-                    .linux => {
-                        const linux = std.os.linux;
-                        var pgrp: i32 = undefined;
-                        const rc = linux.tcgetpgrp(self.master, &pgrp);
-                        switch (rc) {
-                            0 => return @intCast(pgrp), // SUCCESS
-                            else => return null, // Anything else
-                        }
-                    },
-                    else => {
-                        const rc = c.tcgetpgrp(self.master);
-                        if (rc < 0) return null;
-                        return @intCast(rc);
+    /// Which process group currently owns the terminal.
+    ///
+    /// Split out from `getProcessInfo` so a borrowed master fd can answer it
+    /// too. Keeper mode has no `Pty` of its own, and this is the question that
+    /// tells us what is actually running in a tab.
+    pub fn foregroundPidFd(fd: Fd) ?u64 {
+        switch (builtin.os.tag) {
+            .linux => {
+                const linux = std.os.linux;
+                var pgrp: i32 = undefined;
+                return switch (linux.tcgetpgrp(fd, &pgrp)) {
+                    0 => @intCast(pgrp),
+                    else => null,
+                };
+            },
+            else => {
+                const rc = c.tcgetpgrp(fd);
+                if (rc < 0) return null;
+                return @intCast(rc);
+            },
+        }
+    }
+
+    /// The name of the slave side, written into `buf` and returned as a slice
+    /// of it. Same reason as above: usable from a borrowed master.
+    pub fn ttyNameFd(fd: Fd, buf: *[std.fs.max_path_bytes:0]u8) ?[:0]const u8 {
+        switch (builtin.os.tag) {
+            .macos => {
+                // The macOS TIOCPTYGNAME ioctl does not allow us to specify
+                // the length of the buffer passed to it, but expects it to be
+                // at least 128 bytes long.
+                assert(buf.len >= 128);
+                switch (posix.errno(c.ioctl(fd, c.TIOCPTYGNAME, @intFromPtr(buf)))) {
+                    .SUCCESS => return std.mem.sliceTo(buf, 0),
+                    else => |err| {
+                        log.err("error getting name of slave PTY errno={t}", .{err});
+                        return null;
                     },
                 }
             },
+            .linux => {
+                if (c.ptsname_r(fd, buf, buf.len) != 0) return null;
+                return std.mem.sliceTo(buf, 0);
+            },
+            else => return null,
+        }
+    }
+
+    pub fn getProcessInfo(self: *PosixPty, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+        return switch (info) {
+            .foreground_pid => foregroundPidFd(self.master),
             .tty_name => {
                 if (self.tty_name) |tty_name| return tty_name;
 
@@ -510,6 +549,15 @@ const WindowsPty = struct {
     /// `null` if there was an error getting the information or the information
     /// is not available on a particular platform.
     pub fn getProcessInfo(_: *WindowsPty, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+        return null;
+    }
+
+    /// Keeper mode is POSIX-only, so nothing calls these on Windows.
+    pub fn foregroundPidFd(_: Fd) ?u64 {
+        return null;
+    }
+
+    pub fn ttyNameFd(_: Fd, _: *[std.fs.max_path_bytes:0]u8) ?[:0]const u8 {
         return null;
     }
 };
