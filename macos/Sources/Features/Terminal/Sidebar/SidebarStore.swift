@@ -371,7 +371,12 @@ final class SidebarStore {
             // Determine whether this tab has an unread completion.
             // Scope to the current agent via the mutually-exclusive session key.
             let agent = AgentType.detect(from: entries)
-            let doneToken = agent.flatMap { a in entries.first(where: { $0.key == a.doneAtKey })?.value }
+            // The transcript names the turn it just finished, which is a
+            // better completion marker than the hook's: it can't be missed,
+            // and it exists for agents that never had a hook at all. Fall
+            // back to the hook for the agents we can't read.
+            let doneToken = sid.flatMap { watcher.completionToken[$0] }
+                ?? agent.flatMap { a in entries.first(where: { $0.key == a.doneAtKey })?.value }
             var unread = false
             if let sid, let token = doneToken {
                 if w == selectedWindow {

@@ -42,9 +42,82 @@ enum AgentShimInstaller {
                       to: dir.appendingPathComponent("claude-settings.json"), executable: false)
             shimDirectory = dir.path
             logger.info("agent shims installed at \(dir.path)")
+            retireLegacyHooks()
         } catch {
             logger.warning("agent shim install failed: \(error)")
             shimDirectory = nil
+        }
+    }
+
+    // MARK: - Retiring the old install
+
+    /// Take our hooks back out of the user's global Claude settings.
+    ///
+    /// Older versions asked people to install hooks into `~/.claude/settings.json`
+    /// permanently. That has two problems. It fires in every terminal on the
+    /// machine, not just ours, because a hook script has no reliable way to
+    /// tell whose terminal it is running in. And it keeps the shim below
+    /// dormant, since the shim deliberately stands down when it sees ghostty
+    /// hooks already wired up, so the properly scoped path never runs.
+    ///
+    /// Only entries pointing at our own scripts are removed. Everything else
+    /// in the file — other tools' hooks, the status line, settings — is left
+    /// exactly as it was, and the original is kept alongside as a backup.
+    private static func retireLegacyHooks() {
+        let settings = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/settings.json")
+        guard let data = try? Data(contentsOf: settings),
+              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              var hooks = root["hooks"] as? [String: Any] else { return }
+
+        /// Ours are the scripts we shipped into the user's hooks directory.
+        func isOurs(_ command: String) -> Bool {
+            command.contains("/.claude/hooks/ghostty-")
+        }
+
+        var removed = 0
+        for (event, value) in hooks {
+            guard var groups = value as? [[String: Any]] else { continue }
+            for index in groups.indices {
+                guard let entries = groups[index]["hooks"] as? [[String: Any]] else { continue }
+                let kept = entries.filter { !isOurs(($0["command"] as? String) ?? "") }
+                removed += entries.count - kept.count
+                groups[index]["hooks"] = kept
+            }
+            // A group with nothing left in it, and then an event with no
+            // groups left, should go rather than linger as empty scaffolding.
+            groups.removeAll { (($0["hooks"] as? [[String: Any]]) ?? []).isEmpty }
+            if groups.isEmpty {
+                hooks.removeValue(forKey: event)
+            } else {
+                hooks[event] = groups
+            }
+        }
+        guard removed > 0 else { return }
+
+        if hooks.isEmpty {
+            root.removeValue(forKey: "hooks")
+        } else {
+            root["hooks"] = hooks
+        }
+
+        // Keep the original. Rewriting somebody's settings is not the kind of
+        // thing that should be one-way, even when it is right.
+        let backup = settings.deletingLastPathComponent()
+            .appendingPathComponent("settings.json.pre-ghostty-shim")
+        if !FileManager.default.fileExists(atPath: backup.path) {
+            try? data.write(to: backup, options: .atomic)
+        }
+
+        guard let updated = try? JSONSerialization.data(
+            withJSONObject: root,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        ) else { return }
+        do {
+            try updated.write(to: settings, options: .atomic)
+            logger.info("retired \(removed) legacy ghostty hooks from ~/.claude/settings.json")
+        } catch {
+            logger.warning("could not retire legacy hooks: \(error)")
         }
     }
 
@@ -131,24 +204,20 @@ enum AgentShimInstaller {
       SessionStart)
         ipc tab.set-status claude-pid "$PPID"
         ipc tab.set-status claude-session "$session_id"
-        ipc tab.set-status claude-active "done"
         ;;
       UserPromptSubmit)
         prompt=$(echo "$input" | jq -r '.prompt // empty' | tr '\\n' ' ' | head -c 120)
-        ipc tab.set-status claude-active "working"
         [ -n "$prompt" ] && ipc tab.set-status claude "$prompt"
+        # Answering the question is what clears the wait.
+        ipc tab.clear-status claude-active
         ;;
       PreToolUse)
         tool_name=$(echo "$input" | jq -r '.tool_name // empty')
         if [ "$tool_name" = "AskUserQuestion" ] || [ "$tool_name" = "ExitPlanMode" ]; then
           ipc tab.set-status claude-active "needs-input"
         else
-          ipc tab.set-status claude-active "working"
+          ipc tab.clear-status claude-active
         fi
-        ;;
-      Stop|StopFailure)
-        ipc tab.set-status claude-active "done"
-        ipc tab.set-status claude-done-at "$(date +%s)-$$"
         ;;
       SessionEnd)
         ipc tab.clear-status claude
@@ -168,7 +237,6 @@ enum AgentShimInstaller {
             "SessionStart": \(hook),
             "UserPromptSubmit": \(hook),
             "PreToolUse": \(hook),
-            "Stop": \(hook),
             "SessionEnd": \(hook)
           }
         }

@@ -32,6 +32,12 @@ final class AgentTranscriptWatcher: ObservableObject {
 
     @Published private(set) var activity: [UUID: Activity] = [:]
 
+    /// Identifies the turn that most recently finished, so the sidebar can
+    /// tell "finished and you've seen it" from "finished while you were
+    /// elsewhere". It changes once per completed turn and never otherwise,
+    /// which is the whole contract — the value itself means nothing.
+    @Published private(set) var completionToken: [UUID: String] = [:]
+
     /// Only the last slice of a transcript can describe the present, and
     /// transcripts run to megabytes. Read a window instead of a file.
     private nonisolated static let tailWindow = 48 * 1024
@@ -278,15 +284,16 @@ final class AgentTranscriptWatcher: ObservableObject {
         let directory = watcher.directory
 
         ioQueue.async { [weak self] in
-            let derived: Activity?
+            let reading: Reading?
             switch agent {
             case .devin, .cline:
-                derived = directory.flatMap {
-                    AgentSessionDatabase.activity(agent: agent, directory: $0)
-                }
+                reading = directory
+                    .flatMap { AgentSessionDatabase.activity(agent: agent, directory: $0) }
+                    .map { Reading(activity: $0, completedTurn: nil) }
             default:
-                derived = Self.deriveActivity(agent: agent, transcript: url)
+                reading = Self.deriveActivity(agent: agent, transcript: url)
             }
+            let derived = reading?.activity
             Task { @MainActor in
                 guard let self,
                       let watcher = self.watchers[surfaceId],
@@ -294,6 +301,10 @@ final class AgentTranscriptWatcher: ObservableObject {
                 guard let derived else { return }
                 if self.activity[surfaceId] != derived {
                     self.activity[surfaceId] = derived
+                }
+                if let token = reading?.completedTurn,
+                   self.completionToken[surfaceId] != token {
+                    self.completionToken[surfaceId] = token
                 }
             }
         }
@@ -304,10 +315,17 @@ final class AgentTranscriptWatcher: ObservableObject {
     /// Read the last window of a transcript and work out what it says about
     /// the present, scanning from the end so we stop at the first line that
     /// settles the question.
+    /// One reading of a transcript: what the agent is doing, plus an identity
+    /// for the finished turn when the answer is "nothing, it's done".
+    struct Reading {
+        let activity: Activity
+        let completedTurn: String?
+    }
+
     private nonisolated static func deriveActivity(
         agent: SidebarTabManager.AgentType,
         transcript: URL
-    ) -> Activity? {
+    ) -> Reading? {
         guard let handle = try? FileHandle(forReadingFrom: transcript) else { return nil }
         defer { try? handle.close() }
 
@@ -334,20 +352,26 @@ final class AgentTranscriptWatcher: ObservableObject {
     private nonisolated static func interpret(
         agent: SidebarTabManager.AgentType,
         entry: [String: Any]
-    ) -> Activity? {
+    ) -> Reading? {
         switch agent {
         case .claude:
             switch entry["type"] as? String {
             case "assistant":
                 guard let message = entry["message"] as? [String: Any] else { return nil }
+                // Every line carries its own id, which makes a perfectly good
+                // name for the turn it ends.
+                let turn = (entry["uuid"] as? String)
+                    ?? (entry["timestamp"] as? String)
                 let blocks = (message["content"] as? [[String: Any]]) ?? []
                 // The last block is what the agent is on right now.
                 for block in blocks.reversed() {
                     switch block["type"] as? String {
                     case "tool_use":
-                        return .tool((block["name"] as? String) ?? "tool")
+                        return .init(
+                            activity: .tool((block["name"] as? String) ?? "tool"),
+                            completedTurn: nil)
                     case "thinking":
-                        return .thinking
+                        return .init(activity: .thinking, completedTurn: nil)
                     default:
                         continue
                     }
@@ -355,14 +379,14 @@ final class AgentTranscriptWatcher: ObservableObject {
                 // Plain prose. Whether the turn is over is the stop reason's
                 // to say: anything other than a hand-off to a tool ends it.
                 if let stop = message["stop_reason"] as? String, stop != "tool_use" {
-                    return .idle
+                    return .init(activity: .idle, completedTurn: turn)
                 }
-                return .working
+                return .init(activity: .working, completedTurn: nil)
 
             case "user":
                 // Either a fresh prompt or a tool result coming back. Both
                 // mean the agent has the ball.
-                return .working
+                return .init(activity: .working, completedTurn: nil)
 
             default:
                 // Our own bookkeeping lines and attachments say nothing.
@@ -375,15 +399,20 @@ final class AgentTranscriptWatcher: ObservableObject {
                   let kind = payload["type"] as? String else { return nil }
             switch kind {
             case "task_complete", "turn_aborted":
-                return .idle
+                // Codex names the turn itself, which is exactly the identity
+                // we want for "has the user seen this finish".
+                return .init(
+                    activity: .idle,
+                    completedTurn: (payload["turn_id"] as? String)
+                        ?? (entry["timestamp"] as? String))
             case "agent_reasoning":
-                return .thinking
+                return .init(activity: .thinking, completedTurn: nil)
             case "mcp_tool_call_begin", "exec_command_begin", "web_search_begin":
-                return .tool(toolName(from: payload))
+                return .init(activity: .tool(toolName(from: payload)), completedTurn: nil)
             case "task_started", "user_message", "agent_message",
                  "mcp_tool_call_end", "exec_command_end", "patch_apply_begin",
                  "patch_apply_end", "web_search_end":
-                return .working
+                return .init(activity: .working, completedTurn: nil)
             default:
                 // Token counts and settings churn constantly and mean nothing.
                 return nil
