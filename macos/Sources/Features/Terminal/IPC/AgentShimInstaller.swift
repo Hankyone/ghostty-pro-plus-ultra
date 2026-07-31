@@ -228,8 +228,14 @@ enum AgentShimInstaller {
     """
 
     private static func claudeSettingsJSON(hookScript: String) -> String {
+        // The command is a shell string, and our own path contains a space
+        // ("Application Support"), so it has to be quoted or bash reads it as
+        // two arguments and runs "/Users/…/Library/Application". Single quotes
+        // need no JSON escaping; a literal one inside the path is closed,
+        // escaped and reopened the POSIX way.
+        let quoted = "'" + hookScript.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let hook = """
-        [{"hooks": [{"type": "command", "command": "bash \(hookScript)"}]}]
+        [{"hooks": [{"type": "command", "command": "bash \(quoted)"}]}]
         """
         return """
         {
