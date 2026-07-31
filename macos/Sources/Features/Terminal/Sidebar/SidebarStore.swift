@@ -393,7 +393,7 @@ final class SidebarStore {
                 let session = entries.first(where: { $0.key == agent.sessionKey })?.value ?? ""
                 // Devin and Cline never report a session id, so they are found
                 // by working directory instead and need no id to start.
-                let joinsOnDirectory = (agent == .devin || agent == .cline)
+                let joinsOnDirectory = (agent == .devin || agent == .cline || agent == .opencode)
                 if !session.isEmpty || joinsOnDirectory {
                     transcriptSubjects.append(.init(
                         surfaceId: sid,
@@ -473,6 +473,9 @@ final class SidebarStore {
         // the screen stop agreeing. Waiting for approval still comes from the
         // hook below, since a transcript records decisions, not the asking.
         switch activity {
+        case .needsInput:
+            // Grok records the asking, so this needs no hook.
+            return .needsInput
         case .thinking, .tool, .working:
             return .working
         case .idle:

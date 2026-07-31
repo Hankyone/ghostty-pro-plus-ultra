@@ -455,6 +455,7 @@ private struct ThreadRow: View {
         case .thinking: return "Thinking"
         case .tool(let name): return "Running \(name)"
         case .working: return "Working"
+        case .needsInput: return "Waiting for you"
         case .idle: return ""
         }
     }
@@ -1390,6 +1391,10 @@ struct ActivityMark: View {
             RoundedRectangle(cornerRadius: 1, style: .continuous)
                 .fill(Color.accentColor)
                 .frame(width: 5, height: 5)
+        case .needsInput:
+            // Same orange pulse the hook-driven path uses, so "you're needed"
+            // looks identical no matter which agent noticed it.
+            PulsingDot(color: .orange, size: 6)
         case .working, .idle:
             Circle().fill(Color.accentColor).frame(width: 5, height: 5)
         }

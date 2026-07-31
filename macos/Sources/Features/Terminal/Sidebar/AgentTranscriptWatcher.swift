@@ -26,6 +26,10 @@ final class AgentTranscriptWatcher: ObservableObject {
         case tool(String)
         /// Mid-turn, nothing more specific to say.
         case working
+        /// Stopped, holding, waiting for the user to approve something.
+        /// Only the agents that record the asking can report this; for the
+        /// rest it still comes from a hook.
+        case needsInput
         /// The turn ended. The agent is waiting on the user.
         case idle
     }
@@ -212,7 +216,25 @@ final class AgentTranscriptWatcher: ObservableObject {
             }
             return nil
 
-        case .devin, .cline:
+        case .grok:
+            // ~/.grok/sessions/<url-encoded cwd>/<session>/events.jsonl. The
+            // directory is keyed by working directory, but the session id is
+            // unique, so search for it rather than reproduce the encoding.
+            let sessions = home.appendingPathComponent(".grok/sessions", isDirectory: true)
+            guard let dirs = try? fm.contentsOfDirectory(
+                at: sessions,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else { return nil }
+            for dir in dirs {
+                let candidate = dir
+                    .appendingPathComponent(sessionId, isDirectory: true)
+                    .appendingPathComponent("events.jsonl")
+                if fm.fileExists(atPath: candidate.path) { return candidate }
+            }
+            return nil
+
+        case .devin, .cline, .opencode:
             // These keep the conversation in a database rather than a log.
             // Watch its write-ahead journal, which is what actually moves
             // during a session, and fall back to the database file itself
@@ -286,7 +308,7 @@ final class AgentTranscriptWatcher: ObservableObject {
         ioQueue.async { [weak self] in
             let reading: Reading?
             switch agent {
-            case .devin, .cline:
+            case .devin, .cline, .opencode:
                 reading = directory
                     .flatMap { AgentSessionDatabase.activity(agent: agent, directory: $0) }
                     .map { Reading(activity: $0, completedTurn: nil) }
@@ -415,6 +437,41 @@ final class AgentTranscriptWatcher: ObservableObject {
                 return .init(activity: .working, completedTurn: nil)
             default:
                 // Token counts and settings churn constantly and mean nothing.
+                return nil
+            }
+
+        case .grok:
+            // Grok keeps the most explicit log of any of them. It names the
+            // phase it is in, and it records the asking as well as the answer,
+            // so it is the one agent where waiting-for-approval needs no hook.
+            switch entry["type"] as? String {
+            case "turn_ended":
+                return .init(
+                    activity: .idle,
+                    completedTurn: entry["ts"] as? String)
+            case "permission_requested":
+                return .init(activity: .needsInput, completedTurn: nil)
+            case "permission_resolved", "turn_started", "loop_started", "first_token":
+                return .init(activity: .working, completedTurn: nil)
+            case "tool_started":
+                return .init(
+                    activity: .tool((entry["tool_name"] as? String) ?? "tool"),
+                    completedTurn: nil)
+            case "phase_changed":
+                switch entry["phase"] as? String {
+                case "streaming_reasoning":
+                    return .init(activity: .thinking, completedTurn: nil)
+                case "permission_prompt":
+                    return .init(activity: .needsInput, completedTurn: nil)
+                case "tool_execution":
+                    return .init(activity: .tool("tool"), completedTurn: nil)
+                case "streaming_text", "waiting_for_model":
+                    return .init(activity: .working, completedTurn: nil)
+                default:
+                    return nil
+                }
+            default:
+                // Its MCP plumbing chatters constantly and means nothing here.
                 return nil
             }
 

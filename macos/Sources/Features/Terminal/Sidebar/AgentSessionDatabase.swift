@@ -36,6 +36,9 @@ enum AgentSessionDatabase {
         case .cline:
             return Location(database: home.appendingPathComponent(
                 ".cline/data/db/sessions.db"))
+        case .opencode:
+            return Location(database: home.appendingPathComponent(
+                ".local/share/opencode/opencode.db"))
         default:
             return nil
         }
@@ -62,9 +65,38 @@ enum AgentSessionDatabase {
             return devinActivity(handle, directory: directory)
         case .cline:
             return clineActivity(handle, directory: directory)
+        case .opencode:
+            return opencodeActivity(handle, directory: directory)
         default:
             return nil
         }
+    }
+
+    /// OpenCode stamps a message with a completion time only once the turn
+    /// behind it is finished, so the newest message answers the question by
+    /// itself: stamped means done, unstamped means still going.
+    private static func opencodeActivity(
+        _ handle: OpaquePointer,
+        directory: String
+    ) -> AgentTranscriptWatcher.Activity? {
+        guard let payload = string(
+            handle,
+            """
+            SELECT m.data FROM message m
+            JOIN session s ON s.id = m.session_id
+            WHERE s.directory = ?1
+            ORDER BY m.time_created DESC LIMIT 1
+            """,
+            directory
+        ) else { return nil }
+
+        guard let data = payload.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+
+        guard (object["role"] as? String) == "assistant" else { return .working }
+        let time = object["time"] as? [String: Any]
+        return time?["completed"] == nil ? .working : .idle
     }
 
     // MARK: - Per agent
