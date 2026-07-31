@@ -232,6 +232,9 @@ final class SidebarStore {
         if now.timeIntervalSince(lastPidSweepTime) >= Self.pidSweepInterval {
             lastPidSweepTime = now
             metadataStore.sweepStaleSessions()
+            // Same reasoning for what we learned by looking at processes: a
+            // pid the system has reused must not still answer as an agent.
+            AgentProcessDetector.forgetDeadProcesses()
         }
 
         // Group managers by tab group so each group is built exactly once.
@@ -370,7 +373,13 @@ final class SidebarStore {
 
             // Determine whether this tab has an unread completion.
             // Scope to the current agent via the mutually-exclusive session key.
+            // What the agent told us, or failing that what is actually
+            // running. Only Claude ever reports itself, so without the second
+            // half every other agent goes unrecognised and every reader built
+            // on knowing which agent it is sits idle no matter how good it is.
             let agent = AgentType.detect(from: entries)
+                ?? surface?.surfaceModel?.foregroundPID
+                    .flatMap { AgentProcessDetector.agent(forProcess: pid_t($0)) }
             // The transcript names the turn it just finished, which is a
             // better completion marker than the hook's: it can't be missed,
             // and it exists for agents that never had a hook at all. Fall
@@ -505,7 +514,14 @@ final class SidebarStore {
             where: { $0.key == "process-running" && $0.value == "true" })
 
         // Tier 2: quiescence classifier for hook-less foreground processes.
-        if processRunning, let sid = surface?.id,
+        //
+        // Skipped for agents whose own record we can read. A freshly started
+        // agent has written nothing yet, and the classifier reads that empty
+        // prompt as "waiting for you" and pulses orange within seconds of
+        // launch. Orange means this tab needs you; an agent nobody has asked
+        // anything yet does not.
+        if processRunning, !(agent?.hasDirectStatus ?? false),
+           let sid = surface?.id,
            let verdict = classifierVerdicts[sid] {
             switch verdict {
             case .needsInput: return .needsInput

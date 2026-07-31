@@ -467,6 +467,20 @@ class SidebarTabManager: ObservableObject {
         /// indicates the tab is running this agent.
         var sessionKey: String { "\(rawValue)-session" }
 
+        /// Whether this agent's own record of the conversation is readable.
+        ///
+        /// For these, silence is information: it means the agent has not
+        /// started a turn yet, not that we are in the dark. Guessing a state
+        /// from the shape of the screen on top of that is how a freshly
+        /// opened agent sitting at its own prompt ends up demanding
+        /// attention it does not want.
+        var hasDirectStatus: Bool {
+            switch self {
+            case .claude, .codex, .grok, .opencode, .devin, .cline: return true
+            case .cursor, .antigravity: return false
+            }
+        }
+
         /// The active status key (e.g. "claude-active"). Values: "working", "done", "needs-input".
         var activeKey: String { "\(rawValue)-active" }
 

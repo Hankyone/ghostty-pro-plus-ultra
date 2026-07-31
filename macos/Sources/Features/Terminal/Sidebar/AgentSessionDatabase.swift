@@ -147,27 +147,41 @@ enum AgentSessionDatabase {
         return role == "assistant" ? .idle : .working
     }
 
-    /// Cline is the simplest of all of them: it keeps a status column, so
-    /// there is nothing to infer. We only translate its vocabulary into ours.
+    /// Cline keeps a status column, but its vocabulary is its own and it can
+    /// grow, so the end time leads and the status only refines it.
+    ///
+    /// Matching on status strings alone was a mistake: an unrecognised one
+    /// returned nothing, the sidebar fell through to guessing from the shape
+    /// of the screen, and the guess was "waiting for you". A live session
+    /// turned orange seconds after starting. Whether a session has ended is
+    /// not a matter of vocabulary, so that is what decides now.
     private static func clineActivity(
         _ handle: OpaquePointer,
         directory: String
     ) -> AgentTranscriptWatcher.Activity? {
-        guard let status = string(
+        guard let row = row(
             handle,
             """
-            SELECT status FROM sessions
+            SELECT COALESCE(ended_at, ''), status, COALESCE(pid, 0) FROM sessions
             WHERE cwd = ?1
             ORDER BY started_at DESC LIMIT 1
             """,
-            directory
+            directory,
+            columns: 3
         ) else { return nil }
 
-        switch status {
-        case "running", "busy", "working": return .working
-        case "idle", "completed", "failed", "stopped": return .idle
-        default: return nil
+        // An end time means the session is over, whatever it was called.
+        if !row[0].isEmpty { return .idle }
+
+        // No end time and no process is a row left behind by a crash. Say
+        // nothing rather than report a dead session as busy forever.
+        if let pid = Int32(row[2]), pid > 0, kill(pid, 0) == -1, errno == ESRCH {
+            return nil
         }
+
+        // Running. "idle" is Cline's word for between turns, which is our
+        // idle too; everything else it reports while alive means working.
+        return row[1] == "idle" ? .idle : .working
     }
 
     private static func devinToolTitle(_ json: String) -> String {
@@ -194,6 +208,27 @@ enum AgentSessionDatabase {
         // a background read on an agent that is mid-write.
         sqlite3_busy_timeout(handle, 50)
         return handle
+    }
+
+    /// Run a one-parameter query and return the first row as strings.
+    private static func row(
+        _ handle: OpaquePointer,
+        _ sql: String,
+        _ parameter: String,
+        columns: Int32
+    ) -> [String]? {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(statement) }
+
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(statement, 1, parameter, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+
+        return (0..<columns).map { index in
+            guard let raw = sqlite3_column_text(statement, index) else { return "" }
+            return String(cString: raw)
+        }
     }
 
     /// Run a one-parameter query and return the first column of the first row.
