@@ -351,7 +351,12 @@ final class SidebarStore {
         metadataStore: TabMetadataStore,
         now: Date
     ) -> [TabItem] {
-        tabWindows.map { w -> TabItem in
+        // Sessions worth following a transcript for, gathered as we go and
+        // handed to the watcher once the pass is done.
+        var transcriptSubjects: [AgentTranscriptWatcher.Subject] = []
+        let watcher = AgentTranscriptWatcher.shared
+
+        let items = tabWindows.map { w -> TabItem in
             let controller = w.windowController as? BaseTerminalController
             let surface = controller?.focusedSurface
             let wid = ObjectIdentifier(w)
@@ -377,9 +382,23 @@ final class SidebarStore {
                 }
             }
 
+            // A transcript is only findable once the agent has told us which
+            // session it is running, which the session key already carries.
+            if let sid, let agent,
+               let session = entries.first(where: { $0.key == agent.sessionKey })?.value,
+               !session.isEmpty {
+                transcriptSubjects.append(.init(
+                    surfaceId: sid,
+                    agent: agent,
+                    sessionId: session
+                ))
+            }
+            let activity = sid.flatMap { watcher.activity[$0] }
+
             let indicator = computeIndicator(
                 entries: entries,
                 agent: agent,
+                activity: activity,
                 unread: unread,
                 surface: surface,
                 isSelected: w == selectedWindow,
@@ -402,9 +421,13 @@ final class SidebarStore {
                 projectRoot: projectRoot,
                 lastActivity: lastActivityTime[wid],
                 createdAt: tabCreationTime[wid],
-                indicator: indicator
+                indicator: indicator,
+                activity: activity
             )
         }
+
+        watcher.sync(subjects: transcriptSubjects)
+        return items
     }
 
     // MARK: - Status Indicator
@@ -428,11 +451,33 @@ final class SidebarStore {
     private func computeIndicator(
         entries: [TabMetadataStore.StatusEntry],
         agent: AgentType?,
+        activity: AgentTranscriptWatcher.Activity?,
         unread: Bool,
         surface: Ghostty.SurfaceView?,
         isSelected: Bool,
         metadataStore: TabMetadataStore
     ) -> TabIndicator {
+        // Tier 0: the agent's own transcript. This outranks hooks because it
+        // is the conversation rather than a report about it — a hook can be
+        // missed, and a missed "done" is exactly the case where the dot and
+        // the screen stop agreeing. Waiting for approval still comes from the
+        // hook below, since a transcript records decisions, not the asking.
+        switch activity {
+        case .thinking, .tool, .working:
+            return .working
+        case .idle:
+            // The turn is genuinely over, so the only question left is
+            // whether the user has seen it.
+            if let agent, entries.contains(
+                where: { $0.key == agent.activeKey && $0.value == "needs-input" }
+            ) {
+                return .needsInput
+            }
+            return unread ? .doneUnseen : .none
+        case nil:
+            break
+        }
+
         // Tier 1: agent hook state is authoritative when present.
         if let agent, let active = entries.first(where: { $0.key == agent.activeKey }) {
             switch active.value {

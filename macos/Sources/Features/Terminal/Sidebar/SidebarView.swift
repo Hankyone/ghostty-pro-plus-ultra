@@ -448,6 +448,17 @@ private struct ThreadRow: View {
         !isSelected && tab.notificationText != nil
     }
 
+    /// Hover text for the activity mark. The tool name is the useful part —
+    /// it is the difference between "busy" and "running your test suite".
+    private func activityDescription(_ activity: AgentTranscriptWatcher.Activity) -> String {
+        switch activity {
+        case .thinking: return "Thinking"
+        case .tool(let name): return "Running \(name)"
+        case .working: return "Working"
+        case .idle: return ""
+        }
+    }
+
     var body: some View {
         let titleColor = isSelected || isHovered ? theme.foreground : theme.secondaryText
         // Tab color tint — subtle background wash instead of a left bar
@@ -471,6 +482,13 @@ private struct ThreadRow: View {
             } else if tab.needsAttention && !isSelected {
                 // Bell / desktop notification / IPC notify.
                 PulsingDot(color: theme.attentionColor, size: 6).padding(.trailing, 6)
+            } else if let activity = tab.activity, activity != .idle {
+                // The transcript knows more than the dot does, so let it say
+                // so: reasoning, running a tool, or simply mid-turn.
+                ActivityMark(activity: activity)
+                    .frame(width: 7, height: 7)
+                    .padding(.trailing, 6)
+                    .help(activityDescription(activity))
             } else {
                 switch tab.indicator {
                 case .doneUnseen:
@@ -1344,10 +1362,37 @@ private struct SidebarClickOverlay: NSViewRepresentable {
 struct PulsingDot: View {
     let color: Color
     var size: CGFloat = 8
+    /// Draw the ring only. A filled dot says "here"; an open one says the
+    /// agent is turning something over and hasn't acted yet.
+    var hollow: Bool = false
 
     var body: some View {
-        PulsingDotLayer(color: color)
+        PulsingDotLayer(color: color, hollow: hollow)
             .frame(width: size, height: size)
+    }
+}
+
+/// The leading mark for a tab whose agent is mid-turn.
+///
+/// It stays inside the vocabulary the sidebar already uses — a small mark in
+/// the same 6pt slot — and varies its form rather than reaching for an icon
+/// set, so a row never changes width and the three states read as one family.
+struct ActivityMark: View {
+    let activity: AgentTranscriptWatcher.Activity
+
+    var body: some View {
+        switch activity {
+        case .thinking:
+            // Open and breathing: considering, not yet doing.
+            PulsingDot(color: .accentColor, size: 7, hollow: true)
+        case .tool:
+            // Square and still: acting on something definite.
+            RoundedRectangle(cornerRadius: 1, style: .continuous)
+                .fill(Color.accentColor)
+                .frame(width: 5, height: 5)
+        case .working, .idle:
+            Circle().fill(Color.accentColor).frame(width: 5, height: 5)
+        }
     }
 }
 
@@ -1355,9 +1400,10 @@ struct PulsingDot: View {
 /// Core Animation. See `PulsingDot` for why this is not a SwiftUI animation.
 private struct PulsingDotLayer: NSViewRepresentable {
     let color: Color
+    var hollow: Bool = false
 
     func makeNSView(context: Context) -> PulsingDotNSView {
-        PulsingDotNSView(color: NSColor(color))
+        PulsingDotNSView(color: NSColor(color), hollow: hollow)
     }
 
     func updateNSView(_ nsView: PulsingDotNSView, context: Context) {
@@ -1365,10 +1411,19 @@ private struct PulsingDotLayer: NSViewRepresentable {
     }
 
     final class PulsingDotNSView: NSView {
-        init(color: NSColor) {
+        private let hollow: Bool
+
+        init(color: NSColor, hollow: Bool = false) {
+            self.hollow = hollow
             super.init(frame: .zero)
             wantsLayer = true
-            layer?.backgroundColor = color.cgColor
+            if hollow {
+                layer?.backgroundColor = NSColor.clear.cgColor
+                layer?.borderColor = color.cgColor
+                layer?.borderWidth = 1.5
+            } else {
+                layer?.backgroundColor = color.cgColor
+            }
 
             let pulse = CABasicAnimation(keyPath: "opacity")
             pulse.fromValue = 1.0
@@ -1389,7 +1444,11 @@ private struct PulsingDotLayer: NSViewRepresentable {
         }
 
         func updateColor(_ color: NSColor) {
-            layer?.backgroundColor = color.cgColor
+            if hollow {
+                layer?.borderColor = color.cgColor
+            } else {
+                layer?.backgroundColor = color.cgColor
+            }
         }
     }
 }

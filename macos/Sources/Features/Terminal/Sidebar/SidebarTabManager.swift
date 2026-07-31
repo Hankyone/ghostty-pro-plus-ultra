@@ -60,6 +60,10 @@ class SidebarTabManager: ObservableObject {
         /// What the status dot should show. Computed by the store from
         /// hooks, OSC signals, and the screen-quiescence classifier.
         var indicator: TabIndicator = .none
+        /// What the agent's own transcript says it is doing, when we can read
+        /// one. Finer-grained than the dot: it names the tool and knows the
+        /// difference between reasoning and acting.
+        var activity: AgentTranscriptWatcher.Activity?
 
         /// The last path component of the pwd, for compact display.
         var directoryName: String? {
@@ -109,6 +113,7 @@ class SidebarTabManager: ObservableObject {
                 && lhs.projectRoot == rhs.projectRoot
                 && lhs.lastActivity == rhs.lastActivity
                 && lhs.indicator == rhs.indicator
+                && lhs.activity == rhs.activity
         }
     }
 
