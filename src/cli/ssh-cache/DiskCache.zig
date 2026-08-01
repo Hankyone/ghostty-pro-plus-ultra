@@ -393,6 +393,16 @@ fn readEntries(
     return entries;
 }
 
+/// Whether an error from a cache operation reflects a problem with the cache
+/// itself. A destination we can't key on and a lock held by another process
+/// both leave the cache healthy, so neither is worth reporting.
+pub fn isFailure(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidCacheKey, error.CacheLocked => false,
+        else => true,
+    };
+}
+
 // Supports both standalone hostnames and user@hostname format
 pub fn isValidCacheKey(key: []const u8) bool {
     if (key.len == 0) return false;
@@ -702,6 +712,15 @@ test "disk cache add survives allocation failure" {
             try testing.expectEqual(error.OutOfMemory, err);
         }
     }
+}
+
+test isFailure {
+    const testing = std.testing;
+
+    try testing.expect(!isFailure(error.InvalidCacheKey));
+    try testing.expect(!isFailure(error.CacheLocked));
+    try testing.expect(isFailure(error.AccessDenied));
+    try testing.expect(isFailure(error.IsDir));
 }
 
 test isValidHost {

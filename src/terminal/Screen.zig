@@ -8,6 +8,7 @@ const ansi = @import("ansi.zig");
 const charsets = @import("charsets.zig");
 const fastmem = @import("../fastmem.zig");
 const kitty = @import("kitty.zig");
+const lib = @import("lib.zig");
 const sgr = @import("sgr.zig");
 const tripwire = @import("../tripwire.zig");
 const unicode = @import("../unicode/main.zig");
@@ -114,7 +115,12 @@ pub const SemanticPrompt = struct {
         .click = .none,
     };
 
-    pub const SemanticClick = union(enum) {
+    pub const SemanticClickKind = lib.Enum(
+        lib.target,
+        &.{ "none", "click_events", "cl" },
+    );
+
+    pub const SemanticClick = union(SemanticClickKind) {
         none,
         click_events: osc.semantic_prompt.ClickEvents,
         cl: osc.semantic_prompt.Click,
