@@ -7,7 +7,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: com.mitchellh.ghostty\n"
 "Report-Msgid-Bugs-To: m@mitchellh.com\n"
-"POT-Creation-Date: 2026-07-26 04:59+0200\n"
+"POT-Creation-Date: 2026-07-30 18:07+0200\n"
 "PO-Revision-Date: 2026-02-18 13:14+0100\n"
 "Last-Translator: Volodymyr Chernetskyi "
 "<19735328+chernetskyi@users.noreply.github.com>\n"
@@ -50,6 +50,7 @@ msgstr "Перезавантажте налаштування, щоб показ
 
 #: src/apprt/gtk/ui/1.2/close-confirmation-dialog.blp:7
 #: src/apprt/gtk/ui/1.5/title-dialog.blp:8
+#: src/apprt/gtk/class/application.zig:2031
 msgid "Cancel"
 msgstr "Скасувати"
 
@@ -242,7 +243,7 @@ msgstr "Палітра команд"
 msgid "Terminal Inspector"
 msgstr "Інспектор терміналу"
 
-#: src/apprt/gtk/ui/1.5/window.blp:307 src/apprt/gtk/class/window.zig:1866
+#: src/apprt/gtk/ui/1.5/window.blp:307 src/apprt/gtk/class/window.zig:1888
 msgid "About Ghostty"
 msgstr "Про Ghostty"
 
@@ -254,16 +255,24 @@ msgstr "Завершити"
 msgid "Execute a command…"
 msgstr "Виконати команду…"
 
-#: src/apprt/gtk/class/application.zig:1708
+#: src/apprt/gtk/class/application.zig:1713
 msgid "The keybind was revoked by the system."
 msgstr ""
 
-#: src/apprt/gtk/class/application.zig:1710
+#: src/apprt/gtk/class/application.zig:1715
 msgid "The keybind was denied by the system."
 msgstr ""
 
-#: src/apprt/gtk/class/application.zig:1721
+#: src/apprt/gtk/class/application.zig:1726
 msgid "Global keybind unavailable"
+msgstr ""
+
+#: src/apprt/gtk/class/application.zig:2027
+msgid "Export Terminal IO Events"
+msgstr ""
+
+#: src/apprt/gtk/class/application.zig:2030
+msgid "Export"
 msgstr ""
 
 #: src/apprt/gtk/class/clipboard_confirmation_dialog.zig:198
@@ -358,14 +367,14 @@ msgstr "Змінити заголовок вкладки"
 msgid "Reloaded the configuration"
 msgstr "Налаштування перезавантажено"
 
-#: src/apprt/gtk/class/window.zig:1705
+#: src/apprt/gtk/class/window.zig:1727
 msgid "Copied to clipboard"
 msgstr "Скопійовано до буферa обміну"
 
-#: src/apprt/gtk/class/window.zig:1707
+#: src/apprt/gtk/class/window.zig:1729
 msgid "Cleared clipboard"
 msgstr "Буфер обміну очищено"
 
-#: src/apprt/gtk/class/window.zig:1847
+#: src/apprt/gtk/class/window.zig:1869
 msgid "Ghostty Developers"
 msgstr "Розробники Ghostty"

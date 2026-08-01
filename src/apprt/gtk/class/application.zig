@@ -703,6 +703,11 @@ pub const Application = extern struct {
             .initial_size => return Action.initialSize(target, value),
 
             .inspector => return Action.controlInspector(target, value),
+            .export_terminal_io => return try Action.exportTerminalIO(
+                self,
+                target,
+                value,
+            ),
 
             .key_sequence => return Action.keySequence(target, value),
             .key_table => return Action.keyTable(target, value),
@@ -1996,6 +2001,98 @@ const Action = struct {
             .surface => |v| v.rt_surface.gobj().copyTitleToClipboard(),
         };
     }
+
+    pub fn exportTerminalIO(
+        self: *Application,
+        target: apprt.Target,
+        value: apprt.Action.Value(.export_terminal_io),
+    ) Allocator.Error!bool {
+        const surface = switch (target) {
+            .app => return false,
+            .surface => |v| v.rt_surface.gobj(),
+        };
+
+        const alloc = self.allocator();
+        const contents = try alloc.dupe(u8, value.contents);
+        errdefer alloc.free(contents);
+        const request = try alloc.create(ExportTerminalIORequest);
+        errdefer alloc.destroy(request);
+        request.* = .{
+            .alloc = alloc,
+            .contents = contents,
+        };
+
+        const parent = ext.getAncestor(gtk.Window, surface.as(gtk.Widget));
+        const dialog = gtk.FileChooserNative.new(
+            i18n._("Export Terminal IO Events"),
+            parent,
+            .save,
+            i18n._("Export"),
+            i18n._("Cancel"),
+        );
+        const chooser = dialog.as(gtk.FileChooser);
+        chooser.setCreateFolders(1);
+        chooser.setCurrentName("ghostty-terminal-io.txt");
+
+        _ = gtk.NativeDialog.signals.response.connect(
+            dialog,
+            *ExportTerminalIORequest,
+            ExportTerminalIORequest.response,
+            request,
+            .{ .destroyData = ExportTerminalIORequest.destroy },
+        );
+        dialog.as(gtk.NativeDialog).show();
+        return true;
+    }
+
+    const ExportTerminalIORequest = struct {
+        alloc: Allocator,
+        contents: []u8,
+
+        fn destroy(self: *ExportTerminalIORequest) callconv(.c) void {
+            self.alloc.free(self.contents);
+            self.alloc.destroy(self);
+        }
+
+        fn response(
+            dialog: *gtk.FileChooserNative,
+            response_id: c_int,
+            self: *ExportTerminalIORequest,
+        ) callconv(.c) void {
+            defer dialog.unref();
+
+            if (response_id != @intFromEnum(gtk.ResponseType.accept)) return;
+
+            const file = dialog.as(gtk.FileChooser).getFile() orelse {
+                log.warn("inspector export dialog returned no file", .{});
+                return;
+            };
+            defer file.unref();
+
+            var gerr: ?*glib.Error = null;
+            const replaced = file.replaceContents(
+                self.contents.ptr,
+                self.contents.len,
+                null,
+                0,
+                .{},
+                null,
+                null,
+                &gerr,
+            );
+            if (gerr) |err| {
+                defer err.free();
+                log.err(
+                    "failed to export terminal IO events err={s}",
+                    .{err.f_message orelse "(unknown)"},
+                );
+                return;
+            }
+            if (replaced == 0) {
+                log.err("failed to export terminal IO events", .{});
+            }
+        }
+    };
 
     pub fn configChange(
         self: *Application,

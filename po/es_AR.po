@@ -7,7 +7,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: com.mitchellh.ghostty\n"
 "Report-Msgid-Bugs-To: m@mitchellh.com\n"
-"POT-Creation-Date: 2026-07-26 04:59+0200\n"
+"POT-Creation-Date: 2026-07-30 18:07+0200\n"
 "PO-Revision-Date: 2026-02-19 13:34-0300\n"
 "Last-Translator: Alan Moyano <alanmoyano203@gmail.com>\n"
 "Language-Team: Argentinian <es@tp.org.es>\n"
@@ -48,6 +48,7 @@ msgstr "Recargar la configuración para volver a mostrar este mensaje"
 
 #: src/apprt/gtk/ui/1.2/close-confirmation-dialog.blp:7
 #: src/apprt/gtk/ui/1.5/title-dialog.blp:8
+#: src/apprt/gtk/class/application.zig:2031
 msgid "Cancel"
 msgstr "Cancelar"
 
@@ -242,7 +243,7 @@ msgstr "Paleta de comandos"
 msgid "Terminal Inspector"
 msgstr "Inspector de la terminal"
 
-#: src/apprt/gtk/ui/1.5/window.blp:307 src/apprt/gtk/class/window.zig:1866
+#: src/apprt/gtk/ui/1.5/window.blp:307 src/apprt/gtk/class/window.zig:1888
 msgid "About Ghostty"
 msgstr "Acerca de Ghostty"
 
@@ -254,16 +255,24 @@ msgstr "Salir"
 msgid "Execute a command…"
 msgstr "Ejecutar un comando…"
 
-#: src/apprt/gtk/class/application.zig:1708
+#: src/apprt/gtk/class/application.zig:1713
 msgid "The keybind was revoked by the system."
 msgstr ""
 
-#: src/apprt/gtk/class/application.zig:1710
+#: src/apprt/gtk/class/application.zig:1715
 msgid "The keybind was denied by the system."
 msgstr ""
 
-#: src/apprt/gtk/class/application.zig:1721
+#: src/apprt/gtk/class/application.zig:1726
 msgid "Global keybind unavailable"
+msgstr ""
+
+#: src/apprt/gtk/class/application.zig:2027
+msgid "Export Terminal IO Events"
+msgstr ""
+
+#: src/apprt/gtk/class/application.zig:2030
+msgid "Export"
 msgstr ""
 
 #: src/apprt/gtk/class/clipboard_confirmation_dialog.zig:198
@@ -358,14 +367,14 @@ msgstr "Cambiar título de la pestaña"
 msgid "Reloaded the configuration"
 msgstr "Configuración recargada"
 
-#: src/apprt/gtk/class/window.zig:1705
+#: src/apprt/gtk/class/window.zig:1727
 msgid "Copied to clipboard"
 msgstr "Copiado al portapapeles"
 
-#: src/apprt/gtk/class/window.zig:1707
+#: src/apprt/gtk/class/window.zig:1729
 msgid "Cleared clipboard"
 msgstr "Portapapeles limpiado"
 
-#: src/apprt/gtk/class/window.zig:1847
+#: src/apprt/gtk/class/window.zig:1869
 msgid "Ghostty Developers"
 msgstr "Desarrolladores de Ghostty"

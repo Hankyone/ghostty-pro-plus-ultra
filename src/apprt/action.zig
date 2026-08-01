@@ -196,6 +196,9 @@ pub const Action = union(Key) {
     /// rendered at the next opportunity.
     render_inspector,
 
+    /// Export the Terminal IO inspector event log.
+    export_terminal_io: ExportTerminalIO,
+
     /// Show a desktop notification.
     desktop_notification: DesktopNotification,
 
@@ -381,6 +384,7 @@ pub const Action = union(Key) {
         inspector,
         show_gtk_inspector,
         render_inspector,
+        export_terminal_io,
         desktop_notification,
         set_title,
         set_tab_title,
@@ -609,6 +613,37 @@ pub const Inspector = enum(c_int) {
 
     test "ghostty.h Inspector" {
         try lib.checkGhosttyHEnum(Inspector, "GHOSTTY_INSPECTOR_");
+    }
+};
+
+/// Terminal IO inspector contents to export. The contents are only valid for
+/// the duration of the action callback.
+pub const ExportTerminalIO = struct {
+    contents: []const u8,
+
+    // Sync with: ghostty_action_export_terminal_io_s
+    pub const C = extern struct {
+        contents: [*]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: ExportTerminalIO) C {
+        return .{
+            .contents = self.contents.ptr,
+            .len = self.contents.len,
+        };
+    }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.Options,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print(
+            "{s}{{ contents: {d} bytes }}",
+            .{ @typeName(@This()), value.contents.len },
+        );
     }
 };
 
