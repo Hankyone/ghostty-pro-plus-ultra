@@ -294,6 +294,11 @@ pub fn detachForShutdown(self: *Exec, renderer_state: *renderer.State) void {
     }
 }
 
+/// Whether a keeper is holding this pane's shell.
+pub fn hasKeeper(self: *Exec) bool {
+    return self.subprocess.keeper_session != null and !self.subprocess.keeper_killed;
+}
+
 pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     assert(td.backend == .exec);
     const exec = &td.backend.exec;

@@ -1479,6 +1479,20 @@ pub const CAPI = struct {
         }
     }
 
+    /// How many panes would actually end if the app quit right now.
+    ///
+    /// Panes held by a keeper survive a quit, so warning about them is
+    /// warning about something that is not going to happen. Panes started
+    /// before `pane-keeper` was turned on have no keeper and do end, which is
+    /// the case the warning exists for.
+    export fn ghostty_app_panes_without_keeper(v: *App) usize {
+        var count: usize = 0;
+        for (v.core_app.surfaces.items) |surface| {
+            if (!surface.core_surface.hasKeeper()) count += 1;
+        }
+        return count;
+    }
+
     /// Whether the pane with this id came back to a shell that never stopped.
     ///
     /// Anything that types into a restored terminal — replaying a last command,

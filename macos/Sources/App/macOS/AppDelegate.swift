@@ -472,6 +472,19 @@ class AppDelegate: NSObject,
         // If our app says we don't need to confirm, we can exit now.
         if !ghostty.needsConfirmQuit { return .terminateNow }
 
+        // Don't ask about terminals that aren't going anywhere. With
+        // persistent terminals on, quitting hands panes to their keepers and
+        // reopening puts them back, so "you have N terminals open, close them
+        // all?" is warning about a loss that cannot happen. Panes started
+        // before the setting was turned on have no keeper and do end, so the
+        // question is only skipped when every one of them is covered.
+        if terminationDetaches,
+           ghostty.config.paneKeeper,
+           let app = ghostty.app,
+           ghostty_app_panes_without_keeper(app) == 0 {
+            return .terminateNow
+        }
+
         return terminate()
     }
 

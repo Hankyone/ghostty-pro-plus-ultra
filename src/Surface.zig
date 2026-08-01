@@ -824,6 +824,18 @@ pub fn detachKeeper(self: *Surface) void {
     }
 }
 
+/// Whether a keeper is holding this pane, so quitting would hand it over
+/// rather than end it.
+///
+/// Panes started before `pane-keeper` was turned on have no keeper and are
+/// not covered, which is exactly the distinction anything warning the user
+/// about losing work needs to make.
+pub fn hasKeeper(self: *Surface) bool {
+    return switch (self.io.backend) {
+        .exec => |*exec| exec.hasKeeper(),
+    };
+}
+
 pub fn deinit(self: *Surface) void {
     // Stop search thread
     if (self.search) |*s| s.deinit();

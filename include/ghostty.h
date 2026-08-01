@@ -1098,6 +1098,7 @@ GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
 /// any of them. Call at the actual point of no return, not when quit is only
 /// proposed.
 GHOSTTY_API void ghostty_app_detach_panes(ghostty_app_t);
+GHOSTTY_API size_t ghostty_app_panes_without_keeper(ghostty_app_t);
 
 /// Whether the pane with this id came back to a shell that never stopped.
 /// Anything that types into a restored terminal must check this first: a
