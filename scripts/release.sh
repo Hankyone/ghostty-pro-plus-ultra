@@ -177,18 +177,43 @@ COMMIT=$(git rev-parse --short HEAD)
 # --- Codesign ---
 echo "==> Codesigning..."
 
-# Sign Sparkle components if present
+# Sign Sparkle components if present.
+#
+# Every one of these needs a secure timestamp, same as the keeper: they are
+# separate bundles that notarization judges on their own terms. And none of
+# them may fail quietly. Xcode leaves them ad-hoc signed, so a swallowed
+# failure here does not leave the previous signature in place, it leaves no
+# real signature at all — and the first sign of it is a rejected notarization
+# a quarter of an hour later, blamed on the wrong thing.
+#
+# The timestamp needs Apple reachable, so this is also where a flaky network
+# shows up. Better it stops here, loudly.
 if [ -d "${APP}/Contents/Frameworks/Sparkle.framework" ]; then
-    /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime \
-        "${APP}/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc" 2>/dev/null || true
-    /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime \
-        "${APP}/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc" 2>/dev/null || true
-    /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime \
-        "${APP}/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" 2>/dev/null || true
-    /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime \
-        "${APP}/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app" 2>/dev/null || true
-    /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime \
-        "${APP}/Contents/Frameworks/Sparkle.framework" 2>/dev/null || true
+    SPARKLE="${APP}/Contents/Frameworks/Sparkle.framework/Versions/B"
+    for component in \
+        "$SPARKLE/XPCServices/Downloader.xpc" \
+        "$SPARKLE/XPCServices/Installer.xpc" \
+        "$SPARKLE/Autoupdate" \
+        "$SPARKLE/Updater.app" \
+        "${APP}/Contents/Frameworks/Sparkle.framework"
+    do
+        [ -e "$component" ] || continue
+        signed=false
+        for attempt in 1 2 3; do
+            if /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime --timestamp \
+                "$component"; then
+                signed=true
+                break
+            fi
+            [ "$attempt" -lt 3 ] && sleep 10
+        done
+        if [ "$signed" = false ]; then
+            echo "Error: could not sign $(basename "$component") in three tries."
+            echo "       A timestamp needs Apple reachable; check the network."
+            echo "       Shipping it unsigned would fail notarization anyway."
+            exit 1
+        fi
+    done
 fi
 
 # Sign the per-pane keeper.
