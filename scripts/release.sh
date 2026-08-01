@@ -53,12 +53,25 @@ fi
 # Notarization happens after the Zig build, the Xcode build, signing and DMG
 # creation — a quarter of an hour in. A missing keychain profile used to fail
 # there, having already pushed main, which is a miserable way to find out.
-if ! xcrun notarytool history --keychain-profile "notarytool-profile" >/dev/null 2>&1; then
-    echo "Error: no usable notarization credential."
+# This asks Apple, so it fails when the network does. Retry before believing
+# it: a flaky connection reporting a missing credential sends you off
+# recreating one that was fine all along.
+notary_ok=false
+for attempt in 1 2 3; do
+    if xcrun notarytool history --keychain-profile "notarytool-profile" >/dev/null 2>&1; then
+        notary_ok=true
+        break
+    fi
+    [ "$attempt" -lt 3 ] && sleep 5
+done
+
+if [ "$notary_ok" = false ]; then
+    echo "Error: could not verify the notarization credential in three tries."
     echo
-    echo "The keychain profile 'notarytool-profile' is missing or invalid, so"
-    echo "notarization would fail after the whole build. Recreate it with an"
-    echo "app-specific password from appleid.apple.com:"
+    echo "Either the network is down or the keychain profile"
+    echo "'notarytool-profile' is missing or invalid. Check the network first —"
+    echo "this check talks to Apple. If the network is fine, recreate the"
+    echo "profile with an app-specific password from appleid.apple.com:"
     echo
     echo "  xcrun notarytool store-credentials notarytool-profile \\"
     echo "      --apple-id ${APPLE_ID} --team-id ${TEAM_ID}"
