@@ -199,18 +199,22 @@ if [ -d "${APP}/Contents/Frameworks/Sparkle.framework" ]; then
     do
         [ -e "$component" ] || continue
         signed=false
-        for attempt in 1 2 3; do
+        for delay in 0 45 120; do
+            [ "$delay" -gt 0 ] && sleep "$delay"
             if /usr/bin/codesign --verbose -f -s "$CERT_NAME" -o runtime --timestamp \
                 "$component"; then
                 signed=true
                 break
             fi
-            [ "$attempt" -lt 3 ] && sleep 10
         done
         if [ "$signed" = false ]; then
-            echo "Error: could not sign $(basename "$component") in three tries."
-            echo "       A timestamp needs Apple reachable; check the network."
-            echo "       Shipping it unsigned would fail notarization anyway."
+            echo "Error: could not sign $(basename "$component")."
+            echo
+            echo "This is almost always Apple's timestamp service throttling,"
+            echo "not a broken credential and not your connection: ordinary"
+            echo "traffic to Apple keeps working while it refuses. Repeated"
+            echo "release attempts are what provoke it. Leave it a few minutes"
+            echo "and run this again."
             exit 1
         fi
     done
