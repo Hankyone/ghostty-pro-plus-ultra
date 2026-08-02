@@ -307,7 +307,10 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .size = opts.size,
         .backend = backend,
         .mailbox = opts.mailbox,
-        .terminal_stream = .initAlloc(alloc, handler),
+        .terminal_stream = .init(.{
+            .allocator = alloc,
+            .handler = handler,
+        }),
         .thread_enter_state = thread_enter_state,
     };
 }
