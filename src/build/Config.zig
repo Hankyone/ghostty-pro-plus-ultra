@@ -73,6 +73,11 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
     // Setup our standard Zig target and optimize options, i.e.
     // `-Doptimize` and `-Dtarget`.
     const optimize = b.standardOptimizeOption(.{});
+    const emit_lib_vt = b.option(
+        bool,
+        "emit-lib-vt",
+        "Set defaults for a libghostty-vt-only build (disables xcframework, macOS app, and docs).",
+    ) orelse false;
     const target = target: {
         var result = b.standardTargetOptions(.{});
 
@@ -100,7 +105,10 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         // If we have no minimum OS version, we set the default based on
         // our tag. Not all tags have a minimum so this may be null.
         if (result.query.os_version_min == null) {
-            result.query.os_version_min = osVersionMin(result.result.os.tag);
+            result.query.os_version_min = if (emit_lib_vt)
+                osVersionMinLibVt(result.result.os.tag)
+            else
+                osVersionMin(result.result.os.tag);
         }
 
         break :target result;
@@ -368,11 +376,7 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
     //---------------------------------------------------------------
     // Artifacts to Emit
 
-    config.emit_lib_vt = b.option(
-        bool,
-        "emit-lib-vt",
-        "Set defaults for a libghostty-vt-only build (disables xcframework, macOS app, and docs).",
-    ) orelse false;
+    config.emit_lib_vt = emit_lib_vt;
 
     config.emit_exe = b.option(
         bool,
@@ -696,9 +700,9 @@ pub fn osVersionMin(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
             .patch = 0,
         } },
 
-        // iOS 17 picked arbitrarily
+        // The full Ghostty path compiles metal shaders that require iOS 14.
         .ios => .{ .semver = .{
-            .major = 17,
+            .major = 14,
             .minor = 0,
             .patch = 0,
         } },
@@ -707,6 +711,15 @@ pub fn osVersionMin(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
         // we should add a new case here.
         else => null,
     };
+}
+
+/// Returns the minimum OS version for lib-vt build.
+///
+/// This should only be used for Darwin targets.
+pub fn osVersionMinLibVt(tag: std.Target.Os.Tag) ?std.Target.Query.OsVersion {
+    // lib-vt has no newer deployment target requirement.
+    if (tag == .ios) return .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } };
+    return osVersionMin(tag);
 }
 
 // Returns a ResolvedTarget for a mac with a `target.result.cpu.model.name` of `generic`.
