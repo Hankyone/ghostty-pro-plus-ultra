@@ -457,7 +457,10 @@ fn new_(
         .terminal = t,
         .io_impl = io_impl,
         .tmp_dir_path = undefined, // Only used if temporary directory is set with API calls
-        .stream = .initAlloc(alloc, handler),
+        .stream = Stream.init(.{
+            .allocator = alloc,
+            .handler = handler,
+        }),
     };
 
     return wrapper;

@@ -63,19 +63,19 @@
 //! | hyperlink_count entries   |
 //! +---------------------------+
 //! | Grid                      |
-//! | one record per row        |
+//! | rows and grapheme section |
 //! +---------------------------+
 //!
 //! Style entry     = encoded ID + style record
 //! Hyperlink entry = encoded ID + hyperlink record
-//! Grid            = row 0 ... row (rows - 1)
-//! Row             = row header + cell 0 ... cell (columns - 1)
-//! Cell            = cell header + grapheme suffix codepoints
+//! Grid            = row 0 ... row (rows - 1) + grapheme suffix section
+//! Row             = row header + encoded cells
 //! ```
 //!
 //! Following the header, the payload contains exactly `style_count` style
 //! records and `hyperlink_count` hyperlink records, followed by exactly
-//! `rows` row records. There is no padding between records.
+//! `rows` row records and one grapheme suffix section. There is no padding
+//! between records.
 //!
 //! Each style begins with an ID (`u16`) followed by the typical style
 //! binary representation (in style.zig). The ID is what cells will use
@@ -93,6 +93,7 @@
 //! Rows and cells use the grid encoding documented in `grid.zig`.
 
 const std = @import("std");
+const build_options = @import("terminal_options");
 const Allocator = std.mem.Allocator;
 const test_fixture = @import("fixture.zig");
 const grid = @import("grid.zig");
@@ -119,6 +120,7 @@ const PayloadEncodeError = hyperlink.EncodeError || grid.EncodeError;
 
 const PayloadDecodeError = std.Io.Reader.Error ||
     Header.CapacityError ||
+    grid.DecodeError ||
     error{
         /// The hyperlink kind is not defined by snapshot version 1.
         InvalidKind,
@@ -202,10 +204,17 @@ pub const Decoder = struct {
         return self.header.pageCapacity() catch unreachable;
     }
 
+    /// Largest remaining PAGE payload staged into one contiguous buffer.
+    /// This comfortably covers every payload a standard-capacity page can
+    /// produce while keeping the allocation an untrusted length can force
+    /// far below the record framing's four-byte length limit.
+    const max_staged_payload = 8 * 1024 * 1024;
+
     /// Decode the remaining payload into caller-owned native page storage.
     ///
     /// The destination must be freshly initialized with `capacity`. `alloc`
-    /// is used only for temporary ID remaps and integrity-check storage.
+    /// is used only for temporary staging, ID remaps, and integrity-check
+    /// storage.
     pub fn decode(
         self: *Decoder,
         destination: *TerminalPage,
@@ -219,16 +228,82 @@ pub const Decoder = struct {
             .cols = self.header.columns,
             .rows = self.header.rows,
         };
-        try decodePayloadBody(
-            self.record_reader.payloadReader(),
-            alloc,
-            destination,
-            self.header,
-        );
+
+        // `init` consumed exactly the fixed header from the declared
+        // payload, so this is the byte count of the tables and grid.
+        const remaining = self.record_reader.header.payload_len - Header.len;
+
+        if (remaining <= max_staged_payload) {
+            // Stage the payload with one bulk read. The whole payload
+            // passes through both hashes as one update and the payload
+            // decoders then parse a flat buffer, which keeps per-row work
+            // free of stream adapters. The CRC and exact-length checks in
+            // `finish` are unaffected.
+            const staged = try alloc.alloc(u8, remaining);
+            defer alloc.free(staged);
+            try self.record_reader.payloadReader().readSliceAll(staged);
+
+            var staged_reader: std.Io.Reader = .fixed(staged);
+            try decodePayloadBody(
+                &staged_reader,
+                alloc,
+                destination,
+                self.header,
+            );
+            if (staged_reader.bufferedLen() != 0) {
+                return error.PayloadNotExhausted;
+            }
+        } else {
+            // A payload this large is either hostile or a page far beyond
+            // native capacities. Decode it through the streaming payload
+            // reader so its declared length cannot force an allocation.
+            try decodePayloadBody(
+                self.record_reader.payloadReader(),
+                alloc,
+                destination,
+                self.header,
+            );
+        }
         try self.record_reader.finish();
-        try destination.verifyIntegrity(alloc);
+
+        // The decoder normalizes every semantic value, so a complete decode
+        // upholds native page invariants by construction. Verifying them
+        // again is a defense against decoder bugs and follows the native
+        // page policy: full integrity verification only when slow runtime
+        // safety is enabled.
+        if (comptime build_options.slow_runtime_safety) {
+            try destination.verifyIntegrity(alloc);
+        }
     }
 };
+
+/// Errors possible while discarding one PAGE record without decoding it.
+pub const DiscardError = record.Reader.InitError ||
+    record.Reader.FinishError ||
+    std.Io.Reader.Error ||
+    error{
+        /// The next record is valid but is not a PAGE.
+        UnexpectedRecordTag,
+    };
+
+/// Consume exactly one complete PAGE record, validating its framing and
+/// CRC32C while discarding the payload without structural validation.
+///
+/// The payload bytes still stream through `source`, so an enclosing running
+/// digest (such as the FINISH checkpoint) continues to cover them. This lets
+/// a decoder stay aligned with the record sequence, and keep authenticating
+/// it, while dropping page content it can no longer apply.
+pub fn discard(source: *std.Io.Reader) DiscardError!void {
+    var record_reader: record.Reader = undefined;
+    try record_reader.init(source);
+    if (record_reader.header.tag != .page) {
+        return error.UnexpectedRecordTag;
+    }
+    try record_reader.payloadReader().discardAll(
+        record_reader.header.payload_len,
+    );
+    try record_reader.finish();
+}
 
 /// Encode a PAGE payload directly from a native page.
 fn encodePayload(
@@ -284,15 +359,13 @@ fn decodePayloadBody(
     page.pauseIntegrityChecks(true);
     defer page.pauseIntegrityChecks(false);
 
-    var style_remap = grid.StyleRemap.init(alloc);
-    defer style_remap.deinit();
-    style_remap.ensureTotalCapacity(header.style_count) catch
+    var style_remap = grid.StyleRemap.init(alloc) catch
         return error.OutOfMemory;
+    defer style_remap.deinit(alloc);
 
-    var hyperlink_remap = grid.HyperlinkRemap.init(alloc);
-    defer hyperlink_remap.deinit();
-    hyperlink_remap.ensureTotalCapacity(header.hyperlink_count) catch
+    var hyperlink_remap = grid.HyperlinkRemap.init(alloc) catch
         return error.OutOfMemory;
+    defer hyperlink_remap.deinit(alloc);
 
     // Styles
     for (0..header.style_count) |_| {
@@ -316,10 +389,7 @@ fn decodePayloadBody(
                 valid,
             ) catch 0;
         } else 0;
-        style_remap.putAssumeCapacityNoClobber(
-            native_id,
-            decoded_id,
-        );
+        style_remap.put(native_id, decoded_id);
     }
 
     // Hyperlinks
@@ -338,10 +408,7 @@ fn decodePayloadBody(
 
         // Zero records an ignored table entry. Grid decoding treats every
         // reference to it as no hyperlink.
-        hyperlink_remap.putAssumeCapacityNoClobber(
-            native_id,
-            decoded_id,
-        );
+        hyperlink_remap.put(native_id, decoded_id);
     }
 
     // Rows and cells
@@ -860,8 +927,7 @@ test "decode accepts unordered sparse style IDs and ignores zero" {
     var descending: [
         Header.len +
             2 * (2 + style.len) +
-            1 +
-            16
+            7
     ]u8 = undefined;
     var descending_writer: std.Io.Writer = .fixed(&descending);
     try header.encode(&descending_writer);
@@ -869,8 +935,9 @@ test "decode accepts unordered sparse style IDs and ignores zero" {
     try style.encode(.{ .flags = .{ .bold = true } }, &descending_writer);
     try io.writeInt(&descending_writer, TerminalStyleId, 2);
     try style.encode(.{ .flags = .{ .italic = true } }, &descending_writer);
-    try descending_writer.writeByte(0);
-    try descending_writer.splatByteAll(0, 16);
+    try descending_writer.writeByte(0); // row flags
+    try io.writeInt(&descending_writer, u16, 0); // cell count
+    try io.writeInt(&descending_writer, u32, 0); // grapheme section
 
     var descending_reader: std.Io.Reader = .fixed(
         descending_writer.buffered(),
@@ -893,7 +960,7 @@ test "decode accepts unordered sparse style IDs and ignores zero" {
         .string_capacity_bytes = 0,
     };
 
-    var zero: [Header.len + 2 + style.len + 17]u8 = undefined;
+    var zero: [Header.len + 2 + style.len + 7]u8 = undefined;
     var zero_writer: std.Io.Writer = .fixed(&zero);
     try one_header.encode(&zero_writer);
     try io.writeInt(&zero_writer, TerminalStyleId, 0);
@@ -936,8 +1003,7 @@ test "decode accepts unordered sparse hyperlink IDs" {
     var encoded: [
         Header.len +
             2 * 14 +
-            1 +
-            16
+            7
     ]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&encoded);
     try header.encode(&writer);
@@ -945,8 +1011,9 @@ test "decode accepts unordered sparse hyperlink IDs" {
     try hyperlink.encode(first, &writer);
     try io.writeInt(&writer, TerminalHyperlinkId, 2);
     try hyperlink.encode(second, &writer);
-    try writer.writeByte(0);
-    try writer.splatByteAll(0, 16);
+    try writer.writeByte(0); // row flags
+    try io.writeInt(&writer, u16, 0); // cell count
+    try io.writeInt(&writer, u32, 0); // grapheme section
 
     var reader: std.Io.Reader = .fixed(writer.buffered());
     var decoded = try decodePayload(
@@ -973,15 +1040,15 @@ test "decode defaults missing sparse cell references" {
         .string_capacity_bytes = 0,
     };
 
-    var style_encoded: [Header.len + 1 + 16]u8 = undefined;
+    var style_encoded: [Header.len + 3 + 8 + 4]u8 = undefined;
     var style_writer: std.Io.Writer = .fixed(&style_encoded);
     try style_header.encode(&style_writer);
-    try style_writer.writeByte(0);
-    try style_writer.writeAll(&.{ 0, 0, 0, 0 });
-    try io.writeInt(&style_writer, TerminalStyleId, 1);
-    try io.writeInt(&style_writer, TerminalHyperlinkId, 0);
-    try io.writeInt(&style_writer, u32, 0);
-    try io.writeInt(&style_writer, u32, 0);
+    try style_writer.writeByte(0x30); // row flags, full cell width
+    try io.writeInt(&style_writer, u16, 1); // cell count
+    try io.writeInt(&style_writer, u64, @bitCast(grid.Cell{
+        .style_id = 1,
+    }));
+    try io.writeInt(&style_writer, u32, 0); // grapheme section
 
     var style_reader: std.Io.Reader = .fixed(style_writer.buffered());
     var style_page = try decodePayload(
@@ -1006,15 +1073,16 @@ test "decode defaults missing sparse cell references" {
         .string_capacity_bytes = 0,
     };
 
-    var hyperlink_encoded: [Header.len + 1 + 16]u8 = undefined;
+    var hyperlink_encoded: [Header.len + 3 + 8 + 4]u8 = undefined;
     var hyperlink_writer: std.Io.Writer = .fixed(&hyperlink_encoded);
     try hyperlink_header.encode(&hyperlink_writer);
-    try hyperlink_writer.writeByte(0);
-    try hyperlink_writer.writeAll(&.{ 0, 0, 0, 0 });
-    try io.writeInt(&hyperlink_writer, TerminalStyleId, 0);
-    try io.writeInt(&hyperlink_writer, TerminalHyperlinkId, 1);
-    try io.writeInt(&hyperlink_writer, u32, 0);
-    try io.writeInt(&hyperlink_writer, u32, 0);
+    try hyperlink_writer.writeByte(0x30); // row flags, full cell width
+    try io.writeInt(&hyperlink_writer, u16, 1); // cell count
+    try io.writeInt(&hyperlink_writer, u64, @bitCast(grid.Cell{
+        .hyperlink = true,
+        .hyperlink_id = 1,
+    }));
+    try io.writeInt(&hyperlink_writer, u32, 0); // grapheme section
 
     var hyperlink_reader: std.Io.Reader = .fixed(
         hyperlink_writer.buffered(),
@@ -1044,41 +1112,42 @@ test "decode normalizes invalid grid semantics" {
         .string_capacity_bytes = 0,
     };
 
-    var encoded: [Header.len + 1 + 3 * 16 + 12]u8 = undefined;
+    var encoded: [Header.len + 3 + 3 * 8 + 4 + 10]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&encoded);
     try header.encode(&writer);
 
     // Preserve wrap while degrading the unknown semantic-prompt value to none
     // and ignoring all reserved row bits.
     try writer.writeByte(0xFD);
+    try io.writeInt(&writer, u16, 3);
 
-    // An unknown content and width kind, invalid semantic content, reserved
-    // bytes, and suffix data all degrade to a blank narrow output cell.
-    try writer.writeAll(&.{ 3, 4, 0xFF, 0xFF });
-    try io.writeInt(&writer, TerminalStyleId, 0);
-    try io.writeInt(&writer, TerminalHyperlinkId, 0);
-    try io.writeInt(&writer, u32, 0xD800);
-    try io.writeInt(&writer, u32, 1);
-    try io.writeInt(&writer, u32, 0x110000);
+    // A text cell replaces an invalid Unicode scalar with U+FFFD while its
+    // reserved semantic content degrades to output.
+    try io.writeInt(&writer, u64, @bitCast(grid.Cell{
+        .content = 0xD800,
+        .semantic_content = 3,
+    }));
 
-    // A recognized text cell replaces an invalid Unicode scalar with U+FFFD.
-    // Its valid suffix cannot fit the advertised zero capacity, so decoding
-    // preserves the base character and drops the optional suffix.
-    try writer.writeAll(&.{ 0, 0, 0, 0 });
-    try io.writeInt(&writer, TerminalStyleId, 0);
-    try io.writeInt(&writer, TerminalHyperlinkId, 0);
-    try io.writeInt(&writer, u32, 0xD800);
-    try io.writeInt(&writer, u32, 1);
-    try io.writeInt(&writer, u32, 'x');
+    // A declared grapheme suffix cannot fit the advertised zero capacity,
+    // so decoding preserves the base character and drops the suffix.
+    try io.writeInt(&writer, u64, @bitCast(grid.Cell{
+        .kind = 1,
+        .content = 'x',
+    }));
 
-    // Reserved palette bits and a nonsensical suffix do not obscure the valid
-    // low palette byte; the suffix is consumed and ignored.
-    try writer.writeAll(&.{ 1, 0, 0, 0xFF });
-    try io.writeInt(&writer, TerminalStyleId, 0);
-    try io.writeInt(&writer, TerminalHyperlinkId, 0);
-    try io.writeInt(&writer, u32, 0xFFFFFF07);
+    // Reserved palette content bits do not obscure the valid low palette
+    // byte.
+    try io.writeInt(&writer, u64, @bitCast(grid.Cell{
+        .kind = 2,
+        .content = 0xFFFF07,
+    }));
+
+    // The grapheme section carries the suffix for the second cell.
     try io.writeInt(&writer, u32, 1);
-    try io.writeInt(&writer, u32, 'x');
+    try io.writeInt(&writer, u16, 0);
+    try io.writeInt(&writer, u16, 1);
+    try io.writeInt(&writer, u16, 1);
+    try io.writeInt(&writer, u32, 0x0301);
 
     var reader: std.Io.Reader = .fixed(writer.buffered());
     var page = try decodePayload(&reader, std.testing.allocator);
@@ -1091,7 +1160,7 @@ test "decode normalizes invalid grid semantics" {
         terminal_page.Row.SemanticPrompt.none,
         first.row.semantic_prompt,
     );
-    try std.testing.expectEqual(@as(u21, 0), first.cell.codepoint());
+    try std.testing.expectEqual(@as(u21, 0xFFFD), first.cell.codepoint());
     try std.testing.expectEqual(
         terminal_page.Cell.Wide.narrow,
         first.cell.wide,
@@ -1104,7 +1173,7 @@ test "decode normalizes invalid grid semantics" {
     try std.testing.expect(!first.cell.hasGrapheme());
 
     const second = page.getRowAndCell(1, 0).cell;
-    try std.testing.expectEqual(@as(u21, 0xFFFD), second.codepoint());
+    try std.testing.expectEqual(@as(u21, 'x'), second.codepoint());
     try std.testing.expect(!second.hasGrapheme());
 
     const third = page.getRowAndCell(2, 0).cell;
@@ -1378,6 +1447,76 @@ test "decode reuses duplicate hyperlinks" {
         "uri",
         entry.uri.slice(decoded.memory),
     );
+}
+
+test "discard consumes exactly one PAGE record and keeps digest coverage" {
+    const testing = std.testing;
+
+    // Discard validates framing only, so an arbitrary payload keeps this test
+    // focused on record consumption rather than page structure.
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    var stream: record.Writer = .init(testing.allocator, &encoded.writer);
+    defer stream.deinit();
+    {
+        const payload = stream.begin(.page);
+        errdefer stream.cancel();
+        try payload.writeAll("undecodable page payload");
+        try stream.finish();
+    }
+    const record_len = encoded.written().len;
+    try encoded.writer.writeAll("next");
+
+    // Discarded payload bytes must still update an enclosing running digest,
+    // which is what lets a snapshot FINISH checkpoint authenticate records
+    // whose content was dropped.
+    var source: std.Io.Reader = .fixed(encoded.written());
+    var hashed: record.StreamReader = .init(&source);
+    try discard(hashed.reader());
+    var expected_digest: record.PrefixDigest = undefined;
+    std.crypto.hash.Blake3.hash(
+        encoded.written()[0..record_len],
+        &expected_digest,
+        .{},
+    );
+    try testing.expectEqual(expected_digest, hashed.prefixDigest());
+    try testing.expectEqualStrings("next", try source.take(4));
+
+    // Only PAGE records may be discarded; the tag remains strict.
+    var wrong_tag: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer wrong_tag.deinit();
+    var wrong_tag_stream: record.Writer = .init(
+        testing.allocator,
+        &wrong_tag.writer,
+    );
+    defer wrong_tag_stream.deinit();
+    {
+        const payload = wrong_tag_stream.begin(.history);
+        errdefer wrong_tag_stream.cancel();
+        try payload.writeAll("payload");
+        try wrong_tag_stream.finish();
+    }
+    var wrong_tag_source: std.Io.Reader = .fixed(wrong_tag.written());
+    try testing.expectError(
+        error.UnexpectedRecordTag,
+        discard(&wrong_tag_source),
+    );
+
+    // Discarded bytes are still covered by the record CRC.
+    const corrupted = try testing.allocator.dupe(
+        u8,
+        encoded.written()[0..record_len],
+    );
+    defer testing.allocator.free(corrupted);
+    corrupted[corrupted.len - 1] ^= 1;
+    var corrupted_source: std.Io.Reader = .fixed(corrupted);
+    try testing.expectError(error.InvalidChecksum, discard(&corrupted_source));
+
+    // A truncated payload is detected before `finish`.
+    var truncated_source: std.Io.Reader = .fixed(
+        encoded.written()[0 .. record_len - 1],
+    );
+    try testing.expectError(error.EndOfStream, discard(&truncated_source));
 }
 
 test "decode ignores empty hyperlink strings" {

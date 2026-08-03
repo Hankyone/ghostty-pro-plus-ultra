@@ -1354,6 +1354,9 @@ pub const PageFormatter = struct {
                     closing.len,
                 );
             }
+            // Closing the div creates a newline in the output
+            // so make sure to create one less newline
+            if (blank_rows >= 1) blank_rows -= 1;
         }
 
         return .{ .rows = blank_rows, .cells = blank_cells };
@@ -5507,6 +5510,43 @@ test "Page html with unicode as numeric entities" {
     // ╰ = U+2570 = 9584, ─ = U+2500 = 9472, ❯ = U+276F = 10095
     try testing.expectEqualStrings(
         "<div style=\"font-family: monospace; white-space: pre;\">&#9584;&#9472; &#10095;</div>",
+        output,
+    );
+}
+
+test "Page html trailing blank lines" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("hello\r\nworld\r\n\r\n");
+
+    const pages = &t.screens.active.pages;
+    try testing.expect(pages.pages.first != null);
+    try testing.expect(pages.pages.first == pages.pages.last);
+
+    const page = pages.pages.last.?.page();
+    var formatter: PageFormatter = .init(page, .{ .emit = .html });
+
+    const state = try formatter.formatWithState(&builder.writer);
+    const output = builder.writer.buffered();
+
+    // The closing div behaves as a newline
+    try testing.expectEqual(@as(usize, page.size.rows - 2), state.rows);
+    try testing.expectEqualStrings(
+        "<div style=\"font-family: monospace; white-space: pre;\">hello\nworld</div>",
         output,
     );
 }

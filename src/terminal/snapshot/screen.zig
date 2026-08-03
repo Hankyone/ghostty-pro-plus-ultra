@@ -205,6 +205,7 @@ const Allocator = std.mem.Allocator;
 const hyperlink = @import("hyperlink.zig");
 const test_fixture = @import("fixture.zig");
 const io = @import("io.zig");
+const grid = @import("grid.zig");
 const page = @import("page.zig");
 const record = @import("record.zig");
 const style = @import("style.zig");
@@ -2261,20 +2262,14 @@ test "SCREEN decode ignores a PAGE with an empty hyperlink URI" {
 
     // One narrow codepoint cell refers to the hyperlink table entry above.
     // Since that entry is ignored, the cell must restore without a hyperlink.
-    try page_payload.writeByte(0);
-    try page_payload.writeAll(&.{ 0, 0, 0, 0 });
-    try io.writeInt(
-        page_payload,
-        terminal_style.Id,
-        0,
-    );
-    try io.writeInt(
-        page_payload,
-        terminal_hyperlink.Id,
-        1,
-    );
-    try io.writeInt(page_payload, u32, 'A');
-    try io.writeInt(page_payload, u32, 0);
+    try page_payload.writeByte(0x30); // row flags, full cell width
+    try io.writeInt(page_payload, u16, 1); // cell count
+    try io.writeInt(page_payload, u64, @bitCast(grid.Cell{
+        .content = 'A',
+        .hyperlink = true,
+        .hyperlink_id = 1,
+    }));
+    try io.writeInt(page_payload, u32, 0); // grapheme section
     try stream.finish();
 
     var source: std.Io.Reader = .fixed(destination.written());
