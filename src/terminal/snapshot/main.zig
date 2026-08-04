@@ -10,13 +10,11 @@
 //! To do that, it sends the active terminal state followed by a READY record,
 //! then complete history.
 //!
-//! READY denotes that enough of the terminal state is down that it can
-//! be fully rendered at that point. This is also the point where live
-//! terminals can also start accepting pty bytes, typically. But the current
-//! snapshot format lacks some of the information necessary to synchronize
-//! pty byte state with an authoritative server.
+//! READY denotes that enough state has been sent down to render the
+//! terminal and reconstruct its unfinished VT Stream state.
 //!
-//! After READY, we send history pages (scrollback).
+//! After READY, we send history pages (scrollback). Finally, the
+//! snapshot ends with a FINISH payload.
 //!
 //! ## Snapshot Format
 //!
@@ -53,6 +51,8 @@
 //! | SCREEN * terminal.screen_count         |
 //! | PAGE * each screen.page_count          |
 //! +----------------------------------------+
+//! | CONTINUATION                           |
+//! +----------------------------------------+
 //! | READY                                  |
 //! +----------------------------------------+
 //! | HISTORY * terminal.screen_count        |
@@ -71,12 +71,16 @@
 //! is zero. FINISH terminates the snapshot. Bytes after FINISH belong to the
 //! containing transport and are not consumed by snapshot decoding.
 //!
+//! CONTINUATION contains the bytes required to bring the terminal's
+//! VT parser/stream up to the same state, or no bytes if it should be
+//! in the ground state.
+//!
 //! READY and FINISH contain BLAKE3-256 digests of all preceding snapshot bytes.
-//! READY therefore validates the renderable active-state prefix. FINISH covers
-//! READY and all history as well, validating the complete snapshot and its
-//! record ordering. Each SCREEN declares its complete logical history extent,
-//! allowing a client to size its scrollbar at READY even though older PAGE
-//! records arrive afterward.
+//! READY therefore validates the renderable active state and continuation.
+//! FINISH covers READY and all history as well, validating the complete snapshot
+//! and its record ordering. Each SCREEN declares its complete logical history
+//! extent, allowing a client to size its scrollbar at READY even though older
+//! PAGE records arrive afterward.
 //!
 //! ## Encoding
 //!
@@ -86,7 +90,9 @@
 //! var output: std.Io.Writer.Allocating = .init(alloc);
 //! defer output.deinit();
 //!
-//! try snapshot.encode(alloc, &output.writer, &terminal);
+//! try snapshot.encode(alloc, &output.writer, &terminal, .{
+//!     .continuation = .ground,
+//! });
 //!
 //! const bytes = output.written();
 //! ```
@@ -113,15 +119,41 @@
 //! outside this ordered snapshot record sequence.
 //!
 //! ```zig
-//! var terminal = try snapshot.decode(alloc, io, &reader);
+//! var decoded = try snapshot.decode(alloc, io, &reader, .{
+//!     .max_continuation_bytes = 1024 * 1024,
+//! });
+//! defer decoded.deinit(alloc);
+//! var terminal = decoded.toOwned();
 //! defer terminal.deinit(alloc);
 //! ```
 //!
 //! Use `snapshot.decodeExact` for a bounded file or buffer that must contain
 //! only one snapshot. It preserves the stricter end-of-file check, which may
 //! block when used with a live stream.
+//!
+//! `snapshot.Decoder` decodes the same stream incrementally so the terminal
+//! becomes usable at READY, before history has arrived. Each `next` call
+//! applies one history page to the by-then live terminal and returning null
+//! validates FINISH:
+//!
+//! ```zig
+//! var decoder: snapshot.Decoder = .init(&reader);
+//! var decoded = try decoder.ready(alloc, io, .{
+//!     .max_continuation_bytes = 1024 * 1024,
+//! });
+//! defer decoded.deinit(alloc);
+//!
+//! var terminal = decoded.toOwned();
+//! defer terminal.deinit(alloc);
+//!
+//! // Render, replay the continuation, process input...
+//! while (try decoder.next(alloc, &terminal)) |progress| {
+//!     _ = progress; // Scrollback grew.
+//! }
+//! ```
 
 pub const checkpoint = @import("checkpoint.zig");
+pub const continuation = @import("continuation.zig");
 pub const envelope = @import("envelope.zig");
 pub const grid = @import("grid.zig");
 pub const history = @import("history.zig");
@@ -136,6 +168,11 @@ const codec = @import("snapshot.zig");
 pub const EncodeError = codec.EncodeError;
 pub const DecodeError = codec.DecodeError;
 pub const DecodeExactError = codec.DecodeExactError;
+pub const Continuation = codec.Continuation;
+pub const EncodeOptions = codec.EncodeOptions;
+pub const DecodeOptions = codec.DecodeOptions;
+pub const Decoded = codec.Decoded;
+pub const Decoder = codec.Decoder;
 pub const encode = codec.encode;
 pub const decode = codec.decode;
 pub const decodeExact = codec.decodeExact;

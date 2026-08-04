@@ -371,7 +371,10 @@ pub fn deinit(self: *Terminal, alloc: Allocator) void {
 /// for handling escape sequences split across write boundaries), you
 /// must store and reuse the returned stream.
 pub fn vtStream(self: *Terminal) Stream {
-    return .initAlloc(self.gpa(), self.vtHandler());
+    return Stream.init(.{
+        .allocator = self.gpa(),
+        .handler = self.vtHandler(),
+    });
 }
 
 /// This is the handler-side only for vtStream.

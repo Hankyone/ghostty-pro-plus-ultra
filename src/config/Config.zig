@@ -1453,9 +1453,9 @@ input: RepeatableReadableIO = .{},
 /// Valid values:
 ///
 ///   * `system` - Respect the system settings for when to show scrollbars.
-///     For example, on macOS, this will respect the "Scrollbar behavior"
-///     system setting which by default usually only shows scrollbars while
-///     actively scrolling or hovering the gutter.
+///     On macOS, we only show scrollbars while actively scrolling or hovering
+///     the gutter. If the system setting is set to "Always", the scrollbar
+///     will be shown when the mouse is over the gutter area.
 ///
 ///   * `never` - Never show a scrollbar. You can still scroll using the mouse,
 ///     keybind actions, etc. but you will not have a visual UI widget showing
@@ -4715,7 +4715,7 @@ pub fn finalize(self: *Config) !void {
                         var environ_map = try global.environMap();
                         defer environ_map.deinit();
                         var buf: [std.fs.max_path_bytes]u8 = undefined;
-                        if (try internal_os.home(&environ_map, &buf)) |home| {
+                        if (try internal_os.home(global.io(), &environ_map, &buf)) |home| {
                             wd = .{ .path = try alloc.dupe(u8, home) };
                         } else {
                             wd = .inherit;
@@ -5445,7 +5445,7 @@ pub const WorkingDirectory = union(enum) {
         const expanded = expanded: {
             var environ_map = global.environMap() catch |err| break :expanded err;
             defer environ_map.deinit();
-            break :expanded internal_os.expandHome(&environ_map, path, &buf);
+            break :expanded internal_os.expandHome(global.io(), &environ_map, path, &buf);
         } catch |err| {
             log.warn(
                 "error expanding home directory for working-directory path={s}: {}",
@@ -5514,6 +5514,7 @@ pub const WorkingDirectory = union(enum) {
 
             var buf: [std.fs.max_path_bytes]u8 = undefined;
             const expected = internal_os.expandHome(
+                testing.io,
                 &environ_map,
                 "~/projects/ghostty",
                 &buf,
@@ -10580,6 +10581,7 @@ test "clone preserves conditional set" {
 
 test "working-directory expands tilde" {
     const testing = std.testing;
+    const io = testing.io;
     const alloc = testing.allocator;
     var environ_map = try testing.environ.createMap(testing.allocator);
     defer environ_map.deinit();
@@ -10594,6 +10596,7 @@ test "working-directory expands tilde" {
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const expected = internal_os.expandHome(
+        io,
         &environ_map,
         "~/projects/ghostty",
         &buf,
