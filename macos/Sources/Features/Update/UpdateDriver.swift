@@ -111,14 +111,18 @@ class UpdateDriver: NSObject, SPUUserDriver {
                     delegate.checkForUpdates(self)
                 }
             },
+<<<<<<< HEAD
             dismiss: { [weak viewModel] in
                 viewModel?.state = .idle
             })))
+=======
+            dismiss: {
+                acknowledgement()
+            }))
+>>>>>>> upstream/main
 
         if !hasUnobtrusiveTarget {
             standard.showUpdaterError(error, acknowledgement: acknowledgement)
-        } else {
-            acknowledgement()
         }
     }
 

@@ -185,7 +185,7 @@ enum UpdateState: Equatable {
     case extracting(Extracting)
     case installing(Installing)
 
-    var isIdle: Bool {
+    var isHidden: Bool {
         if case .idle = self { return true }
         return false
     }
@@ -205,20 +205,34 @@ enum UpdateState: Equatable {
         }
     }
 
+    var isCancellable: Bool {
+        cancelAction != nil
+    }
+
     func cancel() {
+        cancelAction?()
+    }
+
+    private var cancelAction: (() -> Void)? {
         switch self {
+        case .idle:
+            nil
+        case .permissionRequest:
+            nil
         case .checking(let checking):
-            checking.cancel()
+            checking.cancel
         case .updateAvailable(let available):
-            available.reply(.dismiss)
+            { available.reply(.dismiss) }
         case .downloading(let downloading):
-            downloading.cancel()
+            downloading.cancel
         case .notFound(let notFound):
-            notFound.acknowledgement()
+            notFound.acknowledgement
         case .error(let err):
-            err.dismiss()
-        default:
-            break
+            err.dismiss
+        case .extracting:
+            nil
+        case .installing:
+            nil
         }
     }
 
