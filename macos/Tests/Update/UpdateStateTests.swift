@@ -98,15 +98,15 @@ struct UpdateStateTests {
         #expect(state1 != state2)
     }
 
-    // MARK: - isIdle Tests
+    // MARK: - isHidden Tests
 
     @Test func testIsIdleTrue() {
         let state: UpdateState = .idle
-        #expect(state.isIdle == true)
+        #expect(state.isHidden == true)
     }
 
     @Test func testIsIdleFalse() {
         let state: UpdateState = .checking(.init(cancel: {}))
-        #expect(state.isIdle == false)
+        #expect(state.isHidden == false)
     }
 }

@@ -29,9 +29,10 @@ const Blake3 = std.crypto.hash.Blake3;
 /// The running digest shared by snapshot stream codecs and checkpoints.
 pub const PrefixDigest = [Blake3.digest_length]u8;
 
-/// CRC32C as specified by the snapshot format. Zig names this standard
-/// parameter set after its iSCSI use.
-pub const Crc32c = std.hash.crc.Crc32Iscsi;
+/// CRC32C as specified by the snapshot format. This is the parameter set
+/// Zig's standard library names after its iSCSI use, backed by dedicated
+/// CRC32C instructions where the target has them.
+pub const Crc32c = @import("../../crc32c.zig").Crc32c;
 
 /// Identifies the layout and meaning of a record payload.
 /// The current snapshot version rejects every value not listed here.
@@ -53,6 +54,9 @@ pub const Tag = enum(u16) {
 
     /// Digest validating the complete snapshot blob.
     finish = 6,
+
+    /// Canonical unfinished standard TerminalStream input.
+    continuation = 7,
 };
 
 /// The fixed framing that precedes every record payload.
@@ -298,8 +302,9 @@ pub const Reader = struct {
     // such as peek and discard.
     limited_buffer: [1]u8,
 
-    // PAGE decoding performs many small reads. 256 bytes batches several cells
-    // while CRC32C is calculated without making Reader large on the stack.
+    // Fixed-header decoding performs several small reads. 256 bytes batches
+    // them while CRC32C is calculated without making Reader large on the
+    // stack. Bulk payload reads bypass this buffer entirely.
     hashing_buffer: [256]u8,
 
     limited: std.Io.Reader.Limited,
@@ -408,7 +413,7 @@ test "golden PAGE record header and checksum" {
 }
 
 test "reject invalid tags" {
-    for ([_]u16{ 0, 7, std.math.maxInt(u16) }) |tag| {
+    for ([_]u16{ 0, 8, std.math.maxInt(u16) }) |tag| {
         var fixture = [_]u8{0} ** Header.len;
         std.mem.writeInt(u16, fixture[0..2], tag, .little);
         var reader: std.Io.Reader = .fixed(&fixture);
