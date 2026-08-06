@@ -18,7 +18,7 @@ struct UpdatePill: View {
     private let textFont = NSFont.systemFont(ofSize: 11, weight: .medium)
 
     var body: some View {
-        if !model.state.isIdle {
+        if !model.state.isHidden {
             pillButton
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 .onChange(of: model.state) { newState in
