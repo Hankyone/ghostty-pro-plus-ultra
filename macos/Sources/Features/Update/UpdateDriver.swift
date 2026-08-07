@@ -113,12 +113,11 @@ class UpdateDriver: NSObject, SPUUserDriver {
             },
             dismiss: { [weak viewModel] in
                 viewModel?.state = .idle
+                acknowledgement()
             })))
 
         if !hasUnobtrusiveTarget {
             standard.showUpdaterError(error, acknowledgement: acknowledgement)
-        } else {
-            acknowledgement()
         }
     }
 
@@ -183,25 +182,14 @@ class UpdateDriver: NSObject, SPUUserDriver {
         if !hasUnobtrusiveTarget {
             standard.showReady(toInstallAndRelaunch: reply)
         } else {
-            // Show "Relaunch to Update" on the pill and let the user trigger
-            // the install. Auto-calling reply(.install) caused Sparkle to
-            // silently fail when the app couldn't quit cleanly.
-            setStateOnMain(.installing(.init(
-                retryTerminatingApplication: { reply(.install) },
-                dismiss: { [weak viewModel] in
-                    viewModel?.state = .idle
-                    reply(.dismiss)
-                }
-            )))
+            reply(.install)
         }
     }
 
     func showInstallingUpdate(withApplicationTerminated applicationTerminated: Bool, retryTerminatingApplication: @escaping () -> Void) {
         setStateOnMain(.installing(.init(
+            appcastItem: nil,
             retryTerminatingApplication: retryTerminatingApplication,
-            dismiss: { [weak viewModel] in
-                viewModel?.state = .idle
-            }
         )))
 
         if !hasUnobtrusiveTarget {
