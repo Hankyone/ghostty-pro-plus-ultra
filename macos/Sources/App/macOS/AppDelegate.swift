@@ -347,7 +347,10 @@ class AppDelegate: NSObject,
         // Setup signal handlers
         setupSignals()
 
-        // Prune orphaned tab metadata after restoration completes.
+        // Prune orphaned tab metadata and unclaimed keepers after restoration
+        // completes. Keepers left behind by a prior quit — or by window state
+        // that never came back — otherwise sit forever holding shells nothing
+        // can reach, and their Metal/window residue is what bloated WindowServer.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             var liveSurfaceIds = Set<UUID>()
             for window in NSApp.windows {
@@ -357,6 +360,10 @@ class AppDelegate: NSObject,
                 }
             }
             TabMetadataStore.shared.pruneOrphanedEntries(liveSurfaceIds: liveSurfaceIds)
+
+            if self.ghostty.config.paneKeeper {
+                Self.reapUnclaimedKeepers(keeping: liveSurfaceIds)
+            }
         }
 
         // Periodically flush restorable state to disk so a force-kill or crash
@@ -1493,6 +1500,20 @@ extension AppDelegate {
                 }
             }
             await NSApp.reply(toApplicationShouldTerminate: true)
+        }
+    }
+
+    /// End keepers that no restored surface claimed.
+    ///
+    /// `pane-keeper` leaves shells running across quit on purpose. When the
+    /// window state naming a pane is lost, that shell would otherwise never
+    /// die. After restoration we know the live set — everything else is an
+    /// orphan and must be reaped.
+    private static func reapUnclaimedKeepers(keeping liveSurfaceIds: Set<UUID>) {
+        let joined = liveSurfaceIds.map(\.uuidString).joined(separator: "\n")
+        let killed = joined.withCString { Int(ghostty_keepers_reap_except($0)) }
+        if killed > 0 {
+            logger.info("reaped \(killed, privacy: .public) unclaimed keeper(s) after restore")
         }
     }
 }

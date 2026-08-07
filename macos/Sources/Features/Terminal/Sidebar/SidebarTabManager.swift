@@ -50,7 +50,6 @@ class SidebarTabManager: ObservableObject {
         let hasUnreadCompletion: Bool
         let tabColor: TerminalTabColor
         let faviconImage: NSImage?
-        let window: NSWindow
         /// The detected project root directory for this tab, or nil if not in a project.
         let projectRoot: String?
         /// When this tab last had real activity (command execution, status change).
@@ -189,11 +188,19 @@ class SidebarTabManager: ObservableObject {
         refreshSelection()
     }
 
-    /// Break all window references when the owning tab closes.
+    /// Resolve a tab's live NSWindow from the current tab group.
     ///
-    /// Every `TabItem` contains a strong reference to its window. Leaving
-    /// those references in a closed tab's manager keeps its terminal
-    /// controller, surface tree, and PTY alive after the tab disappears.
+    /// `TabItem` deliberately does not retain its window — every sidebar used
+    /// to hold a strong ref to every other tab's window, which kept closed
+    /// terminals (and their Metal layers / keepers) alive after close.
+    func window(for tab: TabItem) -> NSWindow? {
+        guard let window else { return nil }
+        return store.orderedTabWindows(for: window).first {
+            ObjectIdentifier($0) == tab.id
+        }
+    }
+
+    /// Clear published tab rows when the owning tab closes.
     func invalidate() {
         guard !isInvalidated else { return }
         isInvalidated = true
@@ -272,7 +279,8 @@ class SidebarTabManager: ObservableObject {
     }
 
     func selectTab(_ tab: TabItem) {
-        Self.orderLog.info("selectTab: \(tab.displayTitle, privacy: .public) win#\(tab.window.windowNumber)")
+        guard let tabWindow = window(for: tab) else { return }
+        Self.orderLog.info("selectTab: \(tab.displayTitle, privacy: .public) win#\(tabWindow.windowNumber)")
 
         // Don't rebuild here — the next store refresh picks up the
         // attention/acknowledgment changes.
@@ -287,17 +295,17 @@ class SidebarTabManager: ObservableObject {
         isSelectingTab = true
         if let window,
            let tabGroup = window.tabGroup,
-           tabGroup.windows.contains(tab.window) {
-            tabGroup.selectedWindow = tab.window
+           tabGroup.windows.contains(tabWindow) {
+            tabGroup.selectedWindow = tabWindow
         } else {
-            tab.window.makeKeyAndOrderFront(nil)
+            tabWindow.makeKeyAndOrderFront(nil)
         }
         isSelectingTab = false
 
         // After the setter, the target window's sidebar is now visible to the user.
         // Its manager's refreshSelection may have run during the setter and read
         // intermediate (old) state. Correct it now that the setter has completed.
-        if let targetController = tab.window.windowController as? TerminalController,
+        if let targetController = tabWindow.windowController as? TerminalController,
            let targetManager = targetController.sidebarTabManager,
            targetManager !== self,
            targetManager.selectedTabID != tab.id {
@@ -540,12 +548,12 @@ class SidebarTabManager: ObservableObject {
     }
 
     func setTabColor(_ color: TerminalTabColor, for tab: TabItem) {
-        (tab.window as? TerminalWindow)?.tabColor = color
+        (window(for: tab) as? TerminalWindow)?.tabColor = color
         refresh()
     }
 
     func closeTab(_ tab: TabItem) {
-        guard let controller = tab.window.windowController as? TerminalController else { return }
+        guard let controller = window(for: tab)?.windowController as? TerminalController else { return }
         controller.closeTab(nil)
     }
 
@@ -557,18 +565,18 @@ class SidebarTabManager: ObservableObject {
         let ordered = projectGroups.flatMap(\.tabs)
         let id = ObjectIdentifier(window)
         guard let index = ordered.firstIndex(where: { $0.id == id }) else { return nil }
-        if index > 0 { return ordered[index - 1].window }
-        return ordered.count > 1 ? ordered[1].window : nil
+        if index > 0 { return self.window(for: ordered[index - 1]) }
+        return ordered.count > 1 ? self.window(for: ordered[1]) : nil
     }
 
     func renameTab(_ tab: TabItem, to newTitle: String) {
-        guard let controller = tab.window.windowController as? BaseTerminalController else { return }
+        guard let controller = window(for: tab)?.windowController as? BaseTerminalController else { return }
         controller.titleOverride = newTitle.isEmpty ? nil : newTitle
         refresh()
     }
 
     func promptRenameTab(_ tab: TabItem) {
-        guard let controller = tab.window.windowController as? BaseTerminalController else { return }
+        guard let controller = window(for: tab)?.windowController as? BaseTerminalController else { return }
         controller.promptTabTitle()
     }
 
@@ -614,8 +622,10 @@ class SidebarTabManager: ObservableObject {
         relativeTo targetTab: TabItem,
         position: TabInsertionPosition
     ) -> Bool {
+        guard let movingWindowRef = window(for: movingTab),
+              let targetWindowRef = window(for: targetTab) else { return false }
         Self.orderLog.info(
-            "moveTab win#\(movingTab.window.windowNumber) \(position == .before ? "before" : "after") win#\(targetTab.window.windowNumber)")
+            "moveTab win#\(movingWindowRef.windowNumber) \(position == .before ? "before" : "after") win#\(targetWindowRef.windowNumber)")
 
         guard movingTab.id != targetTab.id,
               movingTab.groupID == targetTab.groupID,

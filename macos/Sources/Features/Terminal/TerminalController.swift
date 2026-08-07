@@ -727,9 +727,22 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         cancelPendingInitialPresentation()
 
-        // Undo
-        if let undoManager, let undoState {
-            // Register undo action to restore the tab
+        // Closing the visible tab hands selection to whichever window AppKit
+        // happens to raise, which is the most recently fronted one and has
+        // nothing to do with where the tab sat in the sidebar. Take the row
+        // directly above instead, so selection walks the list the way it
+        // reads. Decided before the close, while the sidebar still exists.
+        let replacement: NSWindow? = tabGroup.selectedWindow === window
+            ? sidebarTabManager?.tabAdjacentInDisplayOrder(to: window)
+            : nil
+
+        // With pane-keeper, undo must not retain live SurfaceViews: that keeps
+        // the keeper alive (kill runs from surface free) and leaves Metal
+        // layers in WindowServer after AppKit has already forgotten the tab.
+        // Without pane-keeper, keep the existing undo-restore behavior.
+        if ghostty.config.paneKeeper {
+            releaseSurfacesImmediately()
+        } else if let undoManager, let undoState {
             undoManager.setActionName("Close Tab")
             undoManager.registerUndo(
                 withTarget: ghostty,
@@ -746,18 +759,21 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                     }
                 }
             }
+            // Drop this controller's refs; undo holds the only remaining tree
+            // for undo-timeout, matching closeWindowImmediately.
+            surfaceTree = .init()
+            focusedSurface = nil
+        } else {
+            releaseSurfacesImmediately()
         }
 
-        // Closing the visible tab hands selection to whichever window AppKit
-        // happens to raise, which is the most recently fronted one and has
-        // nothing to do with where the tab sat in the sidebar. Take the row
-        // directly above instead, so selection walks the list the way it
-        // reads. Decided before the close, while the sidebar still exists.
-        let replacement: NSWindow? = tabGroup.selectedWindow === window
-            ? sidebarTabManager?.tabAdjacentInDisplayOrder(to: window)
-            : nil
-
         window.close()
+
+        // Sibling sidebars hold TabItems for every window in the group. Force
+        // them to drop this window on this runloop turn, not on the next 0.5s
+        // store tick — a strong window ref in those rows is enough to keep the
+        // controller (and previously its surfaces) alive after close.
+        SidebarStore.shared.requestRefresh(reason: "tab closed", force: true)
 
         if let replacement, tabGroup.windows.contains(replacement) {
             tabGroup.selectedWindow = replacement
@@ -860,7 +876,22 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         cancelPendingInitialPresentation()
 
-        registerUndoForCloseWindow()
+        // Same rule as closeTabImmediately: pane-keeper + live-surface undo
+        // leaks keepers and WindowServer layers. Skip that undo and free now.
+        if ghostty.config.paneKeeper {
+            if let tabGroup = window.tabGroup, tabGroup.windows.count > 1 {
+                for tabWindow in tabGroup.windows {
+                    if let controller = tabWindow.windowController as? TerminalController {
+                        controller.cancelPendingInitialPresentation()
+                        controller.releaseSurfacesImmediately()
+                    }
+                }
+            } else {
+                releaseSurfacesImmediately()
+            }
+        } else {
+            registerUndoForCloseWindow()
+        }
 
         if let tabGroup = window.tabGroup, tabGroup.windows.count > 1 {
             tabGroup.windows.forEach { window in
@@ -869,7 +900,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 // process them on later ticks so we can't just disable undo registration.
                 if let controller = window.windowController as? TerminalController {
                     controller.cancelPendingInitialPresentation()
-                    controller.surfaceTree = .init()
+                    if !ghostty.config.paneKeeper {
+                        controller.surfaceTree = .init()
+                    }
                 }
 
                 window.close()
@@ -877,6 +910,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         } else {
             window.close()
         }
+
+        SidebarStore.shared.requestRefresh(reason: "window closed", force: true)
     }
 
     /// Registers undo for closing window(s), handling both single windows and tab groups.
@@ -1345,16 +1380,22 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     }
 
     override func windowWillClose(_ notification: Notification) {
-        // Sidebar tab items strongly reference their NSWindows. Tear the manager
-        // down before the window closes so a closed tab cannot retain its
-        // controller, terminal surfaces, and PTYs through that window list.
+        // Sidebar tab items used to strongly reference their NSWindows. Tear
+        // the manager down before the window closes so a closed tab cannot
+        // retain its controller through that window list. Surfaces should
+        // already have been released on the deliberate close path; this is
+        // the safety net for any other close route.
         sidebarTabManager?.invalidate()
         sidebarTabManager = nil
         sidebarHostingView = nil
+        if !surfaceTree.isEmpty {
+            releaseSurfacesImmediately()
+        }
 
         super.windowWillClose(notification)
         cancelPendingInitialPresentation()
         self.relabelTabs()
+        SidebarStore.shared.requestRefresh(reason: "windowWillClose", force: true)
 
         // If we remove a window, we reset the cascade point to the key window so that
         // the next window cascade's from that one.

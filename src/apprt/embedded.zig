@@ -1502,6 +1502,28 @@ pub const CAPI = struct {
         return termio.keeper.wasReattached(std.mem.sliceTo(id, 0));
     }
 
+    /// Kill every keeper whose pane id is not in the newline-separated
+    /// `live_ids` list. Pass null/empty to kill all held keepers.
+    ///
+    /// Call after window restoration finishes so shells left behind by a prior
+    /// quit — or by a window state that never came back — do not accumulate
+    /// forever. Returns how many keepers were ended.
+    export fn ghostty_keepers_reap_except(live_ids: ?[*:0]const u8) usize {
+        const alloc = global.alloc();
+        var keep: std.ArrayList([]const u8) = .empty;
+        defer keep.deinit(alloc);
+
+        if (live_ids) |joined| {
+            var it = std.mem.splitScalar(u8, std.mem.sliceTo(joined, 0), '\n');
+            while (it.next()) |id| {
+                if (id.len == 0) continue;
+                keep.append(alloc, id) catch {};
+            }
+        }
+
+        return termio.keeper.reapExcept(alloc, keep.items);
+    }
+
     export fn ghostty_app_free(v: *App) void {
         const core_app = v.core_app;
         v.terminate();

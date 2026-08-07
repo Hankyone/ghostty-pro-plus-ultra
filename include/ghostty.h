@@ -1112,6 +1112,13 @@ GHOSTTY_API size_t ghostty_app_panes_without_keeper(ghostty_app_t);
 /// Anything that types into a restored terminal must check this first: a
 /// resumed pane already holds a live session.
 GHOSTTY_API bool ghostty_pane_was_reattached(const char*);
+
+/// Kill every keeper whose pane id is not among the newline-separated
+/// `live_ids` list. Pass NULL or empty to kill all held keepers. Call after
+/// window restoration so unclaimed shells from a prior quit do not accumulate.
+/// Returns how many keepers were ended.
+GHOSTTY_API size_t ghostty_keepers_reap_except(const char* live_ids);
+
 GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
 GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
 GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);

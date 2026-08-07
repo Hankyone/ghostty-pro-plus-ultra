@@ -182,6 +182,17 @@ extension Ghostty {
             surfaceModel?.sendText(text)
         }
 
+        /// Free the underlying libghostty surface immediately.
+        ///
+        /// Tab close must not wait on ARC of the SwiftUI/AppKit view tree:
+        /// retaining a live surface keeps its Metal `IOSurfaceLayer` in
+        /// WindowServer and, with `pane-keeper`, blocks the keeper kill that
+        /// only runs from surface teardown. Call this on the deliberate close
+        /// path before the window goes away.
+        func releaseTerminal() {
+            surfaceModel = nil
+        }
+
         /// Current scrollbar state, cached here for persistence across rebuilds
         /// of the SwiftUI view hierarchy, for example when changing splits
         var scrollbar: Ghostty.Action.Scrollbar?

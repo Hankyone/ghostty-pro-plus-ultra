@@ -321,6 +321,33 @@ pub fn list(alloc: Allocator) ![]HeldPane {
     return try out.toOwnedSlice(alloc);
 }
 
+/// End every held pane whose id is not in `keep`.
+///
+/// Used after window restoration: any keeper the restored surfaces did not
+/// claim is an orphan left behind by a prior quit or a lost window, and will
+/// otherwise sit forever holding a shell nothing can reach.
+pub fn reapExcept(alloc: Allocator, keep: []const []const u8) usize {
+    const panes = list(alloc) catch return 0;
+    defer {
+        for (panes) |p| alloc.free(p.id);
+        alloc.free(panes);
+    }
+
+    var killed: usize = 0;
+    for (panes) |pane| {
+        var retain = false;
+        for (keep) |id| {
+            if (std.mem.eql(u8, pane.id, id)) {
+                retain = true;
+                break;
+            }
+        }
+        if (retain) continue;
+        if (killByPaneId(alloc, pane.id)) killed += 1;
+    }
+    return killed;
+}
+
 /// End a held pane by id, for the case where no window is going to claim it.
 pub fn killByPaneId(alloc: Allocator, pane_id: []const u8) bool {
     const dir_path = socketDir(alloc) catch return false;

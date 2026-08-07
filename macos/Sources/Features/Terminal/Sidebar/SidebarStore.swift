@@ -435,7 +435,6 @@ final class SidebarStore {
                 hasUnreadCompletion: unread,
                 tabColor: color,
                 faviconImage: favicon,
-                window: w,
                 projectRoot: projectRoot,
                 lastActivity: lastActivityTime[wid],
                 createdAt: tabCreationTime[wid],

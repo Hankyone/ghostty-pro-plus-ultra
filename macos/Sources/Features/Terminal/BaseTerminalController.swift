@@ -236,6 +236,20 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
+    /// Tear down every surface in this controller right now.
+    ///
+    /// Clears the split tree and frees each surface's C handle so keeper kill
+    /// and Metal layer release are not gated on later ARC of sidebar rows,
+    /// undo closures, or SwiftUI hosting views.
+    func releaseSurfacesImmediately() {
+        let views = Array(surfaceTree)
+        surfaceTree = .init()
+        focusedSurface = nil
+        for view in views {
+            view.releaseTerminal()
+        }
+    }
+
     // MARK: Methods
 
     /// Create a new split.
