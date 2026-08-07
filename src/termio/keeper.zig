@@ -30,6 +30,9 @@ const c = @cImport({
     @cInclude("signal.h");
     @cInclude("errno.h");
     @cInclude("sys/time.h");
+    if (builtin.os.tag == .macos) {
+        @cInclude("libproc.h");
+    }
 });
 
 /// The binary we spawn, relative to the resources directory.
@@ -172,6 +175,11 @@ pub fn spawn(alloc: Allocator, opts: SpawnOptions) !Session {
         0,
     );
 
+    // The new keeper's `listen` unlinks any socket at this path. If something
+    // is still holding that inode, unlinking orphans it — invisible to a
+    // directory scan, still burning a shell. Displace first.
+    _ = killByPaneId(alloc, opts.pane_id);
+
     const spec = try buildSpec(alloc, socket_path, opts);
     const exe_path = try findKeeper(alloc, opts.resources_dir);
     const keeper_pid = try spawnProcess(alloc, exe_path, spec);
@@ -262,6 +270,10 @@ pub const HeldPane = struct {
 /// This exists for when they can't be — if the window state naming a pane is
 /// lost, its shell keeps running with nothing able to find it, and there has
 /// to be some way to see that and end it.
+///
+/// Entries come from `.sock` files and from `.pid` files (a keeper whose
+/// socket name was stolen still leaves a pidfile, and those used to be
+/// invisible here).
 pub fn list(alloc: Allocator) ![]HeldPane {
     const dir_path = try socketDir(alloc);
     defer alloc.free(dir_path);
@@ -276,6 +288,13 @@ pub fn list(alloc: Allocator) ![]HeldPane {
     };
     defer dir.close(global.io());
 
+    var seen: std.StringHashMapUnmanaged(void) = .{};
+    defer {
+        var kit = seen.keyIterator();
+        while (kit.next()) |k| alloc.free(k.*);
+        seen.deinit(alloc);
+    }
+
     var out: std.ArrayList(HeldPane) = .empty;
     errdefer {
         for (out.items) |p| alloc.free(p.id);
@@ -284,41 +303,63 @@ pub fn list(alloc: Allocator) ![]HeldPane {
 
     var it = dir.iterate();
     while (try it.next(global.io())) |entry| {
-        if (!std.mem.endsWith(u8, entry.name, ".sock")) continue;
-        const id = entry.name[0 .. entry.name.len - ".sock".len];
+        const id = paneIdFromDirEntry(entry.name) orelse continue;
         if (id.len == 0) continue;
-
-        const path = try std.fmt.allocPrintSentinel(
-            alloc,
-            "{s}/{s}",
-            .{ dir_path, entry.name },
-            0,
-        );
-        defer alloc.free(path);
-
-        var pane: HeldPane = .{
-            .id = try alloc.dupe(u8, id),
-            .shell_pid = 0,
-            .alive = false,
-        };
-
-        if (connect(path)) |sock| {
-            defer _ = c.close(sock);
-            const req = "{\"method\":\"hello\"}\n";
-            if (c.write(sock, req.ptr, req.len) > 0) {
-                var buf: [256]u8 = undefined;
-                const n = c.read(sock, &buf, buf.len);
-                if (n > 0) {
-                    pane.alive = true;
-                    pane.shell_pid = @intCast(parseUint(buf[0..@intCast(n)], "\"shell_pid\":") orelse 0);
-                }
-            }
-        } else |_| {}
-
-        try out.append(alloc, pane);
+        if (seen.contains(id)) continue;
+        const owned_id = try alloc.dupe(u8, id);
+        try seen.put(alloc, owned_id, {});
+        try out.append(alloc, try probePane(alloc, dir_path, owned_id));
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+fn paneIdFromDirEntry(name: []const u8) ?[]const u8 {
+    if (std.mem.endsWith(u8, name, ".sock")) {
+        return name[0 .. name.len - ".sock".len];
+    }
+    if (std.mem.endsWith(u8, name, ".pid")) {
+        return name[0 .. name.len - ".pid".len];
+    }
+    return null;
+}
+
+fn probePane(alloc: Allocator, dir_path: []const u8, id: []const u8) !HeldPane {
+    var pane: HeldPane = .{
+        .id = try alloc.dupe(u8, id),
+        .shell_pid = 0,
+        .alive = false,
+    };
+
+    const path = try std.fmt.allocPrintSentinel(
+        alloc,
+        "{s}/{s}.sock",
+        .{ dir_path, id },
+        0,
+    );
+    defer alloc.free(path);
+
+    if (connect(path)) |sock| {
+        defer _ = c.close(sock);
+        const req = "{\"method\":\"hello\"}\n";
+        if (c.write(sock, req.ptr, req.len) > 0) {
+            var buf: [256]u8 = undefined;
+            const n = c.read(sock, &buf, buf.len);
+            if (n > 0) {
+                pane.alive = true;
+                pane.shell_pid = @intCast(parseUint(buf[0..@intCast(n)], "\"shell_pid\":") orelse 0);
+            }
+        }
+    } else |_| {
+        // Socket gone or wedged: a live pidfile still means the pane is held.
+        if (readPidfile(alloc, dir_path, id)) |keeper_pid| {
+            if (processAlive(keeper_pid)) {
+                pane.alive = true;
+            }
+        }
+    }
+
+    return pane;
 }
 
 /// End every held pane whose id is not in `keep`.
@@ -335,17 +376,23 @@ pub fn reapExcept(alloc: Allocator, keep: []const []const u8) usize {
 
     var killed: usize = 0;
     for (panes) |pane| {
-        var retain = false;
-        for (keep) |id| {
-            if (std.mem.eql(u8, pane.id, id)) {
-                retain = true;
-                break;
-            }
-        }
-        if (retain) continue;
+        if (idInKeep(pane.id, keep)) continue;
         if (killByPaneId(alloc, pane.id)) killed += 1;
     }
+
+    // Directory scan misses keepers whose socket was unlinked and whose
+    // pidfile never landed (or was removed). Sweep leftover processes once
+    // every kept pane's keeper pid is accounted for, so we never shoot a
+    // live tab's keeper we simply failed to identify.
+    killed += reapOrphanProcesses(alloc, keep);
     return killed;
+}
+
+fn idInKeep(id: []const u8, keep: []const []const u8) bool {
+    for (keep) |k| {
+        if (std.mem.eql(u8, id, k)) return true;
+    }
+    return false;
 }
 
 /// End a held pane by id, for the case where no window is going to claim it.
@@ -361,20 +408,244 @@ pub fn killByPaneId(alloc: Allocator, pane_id: []const u8) bool {
     ) catch return false;
     defer alloc.free(path);
 
-    const sock = connect(path) catch {
-        // Nothing listening: the socket is a leftover, so clear it away.
-        _ = c.unlink(path.ptr);
-        return false;
-    };
+    var killed = false;
+
+    if (connect(path)) |sock| {
+        defer _ = c.close(sock);
+        const req = "{\"method\":\"kill\"}\n";
+        if (c.write(sock, req.ptr, req.len) >= 0) {
+            var buf: [256]u8 = undefined;
+            const n = c.read(sock, &buf, buf.len);
+            if (n > 0 and std.mem.indexOf(u8, buf[0..@intCast(n)], "\"dead\":true") != null) {
+                killed = true;
+            }
+        }
+    } else |_| {}
+
+    // Socket kill is the polite path. If the name was stolen, the inode is
+    // gone, or the keeper wedged without answering, the pidfile is how we
+    // still find it.
+    if (!killed) {
+        if (readPidfile(alloc, dir_path, pane_id)) |keeper_pid| {
+            if (forceKillPid(keeper_pid)) killed = true;
+        }
+    }
+
+    _ = c.unlink(path.ptr);
+    unlinkPidfile(alloc, dir_path, pane_id);
+    return killed;
+}
+
+fn readPidfile(alloc: Allocator, dir_path: []const u8, pane_id: []const u8) ?c.pid_t {
+    const path = std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}.pid",
+        .{ dir_path, pane_id },
+    ) catch return null;
+    defer alloc.free(path);
+
+    var file = std.Io.Dir.openFileAbsolute(global.io(), path, .{}) catch return null;
+    defer file.close(global.io());
+
+    var buf: [64]u8 = undefined;
+    const n = file.readPositionalAll(global.io(), &buf, 0) catch return null;
+    if (n == 0) return null;
+
+    const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    const pid = std.fmt.parseInt(c.pid_t, trimmed, 10) catch return null;
+    if (pid <= 1) return null;
+    return pid;
+}
+
+fn unlinkPidfile(alloc: Allocator, dir_path: []const u8, pane_id: []const u8) void {
+    const path = std.fmt.allocPrintSentinel(
+        alloc,
+        "{s}/{s}.pid",
+        .{ dir_path, pane_id },
+        0,
+    ) catch return;
+    defer alloc.free(path);
+    _ = c.unlink(path.ptr);
+}
+
+fn processAlive(pid: c.pid_t) bool {
+    return c.kill(pid, 0) == 0;
+}
+
+fn forceKillPid(pid: c.pid_t) bool {
+    if (!processAlive(pid)) return false;
+    _ = c.kill(pid, c.SIGTERM);
+
+    var waited: usize = 0;
+    while (waited < 500) : (waited += 10) {
+        if (!processAlive(pid)) return true;
+        _ = c.usleep(10 * 1000);
+    }
+
+    _ = c.kill(pid, c.SIGKILL);
+    waited = 0;
+    while (waited < 500) : (waited += 10) {
+        if (!processAlive(pid)) return true;
+        _ = c.usleep(10 * 1000);
+    }
+    return !processAlive(pid);
+}
+
+/// Kill `ghostty-keeper` processes we own that do not belong to a kept pane.
+///
+/// Only runs the aggressive "anything unmapped dies" pass when every kept
+/// pane resolves to a keeper pid — otherwise a missing pidfile could make a
+/// live tab look like an orphan.
+fn reapOrphanProcesses(alloc: Allocator, keep: []const []const u8) usize {
+    if (builtin.os.tag != .macos) return 0;
+
+    const dir_path = socketDir(alloc) catch return 0;
+    defer alloc.free(dir_path);
+
+    var protected: std.AutoHashMapUnmanaged(c.pid_t, void) = .{};
+    defer protected.deinit(alloc);
+
+    var unresolved: usize = 0;
+    for (keep) |id| {
+        if (resolveKeeperPid(alloc, dir_path, id)) |pid| {
+            protected.put(alloc, pid, {}) catch {};
+        } else {
+            unresolved += 1;
+        }
+    }
+
+    // Also protect any pid named by a pidfile whose pane id is kept — covers
+    // the case where hello failed but the pidfile is honest.
+    for (keep) |id| {
+        if (readPidfile(alloc, dir_path, id)) |pid| {
+            protected.put(alloc, pid, {}) catch {};
+        }
+    }
+
+    const pids = listKeeperPids(alloc) catch return 0;
+    defer alloc.free(pids);
+
+    var killed: usize = 0;
+    for (pids) |pid| {
+        if (protected.contains(pid)) continue;
+
+        // A pidfile for a non-kept pane: always safe to kill.
+        // An unmapped process with no pidfile: only when every keep id
+        // resolved, so we know this isn't a live tab we failed to identify.
+        const named = paneIdForKeeperPid(alloc, dir_path, pid);
+        defer if (named) |id| alloc.free(id);
+
+        if (named) |id| {
+            if (idInKeep(id, keep)) {
+                protected.put(alloc, pid, {}) catch {};
+                continue;
+            }
+            if (forceKillPid(pid)) {
+                unlinkPidfile(alloc, dir_path, id);
+                const sock = std.fmt.allocPrintSentinel(
+                    alloc,
+                    "{s}/{s}.sock",
+                    .{ dir_path, id },
+                    0,
+                ) catch null;
+                if (sock) |path| {
+                    defer alloc.free(path);
+                    _ = c.unlink(path.ptr);
+                }
+                killed += 1;
+            }
+            continue;
+        }
+
+        if (unresolved == 0 and forceKillPid(pid)) {
+            killed += 1;
+        }
+    }
+
+    return killed;
+}
+
+fn resolveKeeperPid(alloc: Allocator, dir_path: []const u8, pane_id: []const u8) ?c.pid_t {
+    if (readPidfile(alloc, dir_path, pane_id)) |pid| {
+        if (processAlive(pid)) return pid;
+    }
+
+    const path = std.fmt.allocPrintSentinel(
+        alloc,
+        "{s}/{s}.sock",
+        .{ dir_path, pane_id },
+        0,
+    ) catch return null;
+    defer alloc.free(path);
+
+    const sock = connect(path) catch return null;
     defer _ = c.close(sock);
 
-    const req = "{\"method\":\"kill\"}\n";
-    if (c.write(sock, req.ptr, req.len) < 0) return false;
-
+    const req = "{\"method\":\"hello\"}\n";
+    if (c.write(sock, req.ptr, req.len) <= 0) return null;
     var buf: [256]u8 = undefined;
     const n = c.read(sock, &buf, buf.len);
+    if (n <= 0) return null;
+    const pid_u = parseUint(buf[0..@intCast(n)], "\"keeper_pid\":") orelse return null;
+    const pid: c.pid_t = @intCast(pid_u);
+    if (pid <= 1) return null;
+    return pid;
+}
+
+fn paneIdForKeeperPid(alloc: Allocator, dir_path: []const u8, pid: c.pid_t) ?[]const u8 {
+    var dir = std.Io.Dir.openDirAbsolute(
+        global.io(),
+        dir_path,
+        .{ .iterate = true },
+    ) catch return null;
+    defer dir.close(global.io());
+
+    var it = dir.iterate();
+    while (it.next(global.io()) catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".pid")) continue;
+        const id = entry.name[0 .. entry.name.len - ".pid".len];
+        if (readPidfile(alloc, dir_path, id)) |file_pid| {
+            if (file_pid == pid) return alloc.dupe(u8, id) catch null;
+        }
+    }
+    return null;
+}
+
+fn listKeeperPids(alloc: Allocator) ![]c.pid_t {
+    if (builtin.os.tag != .macos) return try alloc.alloc(c.pid_t, 0);
+
+    const uid: u32 = @intCast(c.getuid());
+    // First call asks for the buffer size.
+    const bytes_needed = c.proc_listpids(c.PROC_UID_ONLY, uid, null, 0);
+    if (bytes_needed <= 0) return try alloc.alloc(c.pid_t, 0);
+
+    const cap: usize = @intCast(bytes_needed);
+    const raw = try alloc.alloc(c_int, cap / @sizeOf(c_int) + 8);
+    defer alloc.free(raw);
+
+    const got = c.proc_listpids(c.PROC_UID_ONLY, uid, raw.ptr, @intCast(raw.len * @sizeOf(c_int)));
+    if (got <= 0) return try alloc.alloc(c.pid_t, 0);
+    const count: usize = @as(usize, @intCast(got)) / @sizeOf(c_int);
+
+    var out: std.ArrayList(c.pid_t) = .empty;
+    errdefer out.deinit(alloc);
+
+    for (raw[0..count]) |pid_i| {
+        if (pid_i <= 1) continue;
+        if (!isGhosttyKeeper(@intCast(pid_i))) continue;
+        try out.append(alloc, @intCast(pid_i));
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn isGhosttyKeeper(pid: c.pid_t) bool {
+    if (builtin.os.tag != .macos) return false;
+    var path_buf: [c.PROC_PIDPATHINFO_MAXSIZE]u8 = undefined;
+    const n = c.proc_pidpath(pid, &path_buf, path_buf.len);
     if (n <= 0) return false;
-    return std.mem.indexOf(u8, buf[0..@intCast(n)], "\"dead\":true") != null;
+    const path = path_buf[0..@intCast(n)];
+    return std.mem.endsWith(u8, path, "/" ++ keeper_exe) or
+        std.mem.eql(u8, path, keeper_exe);
 }
 
 // -- internals -------------------------------------------------------------

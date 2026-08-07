@@ -226,6 +226,12 @@ fn start(alloc: std.mem.Allocator, spec: SpawnSpec) !Keeper {
     };
 
     keeper.listener = try listen(spec.socket_path);
+    // A pidfile lets Ghostty find us even if the socket name is stolen or
+    // unlinked while we still hold the inode — which is how keepers used to
+    // become invisible orphans across reattach/spawn races and updates.
+    writePidfile(spec.socket_path) catch |err| {
+        log.warn("could not write pidfile err={}", .{err});
+    };
     log.info("keeper up shell_pid={} socket={s}", .{ pid, spec.socket_path });
     return keeper;
 }
@@ -447,10 +453,13 @@ fn handleRequest(
 
     if (std.mem.eql(u8, method, "hello")) {
         var out: [256]u8 = undefined;
+        // `keeper_pid` is additive: older clients ignore unknown fields, and
+        // newer clients use it to protect live keepers during process reaps
+        // even when a pidfile is missing.
         const msg = try std.fmt.bufPrint(
             &out,
-            "{{\"ok\":true,\"version\":{d},\"shell_pid\":{d},\"alive\":{}}}",
-            .{ protocol_version, self.shell_pid, !self.exited },
+            "{{\"ok\":true,\"version\":{d},\"shell_pid\":{d},\"keeper_pid\":{d},\"alive\":{}}}",
+            .{ protocol_version, self.shell_pid, c.getpid(), !self.exited },
         );
         try reply(client, msg);
         return false;
@@ -664,8 +673,45 @@ fn cleanup(self: *Keeper) void {
         buf[self.socket_path.len] = 0;
         _ = c.unlink(@ptrCast(&buf));
     }
+    unlinkPidfile(self.socket_path);
 
     _ = c.close(self.master);
+}
+
+/// Derive `{pane}.pid` from `{pane}.sock` into `out`. Returns the written
+/// path length, or null if the socket path isn't shaped like we expect.
+fn pidfileInto(socket_path: []const u8, out: *[path_max]u8) ?usize {
+    if (!std.mem.endsWith(u8, socket_path, ".sock")) return null;
+    const base_len = socket_path.len - ".sock".len;
+    const total = base_len + ".pid".len;
+    if (total >= out.len) return null;
+    @memcpy(out[0..base_len], socket_path[0..base_len]);
+    @memcpy(out[base_len..][0..".pid".len], ".pid");
+    out[total] = 0;
+    return total;
+}
+
+fn writePidfile(socket_path: []const u8) !void {
+    var path_buf: [path_max]u8 = undefined;
+    _ = pidfileInto(socket_path, &path_buf) orelse return error.BadSocketPath;
+
+    const fd = c.open(
+        @ptrCast(&path_buf),
+        c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC,
+        @as(c_uint, 0o600),
+    );
+    if (fd < 0) return error.OpenFailed;
+    defer _ = c.close(fd);
+
+    var body: [32]u8 = undefined;
+    const n = std.fmt.bufPrint(&body, "{d}\n", .{c.getpid()}) catch return error.FormatFailed;
+    if (c.write(fd, n.ptr, n.len) < 0) return error.WriteFailed;
+}
+
+fn unlinkPidfile(socket_path: []const u8) void {
+    var path_buf: [path_max]u8 = undefined;
+    _ = pidfileInto(socket_path, &path_buf) orelse return;
+    _ = c.unlink(@ptrCast(&path_buf));
 }
 
 // -- helpers ---------------------------------------------------------------
