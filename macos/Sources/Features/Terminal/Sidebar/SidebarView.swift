@@ -227,7 +227,7 @@ struct SidebarView: View {
         .background(.clear)
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
-                if !updateViewModel.state.isIdle {
+                if !updateViewModel.state.isHidden {
                     HStack {
                         Spacer()
                         UpdatePill(model: updateViewModel)
