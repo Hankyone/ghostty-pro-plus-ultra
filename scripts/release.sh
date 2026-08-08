@@ -120,8 +120,14 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
 fi
 
 # --- Build GhosttyKit (Zig) ---
-# Upstream requires Zig 0.16+, which includes the macOS SDK linker fix that
-# previously required the local xcrun SDK shim.
+# Zig 0.16 fixed the Mach-O linker issue with newer SDK .tbd stubs, but
+# @cImport still chokes on the Xcode 26.4+/27 macOS headers (mach_msg_*
+# types become opaque and size assertions fail). Prefer the local xcrun
+# shim that answers SDK queries with MacOSX15.4 when present.
+if [ -d "${HOME}/.config/zig/sdk-shim" ]; then
+    export PATH="${HOME}/.config/zig/sdk-shim:$PATH"
+fi
+
 if command -v brew >/dev/null 2>&1; then
     RELEASE_ZIG_PREFIX=$(brew --prefix zig 2>/dev/null || true)
     if [ -x "${RELEASE_ZIG_PREFIX}/bin/zig" ]; then
