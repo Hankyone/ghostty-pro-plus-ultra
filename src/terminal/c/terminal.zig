@@ -98,6 +98,9 @@ const TerminalWrapper = struct {
     /// We also need to store a temp dir path for some operations (e.g., kitty
     /// graphics). This provides stable storage for the API calls.
     tmp_dir_path: [max_path_bytes]u8,
+    /// The terminfo name reported for XTGETTCAP "TN". The stream handler holds
+    /// a slice into this.
+    terminfo_name_buf: [Handler.max_terminfo_name_bytes]u8,
     stream: Stream,
     effects: Effects = .{},
     tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
@@ -148,6 +151,36 @@ pub const ProgressReport = extern struct {
     progress: i8,
 };
 
+/// A borrowed unsupported string sequence.
+///
+/// C: GhosttyTerminalUnknownStringSequence
+pub const UnknownStringSequence = extern struct {
+    truncated: bool,
+    content: lib.String,
+};
+
+/// An unsupported terminal sequence reported to the C callback.
+///
+/// C: GhosttyTerminalUnknownSequence
+pub const UnknownSequence = union(Tag) {
+    apc: UnknownStringSequence,
+
+    /// C: GhosttyTerminalUnknownSequenceTag
+    pub const Tag = lib.Enum(lib.target, &.{"apc"});
+
+    const c_union = lib.TaggedUnion(
+        lib.target,
+        @This(),
+        // A future borrowed CSI payload may need parameter, separator, and
+        // intermediate arrays. Reserve 128 bytes so that representation and
+        // other structured sequence types can be added without an ABI break.
+        [16]u64,
+    );
+    pub const C = c_union.C;
+    pub const CValue = c_union.CValue;
+    pub const cval = c_union.cval;
+};
+
 /// A terminal mode and boolean value used for mode configuration.
 ///
 /// C: GhosttyTerminalModeConfig
@@ -161,9 +194,10 @@ pub const ModeConfig = extern struct {
     }
 };
 
-/// C callback state for terminal effects. Trampolines are always
-/// installed on the stream handler; they check these fields and
-/// no-op when the corresponding callback is null.
+/// C callback state for terminal effects. Most trampolines are always
+/// installed on the stream handler; they check these fields and no-op when
+/// the corresponding callback is null. The unknown-sequence trampoline is
+/// installed dynamically to preserve its null fast path.
 const Effects = struct {
     userdata: ?*anyopaque = null,
     write_pty: ?WritePtyFn = null,
@@ -178,6 +212,7 @@ const Effects = struct {
     progress_report: ?ProgressReportFn = null,
     size_cb: ?SizeFn = null,
     clipboard_write: ?ClipboardWriteFn = null,
+    unknown_sequence: ?UnknownSequenceFn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
     /// trampoline converts C feature codes into this buffer and returns
@@ -224,6 +259,10 @@ const Effects = struct {
 
     /// C function pointer type for the progress_report callback.
     pub const ProgressReportFn = *const fn (Terminal, ?*anyopaque, *const ProgressReport) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for the unknown_sequence callback. The request
+    /// and its content are borrowed for the callback duration.
+    pub const UnknownSequenceFn = *const fn (Terminal, ?*anyopaque, *const UnknownSequence.C) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the size callback.
     /// Returns true and fills out_size if size is available,
@@ -408,6 +447,26 @@ const Effects = struct {
         func(@ptrCast(wrapper), wrapper.effects.userdata, &c_report);
     }
 
+    fn unknownSequenceTrampoline(
+        handler: *Handler,
+        sequence: Handler.UnknownSequence,
+    ) void {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.unknown_sequence orelse return;
+        const value = UnknownSequence.cval(switch (sequence) {
+            .apc => |apc_value| .{
+                .apc = .{
+                    .truncated = apc_value.truncated,
+                    .content = .{
+                        .ptr = apc_value.content.ptr,
+                        .len = apc_value.content.len,
+                    },
+                },
+            },
+        });
+        func(@ptrCast(wrapper), wrapper.effects.userdata, &value);
+    }
+
     fn sizeTrampoline(handler: *Handler) ?size_report.Size {
         const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.size_cb orelse return null;
@@ -463,6 +522,7 @@ fn wrap(
         .terminal = t,
         .io = io,
         .tmp_dir_path = undefined,
+        .terminfo_name_buf = undefined,
         .stream = Stream.init(.{
             .allocator = alloc,
             .handler = handler,
@@ -905,6 +965,9 @@ pub const Option = enum(c_int) {
     title_report = 32,
     mode_default = 33,
     mode = 34,
+    unknown_sequence = 35,
+    unknown_max_bytes = 36,
+    terminfo_name = 37,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -922,7 +985,8 @@ pub const Option = enum(c_int) {
             .progress_report => ?Effects.ProgressReportFn,
             .size_cb => ?Effects.SizeFn,
             .clipboard_write => ?Effects.ClipboardWriteFn,
-            .title, .pwd => ?*const lib.String,
+            .unknown_sequence => ?Effects.UnknownSequenceFn,
+            .title, .pwd, .terminfo_name => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
             .kitty_image_storage_limit => ?*const u64,
@@ -937,6 +1001,7 @@ pub const Option = enum(c_int) {
             .scrollback_max_bytes,
             .scrollback_max_lines,
             .continuation_max_bytes,
+            .unknown_max_bytes,
             => ?*const usize,
             .selection => ?*const selection_c.CSelection,
             .default_cursor_style => ?*const TerminalCursorStyle,
@@ -988,6 +1053,13 @@ fn setTyped(
         .progress_report => wrapper.effects.progress_report = value,
         .size_cb => wrapper.effects.size_cb = value,
         .clipboard_write => wrapper.effects.clipboard_write = value,
+        .unknown_sequence => {
+            wrapper.effects.unknown_sequence = value;
+            wrapper.stream.handler.unknown_sequence = if (value != null)
+                &Effects.unknownSequenceTrampoline
+            else
+                null;
+        },
         .title_report => wrapper.stream.handler.title_report = if (value) |ptr|
             ptr.*
         else
@@ -999,6 +1071,15 @@ fn setTyped(
         .pwd => {
             const str = if (value) |v| v.ptr[0..v.len] else "";
             wrapper.terminal.setPwd(str) catch return .out_of_memory;
+        },
+        .terminfo_name => {
+            const str = if (value) |v| v.ptr[0..v.len] else "";
+            if (str.len > wrapper.terminfo_name_buf.len) return .invalid_value;
+            @memcpy(wrapper.terminfo_name_buf[0..str.len], str);
+            wrapper.stream.handler.terminfo_name = if (str.len > 0)
+                wrapper.terminfo_name_buf[0..str.len]
+            else
+                null;
         },
         .color_foreground => {
             wrapper.terminal.colors.foreground.default = if (value) |v| .fromC(v.*) else null;
@@ -1106,6 +1187,8 @@ fn setTyped(
             wrapper,
             if (value) |ptr| ptr.* else default_continuation_max_bytes,
         ),
+        .unknown_max_bytes => wrapper.stream.handler.apc_handler.unknown_max_bytes =
+            if (value) |ptr| ptr.* else 0,
         .mode, .mode_default => {
             const config = (value orelse return .invalid_value).*;
             const mode = config.toMode() orelse return .invalid_value;
@@ -3666,6 +3749,73 @@ test "xtversion without callback reports default" {
     try testing.expectEqualStrings("\x1BP>|libghostty\x1B\\", S.last_data.?);
 }
 
+test "set terminfo_name option" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+
+        fn deinit() void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = null;
+        }
+
+        fn writePty(_: Terminal, _: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+    };
+    defer S.deinit();
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+
+    // While no name is set the query goes unanswered; other capabilities
+    // are still served from the static map.
+    const query = "\x1BP+q" ++ std.fmt.bytesToHex("TN", .upper) ++ "\x1B\\";
+    vt_write(t, query, query.len);
+    try testing.expect(S.last_data == null);
+    const co_query = "\x1BP+q" ++ std.fmt.bytesToHex("Co", .upper) ++ "\x1B\\";
+    vt_write(t, co_query, co_query.len);
+    try testing.expectEqualStrings(
+        "\x1BP1+r" ++ std.fmt.bytesToHex("Co", .upper) ++ "=" ++
+            std.fmt.bytesToHex("256", .upper) ++ "\x1B\\",
+        S.last_data.?,
+    );
+    S.deinit();
+
+    // The name is copied, so the caller's buffer can go away afterwards.
+    var name: [14]u8 = "xterm-256color".*;
+    const value: lib.String = .{ .ptr = &name, .len = name.len };
+    try testing.expectEqual(Result.success, set(t, .terminfo_name, @ptrCast(&value)));
+    @memset(&name, 'z');
+
+    vt_write(t, query, query.len);
+    try testing.expect(S.last_data != null);
+    try testing.expectEqualStrings(
+        "\x1BP1+r" ++ std.fmt.bytesToHex("TN", .upper) ++ "=" ++
+            std.fmt.bytesToHex("xterm-256color", .upper) ++ "\x1B\\",
+        S.last_data.?,
+    );
+
+    // Clearing with NULL leaves the query unanswered again.
+    S.deinit();
+    try testing.expectEqual(Result.success, set(t, .terminfo_name, null));
+    vt_write(t, query, query.len);
+    try testing.expect(S.last_data == null);
+
+    // Names beyond the maximum are rejected rather than truncated.
+    const long: [Handler.max_terminfo_name_bytes + 1]u8 = @splat('a');
+    const long_value: lib.String = .{ .ptr = &long, .len = long.len };
+    try testing.expectEqual(Result.invalid_value, set(t, .terminfo_name, @ptrCast(&long_value)));
+}
+
 test "set title_changed callback" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
@@ -3859,6 +4009,114 @@ test "set progress_report callback" {
     const ignored = "\x1B]9;4;1;90\x1B\\";
     vt_write(t, ignored, ignored.len);
     try testing.expectEqual(@as(usize, cases.len), S.count);
+}
+
+test "set unknown_sequence callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var count: usize = 0;
+        var last_terminal: Terminal = null;
+        var last_userdata: ?*anyopaque = null;
+        var last_tag: UnknownSequence.Tag = .apc;
+        var last_truncated: bool = false;
+        var content: [64]u8 = undefined;
+        var content_len: usize = 0;
+
+        fn unknownSequence(
+            terminal_: Terminal,
+            ud: ?*anyopaque,
+            sequence: *const UnknownSequence.C,
+        ) callconv(lib.calling_conv) void {
+            count += 1;
+            last_terminal = terminal_;
+            last_userdata = ud;
+            last_tag = sequence.tag;
+            const apc_value = sequence.value.apc;
+            last_truncated = apc_value.truncated;
+            content_len = @min(apc_value.content.len, content.len);
+            @memcpy(content[0..content_len], apc_value.content.ptr[0..content_len]);
+        }
+    };
+    S.count = 0;
+    S.last_terminal = null;
+    S.last_userdata = null;
+    S.last_tag = .apc;
+    S.last_truncated = false;
+    S.content_len = 0;
+
+    var sentinel: u8 = 101;
+    try testing.expectEqual(Result.success, set(t, .userdata, @ptrCast(&sentinel)));
+
+    const max_bytes: usize = 8;
+    try testing.expectEqual(Result.success, set(
+        t,
+        .unknown_max_bytes,
+        @ptrCast(&max_bytes),
+    ));
+    try testing.expectEqual(max_bytes, t.?.stream.handler.apc_handler.unknown_max_bytes);
+
+    // A byte limit without a callback performs no external effect.
+    const before_callback = "\x1B_abc;xy\x1B\\";
+    vt_write(t, before_callback, before_callback.len);
+    try testing.expectEqual(@as(usize, 0), S.count);
+    try testing.expect(t.?.stream.handler.unknown_sequence == null);
+
+    try testing.expectEqual(Result.success, set(
+        t,
+        .unknown_sequence,
+        @ptrCast(&S.unknownSequence),
+    ));
+    try testing.expect(t.?.stream.handler.unknown_sequence != null);
+
+    // Split a complete APC across writes to exercise persistent parser state.
+    const seq_a = "\x1B_abc;";
+    const seq_b = "xy\x1B\\";
+    vt_write(t, seq_a, seq_a.len);
+    try testing.expectEqual(@as(usize, 0), S.count);
+    vt_write(t, seq_b, seq_b.len);
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqual(t, S.last_terminal);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
+    try testing.expectEqual(UnknownSequence.Tag.apc, S.last_tag);
+    try testing.expect(!S.last_truncated);
+    try testing.expectEqualStrings("abc;xy", S.content[0..S.content_len]);
+
+    // Content beyond the generic limit is omitted and marked truncated.
+    const truncated = "\x1B_abcdefghijkl\x1B\\";
+    vt_write(t, truncated, truncated.len);
+    try testing.expectEqual(@as(usize, 2), S.count);
+    try testing.expect(S.last_truncated);
+    try testing.expectEqualStrings("abcdefgh", S.content[0..S.content_len]);
+
+    // CAN aborts the APC and must not invoke the callback.
+    const aborted = "\x1B_abcdef\x18";
+    vt_write(t, aborted, aborted.len);
+    try testing.expectEqual(@as(usize, 2), S.count);
+
+    // Clearing the callback restores the null fast path immediately.
+    try testing.expectEqual(Result.success, set(t, .unknown_sequence, null));
+    try testing.expect(t.?.stream.handler.unknown_sequence == null);
+    vt_write(t, before_callback, before_callback.len);
+    try testing.expectEqual(@as(usize, 2), S.count);
+
+    // A NULL limit disables capture even after reinstalling the callback.
+    try testing.expectEqual(Result.success, set(
+        t,
+        .unknown_sequence,
+        @ptrCast(&S.unknownSequence),
+    ));
+    try testing.expectEqual(Result.success, set(t, .unknown_max_bytes, null));
+    try testing.expectEqual(@as(usize, 0), t.?.stream.handler.apc_handler.unknown_max_bytes);
+    vt_write(t, before_callback, before_callback.len);
+    try testing.expectEqual(@as(usize, 2), S.count);
 }
 
 test "set pwd_changed callback" {

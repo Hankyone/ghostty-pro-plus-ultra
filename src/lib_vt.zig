@@ -80,6 +80,7 @@ pub const Terminal = terminal.Terminal;
 pub const TerminalStream = terminal.TerminalStream;
 pub const Stream = terminal.Stream;
 pub const StreamAction = terminal.StreamAction;
+pub const UnknownSequence = terminal.UnknownSequence;
 pub const Cursor = Screen.Cursor;
 pub const CursorStyle = Screen.CursorStyle;
 pub const CursorStyleReq = terminal.CursorStyle;
