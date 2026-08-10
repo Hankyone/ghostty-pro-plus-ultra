@@ -205,7 +205,10 @@ extension Ghostty {
                 // top Z-index os it isn't faded by the unfocused overlay.
                 //
                 // This is disabled except on macOS because it uses AppKit drag/drop APIs.
-                SurfaceGrabHandle(surfaceView: surfaceView)
+                SurfaceGrabHandle(
+                    surfaceView: surfaceView,
+                    dragHandle: ghostty.config.dragHandle,
+                )
                 #endif
             }
         }

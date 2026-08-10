@@ -78,6 +78,32 @@ pub fn create(alloc: Allocator) CreateError!*App {
     var app = try alloc.create(App);
     errdefer alloc.destroy(app);
     try app.init(alloc);
+
+    // If font discovery supports warmup, then we call it. Some font
+    // mechanisms (e.g. CoreText) have a multi-millisecond one-time cost
+    // on startup.
+    if (comptime @hasDecl(font.Discover, "warmup")) {
+        if (std.Thread.spawn(
+            .{},
+            font.Discover.warmup,
+            .{},
+        )) |thr| thr.detach() else |err| {
+            log.warn("font warmup thread spawn failed err={}", .{err});
+        }
+    }
+
+    // Same for the renderer's graphics API (e.g. Metal), which pays
+    // one-time framework initialization costs on first use.
+    if (comptime @hasDecl(renderer.Renderer.API, "warmup")) {
+        if (std.Thread.spawn(
+            .{},
+            renderer.Renderer.API.warmup,
+            .{},
+        )) |thr| thr.detach() else |err| {
+            log.warn("renderer warmup thread spawn failed err={}", .{err});
+        }
+    }
+
     return app;
 }
 

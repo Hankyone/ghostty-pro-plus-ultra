@@ -51,17 +51,25 @@ pub const Io = struct {
     impl: Impl,
 
     /// Platform-specific storage backing the public `std.Io` value.
-    const Impl = if (builtin.os.tag != .freestanding)
+    ///
+    /// Where supported (POSIX) we use TinyIo, which is stateless and
+    /// supports exactly the operations the terminal needs at a fraction
+    /// of the code size (see lib/TinyIo.zig). On Windows we use
+    /// `std.Io.Threaded` since TinyIo doesn't implement the NT
+    /// operations. On the remaining targets (e.g. freestanding wasm)
+    /// TinyIo degrades to `std.Io.failing`, which is correct: they have
+    /// no filesystem.
+    const Impl = if (builtin.os.tag == .windows)
         *std.Io.Threaded
     else
-        void;
+        lib.TinyIo;
 
     /// Allocation failures possible while constructing an I/O owner.
     pub const Error = error{OutOfMemory};
 
     /// Allocate the native I/O implementation when the platform requires it.
     pub fn init(alloc: std.mem.Allocator) Error!Io {
-        if (comptime builtin.os.tag == .freestanding) return .{ .impl = {} };
+        if (comptime Impl == lib.TinyIo) return .{ .impl = .init };
 
         const ptr = alloc.create(std.Io.Threaded) catch
             return error.OutOfMemory;
@@ -71,15 +79,15 @@ pub const Io = struct {
 
     /// Return the value passed to native terminal construction and decoding.
     pub fn io(self: Io) std.Io {
-        if (comptime builtin.os.tag == .freestanding) {
-            return std.Io.failing;
-        }
         return self.impl.io();
     }
 
     /// Release an I/O implementation that has not already been transferred.
     pub fn deinit(self: Io, alloc: std.mem.Allocator) void {
-        if (comptime builtin.os.tag != .freestanding) {
+        // Note: this must not name `std.Io.Threaded` in the condition
+        // because resolving that type trips its container-level comptime
+        // checks on targets it doesn't support (e.g. wasm32-freestanding).
+        if (comptime Impl != lib.TinyIo) {
             self.impl.deinit();
             alloc.destroy(self.impl);
         }
