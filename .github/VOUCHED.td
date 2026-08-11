@@ -90,6 +90,7 @@ damyanbogoev
 danneu
 danulqua
 dariogriffo
+dave92082
 davidsanchez222
 deblasis
 dervedro
@@ -248,6 +249,7 @@ pluiedev
 pouwerkerk
 poweruser64
 prakhar54-byte
+prihlop
 priyans-hu
 puzza007
 qappell

@@ -1329,7 +1329,7 @@ pub const Window = extern struct {
             priv.handle_active_state_source = null;
         }
 
-        priv.command_palette.set(null);
+        priv.command_palette.deinit();
 
         if (priv.config) |v| {
             v.unref();

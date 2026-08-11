@@ -1,10 +1,14 @@
-// Ghostty embedding API. The documentation for the embedding API is
-// only within the Zig source files that define the implementations. This
-// isn't meant to be a general purpose embedding API (yet) so there hasn't
-// been documentation or example work beyond that.
+// Ghostty's internal embedder API, a.k.a. "libghostty-internal".
 //
-// The only consumer of this API is the macOS app, but the API is built to
-// be more general purpose.
+// The only consumer of this API is the macOS app, and while it is fairly
+// comprehensive, it is tailored to the needs of the macOS app and not designed
+// for external use, hence why most functions are undocumented and some are
+// macOS-specific (e.g. ones dealing with the Metal graphics API).
+// 
+// External embedders should instead use `libghostty-vt` or other related
+// packages, which are extensively documented and designed from the ground up
+// to be used in other software. Header files for which can be found in
+// `include/ghostty/`.
 #ifndef GHOSTTY_H
 #define GHOSTTY_H
 
@@ -688,6 +692,14 @@ typedef struct {
   const char* pwd;
 } ghostty_action_pwd_s;
 
+// apprt.action.OpenConfig
+typedef enum {
+  // Open the config in the OS default editor.
+  GHOSTTY_ACTION_OPEN_CONFIG_OS_OPEN,
+  // Open the config in a new window using $EDITOR or $VISUAL
+  GHOSTTY_ACTION_OPEN_CONFIG_NEW_WINDOW,
+} ghostty_action_open_config_e;
+
 // terminal.MouseShape
 typedef enum {
   GHOSTTY_MOUSE_SHAPE_DEFAULT,
@@ -1003,6 +1015,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_open_config_e open_config;
 } ghostty_action_u;
 
 typedef struct {
