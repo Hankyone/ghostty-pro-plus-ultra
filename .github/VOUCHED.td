@@ -40,6 +40,7 @@ akimiojr
 alaasdk
 alanmoyano
 alaviss
+alex19ep
 alexbathome
 alexfeijoo44
 alexjuca
@@ -119,6 +120,7 @@ exlee
 -f1813483-netizen
 fallintoplace
 faukah
+figelwump
 filip7
 flou
 fornwall
@@ -278,6 +280,7 @@ sanjj1
 secrus
 seruman
 seyoungjeong
+shorsher
 silveirapf
 simonbcn
 slsrepo
