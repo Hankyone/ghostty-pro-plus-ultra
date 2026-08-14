@@ -99,7 +99,9 @@ devsunb
 diaaeddin
 dkinzler
 dmehala
+dmunozv04
 dobbylee
+dolzenko
 doprz
 douglance
 douglas
@@ -253,6 +255,7 @@ poweruser64
 prakhar54-byte
 prihlop
 priyans-hu
+pssalman
 puzza007
 qappell
 quinnypig
@@ -280,10 +283,12 @@ sanjj1
 secrus
 seruman
 seyoungjeong
+sghng
 shorsher
 silveirapf
 simonbcn
 slsrepo
+steven-tk
 sunshine-syz
 svmhdvn
 tasselx
@@ -319,4 +324,5 @@ ydah
 zenangst
 zenyr
 zeshi09
+zlitus
 zubb
