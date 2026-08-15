@@ -460,6 +460,9 @@ pub const TerminalFormatter = struct {
                 }
             }
 
+            // Screen contents are formatted relative to the top-left.
+            try writer.writeAll("\x1b[H");
+
             // If we have a pin_map, add the bytes we wrote to map.
             if (self.pin_map) |*m| {
                 var discarding: std.Io.Writer.Discarding = .init(&.{});
@@ -1265,32 +1268,17 @@ pub const PageFormatter = struct {
                         if (style_id == invalid_style_id) break :fast;
                     }
 
-                    // Specialized on point tracking so that the common
-                    // non-tracking case has zero per-cell overhead.
-                    const consumed = if (self.point_map == null)
-                        try self.writeCellRun(
-                            emit,
-                            false,
-                            writer,
-                            cells_subset[cell_i..],
-                            x,
-                            y,
-                            style_id,
-                            current_hyperlink_id,
-                            &blank_cells,
-                        )
-                    else
-                        try self.writeCellRun(
-                            emit,
-                            true,
-                            writer,
-                            cells_subset[cell_i..],
-                            x,
-                            y,
-                            style_id,
-                            current_hyperlink_id,
-                            &blank_cells,
-                        );
+                    const consumed = try self.writeCellRun(
+                        emit,
+                        self.point_map != null,
+                        writer,
+                        cells_subset[cell_i..],
+                        x,
+                        y,
+                        style_id,
+                        current_hyperlink_id,
+                        &blank_cells,
+                    );
 
                     // Zero cells consumed means the first cell isn't
                     // eligible for the fast path; handle it below.
@@ -1576,10 +1564,15 @@ pub const PageFormatter = struct {
     /// Blank cell accounting matches the slow path: accumulated blanks
     /// are only materialized once a non-blank cell is found, and any
     /// remainder is written back to `blank_cells`.
-    fn writeCellRun(
+    // Deliberately not inlined: this is instantiated per emit format and
+    // inlining every copy into formatWithStateEmit's row loop bloats the
+    // binary. track_points is a runtime bool for the same reason: a
+    // comptime bool doubles the instantiation count for one predictable
+    // branch per emitted cell.
+    noinline fn writeCellRun(
         self: *const PageFormatter,
         comptime emit: Format,
-        comptime track_points: bool,
+        track_points: bool,
         writer: *std.Io.Writer,
         cells: []const Cell,
         run_x: size.CellCountInt,
@@ -1663,7 +1656,7 @@ pub const PageFormatter = struct {
 
             // This cell produces output: materialize accumulated blanks.
             if (pending > 0) {
-                if (comptime track_points) try self.appendBlankPoints(
+                if (track_points) try self.appendBlankPoints(
                     &self.point_map.?,
                     pending,
                     x,
@@ -1715,7 +1708,7 @@ pub const PageFormatter = struct {
             }
 
             // All of the cell's bytes map to the cell's coordinate.
-            if (comptime track_points) {
+            if (track_points) {
                 const map = &self.point_map.?;
                 map.map.appendNTimes(
                     map.alloc,
@@ -5617,7 +5610,7 @@ test "Terminal vt with tabstops" {
     s.nextSlice("\x1b[5G\x1bH"); // Set tab at column 5
     s.nextSlice("\x1b[15G\x1bH"); // Set tab at column 15
     s.nextSlice("\x1b[30G\x1bH"); // Set tab at column 30
-    s.nextSlice("hello");
+    s.nextSlice("\x1b[Hhello");
 
     var pin_map: PinMap.Map = .empty;
     defer pin_map.deinit(alloc);
@@ -5650,6 +5643,14 @@ test "Terminal vt with tabstops" {
     try testing.expect(t2.tabstops.get(14)); // Column 15 (1-indexed)
     try testing.expect(t2.tabstops.get(29)); // Column 30 (1-indexed)
     try testing.expect(!t2.tabstops.get(8)); // Not a tab
+
+    // Tabstop serialization must not offset the screen contents.
+    for ("hello", 0..) |expected, col| {
+        const cell = t2.screens.active.pages.getCell(.{
+            .screen = .{ .x = @intCast(col), .y = 0 },
+        }).?;
+        try testing.expectEqual(expected, cell.cell.codepoint());
+    }
 
     // Emitting tabstops moves the cursor to each configured column. When
     // cursor state is included, it must be restored afterwards.
