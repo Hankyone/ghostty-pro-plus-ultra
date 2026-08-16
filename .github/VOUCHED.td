@@ -97,9 +97,13 @@ deblasis
 dervedro
 devsunb
 diaaeddin
+diego-moment
+diegoarmstrong
 dkinzler
 dmehala
+dmunozv04
 dobbylee
+dolzenko
 doprz
 douglance
 douglas
@@ -108,6 +112,7 @@ drepper
 dzhlobo
 ekaterinepapava
 elias8
+elitex45
 -enkr1
 enzowilliam
 ephemera
@@ -251,8 +256,10 @@ pluiedev
 pouwerkerk
 poweruser64
 prakhar54-byte
+preiter93
 prihlop
 priyans-hu
+pssalman
 puzza007
 qappell
 quinnypig
@@ -280,10 +287,12 @@ sanjj1
 secrus
 seruman
 seyoungjeong
+sghng
 shorsher
 silveirapf
 simonbcn
 slsrepo
+steven-tk
 sunshine-syz
 svmhdvn
 tasselx
@@ -319,4 +328,5 @@ ydah
 zenangst
 zenyr
 zeshi09
+zlitus
 zubb
