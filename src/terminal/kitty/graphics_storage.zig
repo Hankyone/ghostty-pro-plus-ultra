@@ -447,47 +447,53 @@ pub const ImageStorage = struct {
         return newest;
     }
 
+    /// Clear placements intersecting the active screen, then reclaim every
+    /// image with no remaining placement. Unlike protocol d=A, a terminal
+    /// clear also reclaims images that were already unplaced.
+    pub fn clearScreen(
+        self: *ImageStorage,
+        io: std.Io,
+        alloc: Allocator,
+        t: *terminal.Terminal,
+    ) void {
+        const placements_before = self.placements.count();
+        const images_before = self.images.count();
+
+        // Delete unused placements and images
+        self.deleteVisiblePlacements(alloc, t, true);
+        var image_it = self.images.iterator();
+        while (image_it.next()) |entry| {
+            self.deleteIfUnused(alloc, entry.key_ptr.*);
+        }
+
+        // Mark mutated only if things changed.
+        if (self.placements.count() != placements_before or
+            self.images.count() != images_before) self.markMutated(io);
+    }
+
     /// Delete placements, images.
     pub fn delete(
         self: *ImageStorage,
         io: std.Io,
         alloc: Allocator,
         t: *terminal.Terminal,
-        cmd: command.Delete,
+        cmd: command.Delete.Action,
     ) void {
         // Deletes only ever remove placements/images, so comparing counts
         // before and after tells us whether anything actually changed.
-        // Only then do we mark a mutation. This matters because a
-        // delete-all runs on every screen clear (e.g. `ESC [ 2 J`), and
-        // we don't want empty clears to dirty the image state or bump
-        // the generation.
+        // Only then do we mark a mutation, so a delete that matches nothing
+        // doesn't dirty the image state or bump the generation.
         const placements_before = self.placements.count();
         const images_before = self.images.count();
         defer if (self.placements.count() != placements_before or
             self.images.count() != images_before) self.markMutated(io);
 
         switch (cmd) {
-            .all => |delete_images| {
-                var it = self.placements.iterator();
-                while (it.next()) |entry| {
-                    // Skip virtual placements
-                    switch (entry.value_ptr.location) {
-                        .pin => {},
-                        .virtual => continue,
-                    }
-
-                    // Deinit the placement and remove it
-                    const image_id = entry.key_ptr.image_id;
-                    entry.value_ptr.deinit(t.screens.active);
-                    self.removePlacementByPtr(entry.key_ptr);
-                    if (delete_images) self.deleteIfUnused(alloc, image_id);
-                }
-
-                if (delete_images) {
-                    var image_it = self.images.iterator();
-                    while (image_it.next()) |kv| self.deleteIfUnused(alloc, kv.key_ptr.*);
-                }
-            },
+            .all => |delete_images| self.deleteVisiblePlacements(
+                alloc,
+                t,
+                delete_images,
+            ),
 
             .id => |v| self.deleteById(
                 alloc,
@@ -633,8 +639,9 @@ pub const ImageStorage = struct {
             },
 
             .range => |v| range: {
-                if (v.first <= 0 or v.last <= 0) {
-                    log.warn("delete range values must be greater than zero", .{});
+                // The lower bound defaults to zero when x is omitted.
+                if (v.last == 0) {
+                    log.warn("delete range upper bound must be greater than zero", .{});
                     break :range;
                 }
                 if (v.first > v.last) {
@@ -642,13 +649,24 @@ pub const ImageStorage = struct {
                     break :range;
                 }
 
-                var it = self.placements.iterator();
-                while (it.next()) |entry| {
-                    if (entry.key_ptr.image_id >= v.first and entry.key_ptr.image_id <= v.last) {
-                        const image_id = entry.key_ptr.image_id;
-                        entry.value_ptr.deinit(t.screens.active);
-                        self.removePlacementByPtr(entry.key_ptr);
-                        if (v.delete) self.deleteIfUnused(alloc, image_id);
+                // Remove matching placements in one pass.
+                var placement_it = self.placements.iterator();
+                while (placement_it.next()) |entry| {
+                    if (entry.key_ptr.image_id < v.first or
+                        entry.key_ptr.image_id > v.last) continue;
+
+                    entry.value_ptr.deinit(t.screens.active);
+                    self.removePlacementByPtr(entry.key_ptr);
+                }
+
+                // Uppercase deletion also frees matching images that are now
+                // unused, including images that had no placements initially.
+                if (!v.delete) break :range;
+                var image_it = self.images.iterator();
+                while (image_it.next()) |entry| {
+                    const image_id = entry.key_ptr.*;
+                    if (image_id >= v.first and image_id <= v.last) {
+                        self.deleteIfUnused(alloc, image_id);
                     }
                 }
             },
@@ -656,6 +674,43 @@ pub const ImageStorage = struct {
             // We don't support animation frames yet so they are successfully
             // deleted!
             .animation_frames => {},
+        }
+    }
+
+    /// Delete only non-virtual placements that intersect the active screen.
+    /// The protocol defines d=a/A in terms of visible placements, and an
+    /// uppercase delete only frees data for images selected by those
+    /// placements.
+    fn deleteVisiblePlacements(
+        self: *ImageStorage,
+        alloc: Allocator,
+        t: *terminal.Terminal,
+        delete_unused: bool,
+    ) void {
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            const pin = switch (entry.value_ptr.location) {
+                .pin => |pin| pin,
+                .virtual => continue,
+            };
+            if (pin.garbage) continue;
+
+            // Placements anchored in the active area are necessarily visible.
+            // Only compute their extent when the anchor is already in history
+            // and the bottom edge may still intersect the active area.
+            if (t.screens.active.pages.pointFromPin(
+                .active,
+                pin.*,
+            ) == null) {
+                const image = self.imageById(entry.key_ptr.image_id) orelse continue;
+                const rect = entry.value_ptr.rect(image, t) orelse continue;
+                if (t.screens.active.pages.pointFromPin(.active, rect.bottom_right) == null) continue;
+            }
+
+            const image_id = entry.key_ptr.image_id;
+            entry.value_ptr.deinit(t.screens.active);
+            self.removePlacementByPtr(entry.key_ptr);
+            if (delete_unused) self.deleteIfUnused(alloc, image_id);
         }
     }
 
@@ -667,28 +722,28 @@ pub const ImageStorage = struct {
         placement_id: u32,
         delete_unused: bool,
     ) void {
+        var matched = placement_id == 0;
+
         // If no placement, we delete all placements with the ID
-        if (placement_id == 0) {
-            var it = self.placements.iterator();
-            while (it.next()) |entry| {
-                if (entry.key_ptr.image_id == image_id) {
-                    entry.value_ptr.deinit(s);
-                    self.removePlacementByPtr(entry.key_ptr);
-                }
-            }
-        } else {
-            if (self.placements.getEntry(.{
-                .image_id = image_id,
-                .placement_id = .{ .tag = .external, .id = placement_id },
-            })) |entry| {
-                entry.value_ptr.deinit(s);
-                self.removePlacementByPtr(entry.key_ptr);
-            }
+        if (placement_id == 0) self.removePlacementsByImageId(
+            s,
+            image_id,
+        ) else if (self.placements.getEntry(.{
+            .image_id = image_id,
+            .placement_id = .{
+                .tag = .external,
+                .id = placement_id,
+            },
+        })) |entry| {
+            entry.value_ptr.deinit(s);
+            self.removePlacementByPtr(entry.key_ptr);
+            matched = true;
         }
 
-        // If this is specified, then we also delete the image
-        // if it is no longer in use.
-        if (delete_unused) self.deleteIfUnused(alloc, image_id);
+        // A placement ID narrows the selection to that exact placement, so an
+        // unmatched selector must not free otherwise-unreferenced image data.
+        // https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
+        if (delete_unused and matched) self.deleteIfUnused(alloc, image_id);
     }
 
     /// Delete an image if it is unused.
@@ -894,6 +949,58 @@ pub const ImageStorage = struct {
             return std.math.cast(u32, rounded) orelse std.math.maxInt(u32);
         }
 
+        pub const SourceRect = struct {
+            x: u32,
+            y: u32,
+            width: u32,
+            height: u32,
+        };
+
+        /// Returns the requested source rectangle intersected with the image.
+        /// A zero width or height requests the full corresponding image
+        /// dimension before intersection, as defined by the Kitty protocol.
+        pub fn sourceRect(self: Placement, image: Image) SourceRect {
+            const x = @min(self.source_x, image.width);
+            const y = @min(self.source_y, image.height);
+            return .{
+                .x = x,
+                .y = y,
+                .width = @min(
+                    if (self.source_width > 0) self.source_width else image.width,
+                    image.width - x,
+                ),
+                .height = @min(
+                    if (self.source_height > 0) self.source_height else image.height,
+                    image.height - y,
+                ),
+            };
+        }
+
+        /// Returns the placement offset clamped within the first cell. Pixel
+        /// geometry may temporarily be unavailable, in which case there is no
+        /// valid offset within the cell.
+        pub fn cellOffset(
+            self: Placement,
+            t: *const terminal.Terminal,
+        ) struct {
+            x: u32,
+            y: u32,
+        } {
+            const cell_width: u32 = t.width_px / t.cols;
+            const cell_height: u32 = t.height_px / t.rows;
+
+            return .{
+                .x = if (cell_width > 0)
+                    @min(self.x_offset, cell_width - 1)
+                else
+                    0,
+                .y = if (cell_height > 0)
+                    @min(self.y_offset, cell_height - 1)
+                else
+                    0,
+            };
+        }
+
         /// Returns the size of this placement's image in pixels,
         /// taking into account the source rectangle, specified
         /// rows/columns, and aspect ratio.
@@ -905,9 +1012,9 @@ pub const ImageStorage = struct {
             width: u32,
             height: u32,
         } {
-            // Height / width of the image in px.
-            const width = if (self.source_width > 0) self.source_width else image.width;
-            const height = if (self.source_height > 0) self.source_height else image.height;
+            const source = self.sourceRect(image);
+            const width = source.width;
+            const height = source.height;
 
             // If we don't have any specified cols or rows then the placement
             // should be the native size of the image, and doesn't need to be
@@ -924,6 +1031,7 @@ pub const ImageStorage = struct {
             // count and the height by the row count, because it should be.
             const cell_width: u32 = t.width_px / t.cols;
             const cell_height: u32 = t.height_px / t.rows;
+            const cell_offset = self.cellOffset(t);
 
             // If we have a specified cols AND rows then we calculate
             // the width and height from them directly, we don't need
@@ -933,8 +1041,8 @@ pub const ImageStorage = struct {
                 const calc_height = saturatingMul(cell_height, self.rows);
 
                 return .{
-                    .width = calc_width,
-                    .height = calc_height,
+                    .width = calc_width -| cell_offset.x,
+                    .height = calc_height -| cell_offset.y,
                 };
             }
 
@@ -944,7 +1052,10 @@ pub const ImageStorage = struct {
             // If only the columns were specified, we determine
             // the height of the image based on the aspect ratio.
             if (self.columns > 0) {
-                const calc_width = saturatingMul(cell_width, self.columns);
+                const calc_width = saturatingMul(
+                    cell_width,
+                    self.columns,
+                ) -| cell_offset.x;
                 const calc_height = scaleDimension(calc_width, height, width);
 
                 return .{
@@ -956,7 +1067,10 @@ pub const ImageStorage = struct {
             // Otherwise, only the rows were specified, so we
             // determine the width based on the aspect ratio.
             {
-                const calc_height = saturatingMul(cell_height, self.rows);
+                const calc_height = saturatingMul(
+                    cell_height,
+                    self.rows,
+                ) -| cell_offset.y;
                 const calc_width = scaleDimension(calc_height, width, height);
 
                 return .{
@@ -984,15 +1098,16 @@ pub const ImageStorage = struct {
             // Otherwise we calculate the pixel size, divide by
             // cell size, and round up to the nearest integer.
             const calc_size = self.pixelSize(image, t);
+            const cell_offset = self.cellOffset(t);
             return .{
                 .cols = std.math.divCeil(
                     u32,
-                    calc_size.width +| self.x_offset,
+                    calc_size.width +| cell_offset.x,
                     t.width_px / t.cols,
                 ) catch 0,
                 .rows = std.math.divCeil(
                     u32,
-                    calc_size.height +| self.y_offset,
+                    calc_size.height +| cell_offset.y,
                     t.height_px / t.rows,
                 ) catch 0,
             };
@@ -1176,7 +1291,7 @@ test "storage: placement count limit permits replacement" {
     try testing.expectEqual(@as(usize, 1), s.placements.count());
 }
 
-test "storage: delete all placements and images" {
+test "storage: delete all visible placements and matching images" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -1195,7 +1310,8 @@ test "storage: delete all placements and images" {
     s.dirty = false;
     s.delete(io, alloc, &t, .{ .all = true });
     try testing.expect(s.dirty);
-    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(3));
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
 }
@@ -1220,10 +1336,96 @@ test "storage: delete all placements and images preserves limit" {
     s.dirty = false;
     s.delete(io, alloc, &t, .{ .all = true });
     try testing.expect(s.dirty);
-    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(3));
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(@as(usize, 5000), s.total_limit);
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: delete all visible placements preserves scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const history_key: ImageStorage.PlacementKey = .{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    };
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        s.placements.get(history_key).?.location.pin.*,
+    ) == null);
+
+    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+
+    s.delete(io, alloc, &t, .{ .all = true });
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expect(s.placements.contains(history_key));
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(1));
+}
+
+test "storage: delete all includes placements spanning into active area" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 2,
+    });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const placement = s.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        placement.location.pin.*,
+    ) == null);
+    const rect = placement.rect(s.imageById(1).?, &t).?;
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        rect.bottom_right,
+    ) != null);
+
+    s.delete(io, alloc, &t, .{ .all = true });
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expectEqual(@as(usize, 0), s.images.count());
 }
 
 test "storage: delete all placements" {
@@ -1325,6 +1527,79 @@ test "storage: delete placement by specific id" {
     try testing.expectEqual(@as(usize, 2), s.placements.count());
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: uppercase id delete preserves image when placement does not match" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+
+    s.dirty = false;
+    const generation = s.generation;
+    s.delete(io, alloc, &t, .{ .id = .{
+        .delete = true,
+        .image_id = 1,
+        .placement_id = 7,
+    } });
+
+    try testing.expect(s.imageById(1) != null);
+    try testing.expect(!s.dirty);
+    try testing.expectEqual(generation, s.generation);
+}
+
+test "storage: uppercase id delete frees image after placement matches" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 9, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
+    });
+
+    s.dirty = false;
+    s.delete(io, alloc, &t, .{ .id = .{
+        .delete = true,
+        .image_id = 1,
+        .placement_id = 9,
+    } });
+
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expect(s.dirty);
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: uppercase id delete without placement frees unplaced image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+
+    s.dirty = false;
+    s.delete(io, alloc, &t, .{ .id = .{
+        .delete = true,
+        .image_id = 1,
+    } });
+
+    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expect(s.dirty);
 }
 
 test "storage: delete intersecting cursor" {
@@ -1733,6 +2008,128 @@ test "storage: delete images by range 4" {
     try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
 }
 
+test "storage: uppercase range deletes unplaced image data" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
+
+    s.delete(io, alloc, &t, .{
+        .range = .{
+            .delete = true,
+            // Zero is the default lower bound when x is omitted.
+            .first = 0,
+            .last = 2,
+        },
+    });
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(3));
+}
+
+test "storage: erase display preserves scrollback and reclaims unplaced images" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    const s = &t.screens.active.kitty_images;
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const history_key: ImageStorage.PlacementKey = .{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    };
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        s.placements.get(history_key).?.location.pin.*,
+    ) == null);
+
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 3, .width = 1, .height = 1 });
+
+    t.eraseDisplay(.complete, false);
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expect(s.placements.contains(history_key));
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(1));
+    try testing.expect(!s.images.contains(2));
+    try testing.expect(!s.images.contains(3));
+}
+
+test "storage: cell offsets stay within explicit destination rectangle" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+    t.width_px = 50; // 10 px per col
+    t.height_px = 100; // 20 px per row
+
+    // Explicit columns and rows describe the far cell boundaries. Offsets
+    // move the near edge inward without moving those far edges.
+    const placement: ImageStorage.Placement = .{
+        .location = .{ .virtual = {} },
+        .x_offset = 3,
+        .y_offset = 4,
+        .columns = 2,
+        .rows = 1,
+    };
+    const actual = placement.pixelSize(.{ .width = 4, .height = 3 }, &t);
+    try testing.expectEqual(@as(u32, 17), actual.width);
+    try testing.expectEqual(@as(u32, 16), actual.height);
+    try testing.expectEqual(@as(u32, 2), placement.gridSize(.{ .width = 4, .height = 3 }, &t).cols);
+    try testing.expectEqual(@as(u32, 1), placement.gridSize(.{ .width = 4, .height = 3 }, &t).rows);
+}
+
+test "storage: cell offsets clamp to cell bounds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+    t.width_px = 50; // 10 px per col
+    t.height_px = 100; // 20 px per row
+
+    const placement: ImageStorage.Placement = .{
+        .location = .{ .virtual = {} },
+        .x_offset = std.math.maxInt(u32),
+        .y_offset = std.math.maxInt(u32),
+        .columns = 1,
+        .rows = 1,
+    };
+    const offset = placement.cellOffset(&t);
+    try testing.expectEqual(@as(u32, 9), offset.x);
+    try testing.expectEqual(@as(u32, 19), offset.y);
+
+    // Even hostile offsets leave one pixel inside the requested cell.
+    const actual = placement.pixelSize(.{ .width = 1, .height = 1 }, &t);
+    try testing.expectEqual(@as(u32, 1), actual.width);
+    try testing.expectEqual(@as(u32, 1), actual.height);
+}
+
 test "storage: aspect ratio calculation when only columns or rows specified" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1778,6 +2175,50 @@ test "storage: aspect ratio calculation when only columns or rows specified" {
         try testing.expectEqual(@as(u32, 178), calc_size.width);
         try testing.expectEqual(@as(u32, 100), calc_size.height);
     }
+}
+
+test "storage: default source rectangle is intersected before sizing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+
+    const placement: ImageStorage.Placement = .{
+        .location = .{ .virtual = {} },
+        .source_x = 3,
+        .source_y = 1,
+    };
+    const actual = placement.pixelSize(.{ .width = 4, .height = 3 }, &t);
+    try testing.expectEqual(@as(u32, 1), actual.width);
+    try testing.expectEqual(@as(u32, 2), actual.height);
+}
+
+test "storage: explicit source rectangle is intersected before sizing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    // The requested 8x8 rectangle intersects this 10x10 image as 2x3.
+    // With a two-column destination, the clipped 2:3 aspect ratio produces
+    // a 20x30 pixel destination.
+    const placement: ImageStorage.Placement = .{
+        .location = .{ .virtual = {} },
+        .source_x = 8,
+        .source_y = 7,
+        .source_width = 8,
+        .source_height = 8,
+        .columns = 2,
+    };
+    const actual = placement.pixelSize(.{ .width = 10, .height = 10 }, &t);
+    try testing.expectEqual(@as(u32, 20), actual.width);
+    try testing.expectEqual(@as(u32, 30), actual.height);
 }
 
 test "storage: placement geometry handles untrusted dimensions" {
@@ -1827,8 +2268,8 @@ test "storage: placement geometry handles untrusted dimensions" {
         try testing.expectEqual(max, actual.height);
     }
 
-    // Pixel offsets are protocol-controlled too. Include them without
-    // allowing the grid-size numerator to wrap.
+    // Pixel offsets are protocol-controlled too. Clamp them to the cell
+    // before including them in grid geometry.
     t.width_px = 2;
     t.height_px = 2;
     {
@@ -1838,8 +2279,8 @@ test "storage: placement geometry handles untrusted dimensions" {
             .y_offset = max,
         };
         const actual = placement.gridSize(.{ .width = 1, .height = 1 }, &t);
-        try testing.expectEqual(max, actual.cols);
-        try testing.expectEqual(max, actual.rows);
+        try testing.expectEqual(@as(u32, 1), actual.cols);
+        try testing.expectEqual(@as(u32, 1), actual.rows);
     }
 
     const pin = try trackPin(&t, .{ .x = 0, .y = 0 });
