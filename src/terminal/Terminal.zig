@@ -498,7 +498,14 @@ pub fn printRepeat(self: *Terminal, count_req: usize) !void {
     // identical to calling print per codepoint: ineligible characters
     // or terminal states (insert mode, grapheme clustering, hyperlinks,
     // etc.) fall back to the per-codepoint print() path internally.
-    var buf: [4096]u32 = @splat(c);
+    //
+    // The buffer is filled with a runtime-bounded loop rather than
+    // `= @splat(c)`: a comptime-known 4096-element splat gets fully
+    // unrolled into ~33KB of consecutive stores (LLVM won't re-roll
+    // or vectorize it, see quirks_memset.zig), and it would fill the
+    // whole buffer even for the typical small repeat counts.
+    var buf: [4096]u32 = undefined;
+    for (buf[0..@min(remaining, buf.len)]) |*cp| cp.* = c;
     while (remaining > 0) {
         const n = @min(remaining, buf.len);
         try self.printSlice(buf[0..n]);
@@ -522,11 +529,55 @@ pub fn printRepeat(self: *Terminal, count_req: usize) !void {
 /// slower per-codepoint path. They're less common and this is optimized
 /// for the aforementioned cases.
 pub fn printSlice(self: *Terminal, cps: []const u32) !void {
+    // Check if we can do the fast path up front. If we can't
+    // we need to go back to scalar `print`.
+    const fast = fast: {
+        // Only the main display is supported.
+        if (self.status_display != .main) break :fast false;
+
+        // Modes that require per-codepoint handling in print().
+        // Wraparound is required (its the default) so that our
+        // row-fill logic below can assume soft-wrap semantics. Insert
+        // mode shifts cells per print.
+        if (self.modes.get(.insert)) break :fast false;
+        if (!self.modes.get(.wraparound)) break :fast false;
+
+        // Charset must map ASCII as-is (true unless a DEC special
+        // charset is actively invoked, which is rare).
+        const screen: *Screen = self.screens.active;
+        if (screen.charset.single_shift != null) break :fast false;
+        switch (screen.charset.charsets.get(screen.charset.gl)) {
+            .utf8, .ascii => {},
+            else => break :fast false,
+        }
+
+        // Hyperlinks require per-cell map bookkeeping.
+        if (screen.cursor.hyperlink_id != 0) break :fast false;
+
+        break :fast true;
+    };
+    if (!fast) {
+        for (cps) |cp| try self.print(@intCast(cp));
+        return;
+    }
+
+    const grapheme_cluster = self.modes.get(.grapheme_cluster);
+
+    // When grapheme clustering is enabled and a left margin is set,
+    // print() consults the cell left of the margin after wrapping,
+    // which we can't reason about here. Restrict the fast path to
+    // the [0x10, 0xFF] range in that case (those never cluster).
+    const allow_unicode = !grapheme_cluster or self.scrolling_region.left == 0;
+
     var i: usize = 0;
     while (i < cps.len) {
         // Try the fast-path print first. This will return the number of
         // codepoints it consumed.
-        const consumed = try self.printSliceFast(cps[i..]);
+        const consumed = try self.printSliceFast(
+            cps[i..],
+            grapheme_cluster,
+            allow_unicode,
+        );
         if (consumed > 0) {
             i += consumed;
             continue;
@@ -548,31 +599,15 @@ pub fn printSlice(self: *Terminal, cps: []const u32) !void {
 ///
 /// The fast path handles runs of narrow (width 1) and wide (width 2)
 /// codepoints being written to simple cells. Everything else (zero
-/// width codepoints, grapheme cluster continuations, insert mode,
-/// charset mapping, hyperlinks, complex cells, etc.) is rejected so
-/// `print` can handle it with full generality.
-fn printSliceFast(self: *Terminal, cps: []const u32) !usize {
-    // Only the main display is supported.
-    if (self.status_display != .main) return 0;
-
-    // Modes that require per-codepoint handling in print(). Wraparound
-    // is required (its the default) so that our row-fill logic below can
-    // assume soft-wrap semantics. Insert mode shifts cells per print.
-    if (self.modes.get(.insert)) return 0;
-    if (!self.modes.get(.wraparound)) return 0;
-
+/// width codepoints, grapheme cluster continuations, complex cells,
+/// etc.) is rejected so `print` can handle it with full generality.
+fn printSliceFast(
+    self: *Terminal,
+    cps: []const u32,
+    grapheme_cluster: bool,
+    allow_unicode: bool,
+) !usize {
     const screen: *Screen = self.screens.active;
-
-    // Charset must map ASCII as-is (true unless a DEC special charset
-    // is actively invoked, which is rare).
-    if (screen.charset.single_shift != null) return 0;
-    switch (screen.charset.charsets.get(screen.charset.gl)) {
-        .utf8, .ascii => {},
-        else => return 0,
-    }
-
-    // Hyperlinks require per-cell map bookkeeping.
-    if (screen.cursor.hyperlink_id != 0) return 0;
 
     // Codepoints in [0x10, 0xFF] are always narrow (width 1, matching
     // the c <= 0xFF fast path in print) and can never interact with
@@ -584,13 +619,6 @@ fn printSliceFast(self: *Terminal, cps: []const u32) !usize {
     // 2027) is enabled, if they are a grapheme break from the
     // previously printed codepoint (so print would never attach them
     // to the previous cell).
-    const grapheme_cluster = self.modes.get(.grapheme_cluster);
-
-    // When grapheme clustering is enabled and a left margin is set,
-    // print() consults the cell left of the margin after wrapping,
-    // which we can't reason about here. Restrict the fast path to
-    // the [0x10, 0xFF] range in that case (those never cluster).
-    const allow_unicode = !grapheme_cluster or self.scrolling_region.left == 0;
 
     // Codepoints in [0x10, 0xFF] are always narrow: print()
     // hardcodes width 1 for c <= 0xFF (no width table lookup).
@@ -619,14 +647,46 @@ fn printSliceFast(self: *Terminal, cps: []const u32) !usize {
     }
 
     // The first codepoint requires care when grapheme clustering is
-    // enabled: print() examines the previous *cell* which can hold
-    // state (grapheme data) that we can't cheaply reason about here.
-    // Note this includes the pending-wrap state: print() may attach
-    // to the pending cell *instead of wrapping*. We only take the
-    // first codepoint if the cursor is at column zero with no pending
-    // wrap, where print() skips clustering entirely.
-    if (grapheme_cluster) {
-        if (screen.cursor.pending_wrap or screen.cursor.x != 0) return 0;
+    // enabled: print() may attach it to the previous *cell* instead
+    // of writing a new one. Take the first codepoint only when we can
+    // determine — computing exactly what print() would — that it
+    // starts a new cluster. At column zero with no pending wrap,
+    // print() skips clustering entirely. Otherwise resolve the
+    // previous cell the way print() does and check for a break.
+    //
+    // Note the pending-wrap rejection: print() may attach to the
+    // pending cell *instead of wrapping*, which we can't model here.
+    if (grapheme_cluster and screen.cursor.x != 0) gate: {
+        if (screen.cursor.pending_wrap) return 0;
+
+        // Resolve the content cell to our left exactly like print():
+        // if the immediate left cell is a wide spacer tail, the
+        // content lives one further left. (A spacer tail can never
+        // be at column zero — its wide half would have to be in the
+        // previous row — so the second cursorCellLeft is in bounds.)
+        const immediate = screen.cursorCellLeft(1);
+        const prev: *Cell = switch (immediate.wide) {
+            .spacer_tail => screen.cursorCellLeft(2),
+            else => immediate,
+        };
+
+        // An empty previous cell is necessarily a grapheme break.
+        if (prev.codepoint() == 0) break :gate;
+
+        // Grapheme data on the previous cell requires the full
+        // cluster state machine replay; only print() can do that.
+        if (prev.hasGrapheme()) return 0;
+
+        // A simple single-codepoint previous cell: print() would run
+        // exactly this break check from the default state.
+        var state: uucode.grapheme.BreakState = .default;
+        if (!unicode.graphemeBreak(
+            prev.content.codepoint.data,
+            @intCast(cp0),
+            &state,
+        )) return 0;
+    } else if (grapheme_cluster) {
+        if (screen.cursor.pending_wrap) return 0;
     }
 
     // The width lookup is a runtime value while printSliceFill is
@@ -2287,16 +2347,40 @@ pub fn index(self: *Terminal) !void {
             (!screen.no_scrollback or
                 self.scrolling_region.bottom == 0))
         {
+            // If a bottom margin is set, kitty image placements may
+            // need adjusting around the scroll. The rare placements-
+            // present case is handled out of line so this hot path
+            // only pays a count check (a load from a cache line we
+            // already write, above).
+            if (comptime build_options.kitty_graphics) {
+                if (screen.kitty_images.placements.count() != 0) {
+                    @branchHint(.unlikely);
+                    try self.indexScrollWithImages(.window_shift);
+                    return;
+                }
+            }
+
             try screen.cursorScrollAbove();
             return;
         }
 
         // Slow path for left and right scrolling region margins.
+        // scrollUp handles the kitty image adjustment itself.
         if (self.scrolling_region.left != 0 or
             self.scrolling_region.right != self.cols - 1)
         {
             try self.scrollUp(1);
             return;
+        }
+
+        // Kitty image placements may need adjusting around the scroll;
+        // handled out of line like the scrollback path above.
+        if (comptime build_options.kitty_graphics) {
+            if (screen.kitty_images.placements.count() != 0) {
+                @branchHint(.unlikely);
+                try self.indexScrollWithImages(.in_place);
+                return;
+            }
         }
 
         // Otherwise use a fast path function to efficiently scroll
@@ -2312,6 +2396,69 @@ pub fn index(self: *Terminal) !void {
     if (screen.cursor.y < self.scrolling_region.bottom) {
         screen.cursorDown(1);
     }
+}
+
+/// The operation when we have Kitty image placements during index.
+/// Split out of index() so its hot paths don't carry the adjustment
+/// state in their stack frame, which measurably slows the scroll
+/// hot path.
+fn indexScrollWithImages(
+    self: *Terminal,
+    comptime op: kitty.graphics.ImageStorage.ScrollOp,
+) !void {
+    var kitty_scroll = self.kittyScrollMarginsBegin(-1, op);
+    defer if (kitty_scroll) |*state| state.end();
+    switch (op) {
+        .window_shift => try self.screens.active.cursorScrollAbove(),
+        .in_place => try self.screens.active.cursorScrollRegionUp(
+            self.scrolling_region.bottom - self.scrolling_region.top,
+        ),
+    }
+}
+
+// Handle when Kitty graphics is disabled.
+const KittyScrollMargins = if (build_options.kitty_graphics)
+    kitty.graphics.ImageStorage.ScrollMargins
+else
+    struct {
+        pub inline fn end(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+/// Begin adjusting kitty image placements for a scroll of the
+/// scrolling region by delta rows (negative moves content up). If
+/// adjustment is needed this returns state whose end() must be called
+/// after the scroll's row operations complete (see
+/// ImageStorage.scrollMarginsBegin for why this is two phases). This
+/// returns null when the scrolling region is the full screen, because
+/// placements then follow their anchored rows via pin tracking which
+/// matches kitty's marginless behavior.
+///
+/// Callers must comptime-gate on build_options.kitty_graphics and
+/// check that placements exist before calling, which keeps the cost
+/// on the hot scroll paths cheap.
+fn kittyScrollMarginsBegin(
+    self: *Terminal,
+    delta: isize,
+    op: kitty.graphics.ImageStorage.ScrollOp,
+) ?kitty.graphics.ImageStorage.ScrollMargins {
+    @branchHint(.cold);
+
+    // Full-screen scrolls need no adjustment: placements follow their
+    // anchored rows (possibly into the scrollback) via pin tracking.
+    if (self.scrolling_region.top == 0 and
+        self.scrolling_region.bottom == self.rows - 1 and
+        self.scrolling_region.left == 0 and
+        self.scrolling_region.right == self.cols - 1) return null;
+
+    const screen: *Screen = self.screens.active;
+    return screen.kitty_images.scrollMarginsBegin(
+        self.io(),
+        self,
+        delta,
+        op,
+    );
 }
 
 /// Move the cursor to the previous line in the scrolling region, possibly
@@ -2439,6 +2586,24 @@ pub fn scrollDown(self: *Terminal, count: usize) void {
         self.screens.active.cursor.pending_wrap = old_wrap;
     }
 
+    // If margins are set and kitty image placements exist, they need
+    // adjusting around the scroll. Note this wraps scrollDown and NOT
+    // insertLines: kitty scrolls images for SD/RI but leaves them
+    // alone for IL/DL.
+    var kitty_scroll: ?KittyScrollMargins = null;
+    defer if (kitty_scroll) |*state| state.end();
+    if (comptime build_options.kitty_graphics) {
+        if (self.screens.active.kitty_images.placements.count() != 0) {
+            @branchHint(.unlikely);
+            const region_height: usize =
+                @as(usize, self.scrolling_region.bottom - self.scrolling_region.top) + 1;
+            kitty_scroll = self.kittyScrollMarginsBegin(
+                @intCast(@min(count, region_height)),
+                .in_place,
+            );
+        }
+    }
+
     // Move to the top of the scroll region
     self.screens.active.cursorAbsolute(self.scrolling_region.left, self.scrolling_region.top);
     self.insertLines(count);
@@ -2459,6 +2624,35 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
     defer {
         self.screens.active.cursorAbsolute(old_x, old_y);
         self.screens.active.cursor.pending_wrap = old_wrap;
+    }
+
+    // If margins are set and kitty image placements exist, they need
+    // adjusting around the scroll. Note this wraps scrollUp and NOT
+    // deleteLines: kitty scrolls images for SU/IND but leaves them
+    // alone for IL/DL.
+    var kitty_scroll: ?KittyScrollMargins = null;
+    defer if (kitty_scroll) |*state| state.end();
+    if (comptime build_options.kitty_graphics) {
+        if (self.screens.active.kitty_images.placements.count() != 0) {
+            @branchHint(.unlikely);
+
+            // The op must mirror the branch below: the scrollback path
+            // shifts the active window while the deleteLines path
+            // moves rows in place.
+            const region_height: usize =
+                @as(usize, self.scrolling_region.bottom - self.scrolling_region.top) + 1;
+            kitty_scroll = self.kittyScrollMarginsBegin(
+                -@as(isize, @intCast(@min(count, region_height))),
+                if (self.scrolling_region.top == 0 and
+                    self.scrolling_region.left == 0 and
+                    self.scrolling_region.right == self.cols - 1 and
+                    (!self.screens.active.no_scrollback or
+                        self.scrolling_region.bottom == self.rows - 1))
+                    .window_shift
+                else
+                    .in_place,
+            );
+        }
     }
 
     // If our scroll region is at the top and we have no left/right
@@ -2530,7 +2724,7 @@ pub const ScrollViewport = union(Tag) {
         @This(),
         // Padding: largest variant is isize (8 bytes on 64-bit).
         // Use [2]u64 (16 bytes) for future expansion.
-        [2]u64,
+        .{ .padding = [2]u64 },
     );
     pub const C = c_union.C;
     pub const CValue = c_union.CValue;
@@ -3341,12 +3535,12 @@ pub fn eraseDisplay(
             self.screens.active.cursor.pending_wrap = false;
 
             if (comptime build_options.kitty_graphics) {
-                // Clear all Kitty graphics state for this screen
-                self.screens.active.kitty_images.delete(
+                // Clear only placements still visible after moving the active
+                // area into scrollback.
+                self.screens.active.kitty_images.clearScreen(
                     self.io(),
                     self.screens.active.alloc,
                     self,
-                    .{ .all = true },
                 );
             }
         },
@@ -3399,12 +3593,12 @@ pub fn eraseDisplay(
             self.screens.active.cursor.pending_wrap = false;
 
             if (comptime build_options.kitty_graphics) {
-                // Clear all Kitty graphics state for this screen
-                self.screens.active.kitty_images.delete(
+                // ED2 clears visible placements but preserves graphics that
+                // are wholly in scrollback.
+                self.screens.active.kitty_images.clearScreen(
                     self.io(),
                     self.screens.active.alloc,
                     self,
-                    .{ .all = true },
                 );
             }
 
@@ -15813,6 +16007,8 @@ test "Terminal: deleteLines wide char at right margin with full clear" {
 }
 
 test "Terminal: glyph APC stores session glossary entries" {
+    if (comptime !build_options.glyph_protocol) return error.SkipZigTest;
+
     const alloc = testing.allocator;
     const io_impl = testing.io;
     var t = try init(io_impl, alloc, .{ .cols = 80, .rows = 24 });

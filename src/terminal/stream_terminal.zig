@@ -118,9 +118,10 @@ pub const Handler = struct {
         /// valid for the lifetime of the call.
         enquiry: ?*const fn (*Handler) []const u8,
 
-        /// Called in response to XTWINOPS size queries (CSI 14/16/18 t).
-        /// Returns the current terminal geometry used for encoding.
-        /// Return null to silently ignore the query.
+        /// Called for XTWINOPS size queries (CSI 14/16/18 t) and when VT input
+        /// enables in-band size reports (mode 2048). Returns the current
+        /// terminal geometry used for encoding. Return null to suppress the
+        /// XTWINOPS response or mode 2048 report.
         size: ?*const fn (*Handler) ?size_report.Size,
 
         /// Called when the terminal title changes via escape sequences
@@ -344,7 +345,12 @@ pub const Handler = struct {
             },
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.terminal.decaln(),
-            .full_reset => self.terminal.fullReset(),
+            .full_reset => {
+                self.terminal.fullReset();
+
+                // Clear the progress bar
+                self.progressReport(.{ .state = .remove });
+            },
             .start_hyperlink => try self.terminal.screens.active.startHyperlink(value.uri, value.id),
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
             .semantic_prompt => try self.terminal.semanticPrompt(value),
@@ -674,6 +680,17 @@ pub const Handler = struct {
         self.writePty(resp);
     }
 
+    fn reportMode2048(self: *Handler) void {
+        const get_size = self.effects.size orelse return;
+        const current = get_size(self) orelse return;
+
+        var buf: [128]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+        size_report.encode(&writer, .mode_2048, current) catch return;
+        buf[writer.end] = 0;
+        self.writePty(buf[0..writer.end :0]);
+    }
+
     fn windowTitle(self: *Handler, title_raw: []const u8) !void {
         // Prevent DoS attacks by limiting title length.
         const max_title_len = 1024;
@@ -797,9 +814,13 @@ pub const Handler = struct {
 
             .synchronized_output,
             .linefeed,
-            .in_band_size_reports,
             .focus_event,
             => {},
+
+            // Enabling mode 2048 reports already-committed pixel geometry.
+            // Waiting for the next resize leaves late-enabling clients without
+            // the dimensions they need for their first image frame.
+            .in_band_size_reports => if (enabled) self.reportMode2048(),
 
             .report_visibility => if (enabled) self.sendVisibilityReport(),
 
@@ -1054,7 +1075,7 @@ pub const Handler = struct {
                 }
             },
 
-            .glyph => |*glyph_req| {
+            .glyph => |*glyph_req| if (comptime build_options.glyph_protocol) {
                 const resp = self.terminal.glyphProtocol(alloc, glyph_req);
                 if (resp) |r| resp_block: {
                     // Don't waste time encoding if we can't write responses
@@ -1824,6 +1845,8 @@ test "full reset" {
 }
 
 test "glyph protocol APC with write_pty callback" {
+    if (comptime !build_options.glyph_protocol) return error.SkipZigTest;
+
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
 
@@ -2486,6 +2509,15 @@ test "progress_report effect callback" {
         try testing.expectEqual(case.state, S.last_state);
         try testing.expectEqual(case.progress, S.last_progress);
     }
+
+    // A full reset (RIS) removes any active progress bar.
+    s.nextSlice("\x1B]9;4;1;50\x1B\\");
+    try testing.expectEqual(@as(usize, cases.len + 1), S.count);
+    try testing.expectEqual(osc.Command.ProgressReport.State.set, S.last_state);
+    s.nextSlice("\x1Bc");
+    try testing.expectEqual(@as(usize, cases.len + 2), S.count);
+    try testing.expectEqual(osc.Command.ProgressReport.State.remove, S.last_state);
+    try testing.expectEqual(@as(?u8, null), S.last_progress);
 }
 
 test "clipboard_write effect callback" {
@@ -2779,9 +2811,12 @@ test "kitty_keyboard_query" {
     defer t.deinit(testing.allocator);
 
     const S = struct {
-        var written: ?[:0]const u8 = null;
+        var written: ?[]const u8 = null;
+        var written_buf: [64]u8 = undefined;
         fn writePty(_: *Handler, data: [:0]const u8) void {
-            written = data;
+            std.debug.assert(data.len <= written_buf.len);
+            @memcpy(written_buf[0..data.len], data);
+            written = written_buf[0..data.len];
         }
     };
     S.written = null;
@@ -2808,9 +2843,12 @@ test "xtversion default" {
     defer t.deinit(testing.allocator);
 
     const S = struct {
-        var written: ?[:0]const u8 = null;
+        var written: ?[]const u8 = null;
+        var written_buf: [64]u8 = undefined;
         fn writePty(_: *Handler, data: [:0]const u8) void {
-            written = data;
+            std.debug.assert(data.len <= written_buf.len);
+            @memcpy(written_buf[0..data.len], data);
+            written = written_buf[0..data.len];
         }
     };
     S.written = null;
@@ -2831,9 +2869,12 @@ test "xtversion with effect" {
     defer t.deinit(testing.allocator);
 
     const S = struct {
-        var written: ?[:0]const u8 = null;
+        var written: ?[]const u8 = null;
+        var written_buf: [64]u8 = undefined;
         fn writePty(_: *Handler, data: [:0]const u8) void {
-            written = data;
+            std.debug.assert(data.len <= written_buf.len);
+            @memcpy(written_buf[0..data.len], data);
+            written = written_buf[0..data.len];
         }
         fn xtversion(_: *Handler) []const u8 {
             return "ghostty 1.2.3";
@@ -2857,9 +2898,12 @@ test "xtversion with empty string effect" {
     defer t.deinit(testing.allocator);
 
     const S = struct {
-        var written: ?[:0]const u8 = null;
+        var written: ?[]const u8 = null;
+        var written_buf: [64]u8 = undefined;
         fn writePty(_: *Handler, data: [:0]const u8) void {
-            written = data;
+            std.debug.assert(data.len <= written_buf.len);
+            @memcpy(written_buf[0..data.len], data);
+            written = written_buf[0..data.len];
         }
         fn xtversion(_: *Handler) []const u8 {
             return "";
@@ -2905,6 +2949,97 @@ test "size report csi_14_t with effect" {
     s.nextSlice("\x1b[14t");
     defer testing.allocator.free(S.written.?);
     try testing.expectEqualStrings("\x1b[4;432;720t", S.written.?);
+}
+
+test "mode 2048 enable reports current geometry and disable is silent" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [128]u8 = undefined;
+        var response_len: usize = 0;
+        var calls: usize = 0;
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(response[0..data.len], data);
+            response_len = data.len;
+            calls += 1;
+        }
+
+        fn getSize(_: *Handler) ?size_report.Size {
+            return .{ .rows = 24, .columns = 80, .cell_width = 8, .cell_height = 16 };
+        }
+    };
+    S.response_len = 0;
+    S.calls = 0;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.size = &S.getSize;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    s.nextSlice("\x1b[?2048h");
+    s.nextSlice("\x1b[?2048h");
+
+    try testing.expectEqual(@as(usize, 2), S.calls);
+    try testing.expectEqualStrings("\x1b[48;24;80;384;640t", S.response[0..S.response_len]);
+
+    s.nextSlice("\x1b[?2048l");
+    try testing.expectEqual(@as(usize, 2), S.calls);
+    try testing.expect(!t.modes.get(.in_band_size_reports));
+}
+
+test "mode 2048 enable tolerates missing effects" {
+    const S = struct {
+        var calls: usize = 0;
+
+        fn writePty(_: *Handler, _: [:0]const u8) void {
+            calls += 1;
+        }
+
+        fn getSize(_: *Handler) ?size_report.Size {
+            return .{ .rows = 24, .columns = 80, .cell_width = 8, .cell_height = 16 };
+        }
+    };
+    S.calls = 0;
+
+    var no_size_terminal: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer no_size_terminal.deinit(testing.allocator);
+    var no_size_handler: Handler = .init(&no_size_terminal);
+    no_size_handler.effects.write_pty = &S.writePty;
+    var no_size_stream: Stream = .init(.{
+        .allocator = testing.allocator,
+        .handler = no_size_handler,
+    });
+    defer no_size_stream.deinit();
+
+    no_size_stream.nextSlice("\x1b[?2048h");
+    try testing.expect(no_size_terminal.modes.get(.in_band_size_reports));
+    try testing.expectEqual(@as(usize, 0), S.calls);
+
+    var no_write_terminal: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer no_write_terminal.deinit(testing.allocator);
+    var no_write_handler: Handler = .init(&no_write_terminal);
+    no_write_handler.effects.size = &S.getSize;
+    var no_write_stream: Stream = .init(.{
+        .allocator = testing.allocator,
+        .handler = no_write_handler,
+    });
+    defer no_write_stream.deinit();
+
+    no_write_stream.nextSlice("\x1b[?2048h");
+    try testing.expect(no_write_terminal.modes.get(.in_band_size_reports));
+    try testing.expectEqual(@as(usize, 0), S.calls);
 }
 
 test "size report csi_16_t with effect" {
