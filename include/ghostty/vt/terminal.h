@@ -54,17 +54,17 @@ extern "C" {
  *
  * ## Effects
  *
- * By default, the terminal sequence processing with ghostty_terminal_vt_write() 
- * only process sequences that directly affect terminal state and 
+ * By default, terminal sequence processing with the VT write functions only
+ * processes sequences that directly affect terminal state and
  * ignores sequences that have side effect behavior or require responses.
  * These sequences include things like bell characters, title changes, device
  * attributes queries, and more. To handle these sequences, the embedder
  * must configure "effects."
  *
  * Effects are callbacks that the terminal invokes in response to VT
- * sequences processed during ghostty_terminal_vt_write(). They let the
- * embedding application react to terminal-initiated events such as bell
- * characters, title changes, device status report responses, and more.
+ * sequences processed during VT writes. They let the embedding application
+ * react to terminal-initiated events such as bell characters, title changes,
+ * device status report responses, and more.
  *
  * Each effect is registered with ghostty_terminal_set() using the
  * corresponding `GhosttyTerminalOption` identifier. A `NULL` value
@@ -75,9 +75,10 @@ extern "C" {
  * back to their own application state without global variables.
  * You cannot specify different userdata for different callbacks.
  *
- * All callbacks are invoked synchronously during
- * ghostty_terminal_vt_write(). Callbacks **must not** call
- * ghostty_terminal_vt_write() on the same terminal (no reentrancy).
+ * All callbacks are invoked synchronously during VT writes. Callbacks
+ * **must not** call ghostty_terminal_vt_write() or
+ * ghostty_terminal_vt_write_until_ground() on the same terminal
+ * (no reentrancy).
  * And callbacks must be very careful to not block for too long or perform 
  * expensive operations, since they are blocking further IO processing.
  *
@@ -85,13 +86,13 @@ extern "C" {
  *
  * | Option                                  | Callback Type                     | Trigger                                   |
  * |-----------------------------------------|-----------------------------------|-------------------------------------------|
- * | `GHOSTTY_TERMINAL_OPT_WRITE_PTY`        | `GhosttyTerminalWritePtyFn`       | Query responses written back to the pty   |
+ * | `GHOSTTY_TERMINAL_OPT_WRITE_PTY`        | `GhosttyTerminalWritePtyFn`       | VT query and mode reports written back to the PTY |
  * | `GHOSTTY_TERMINAL_OPT_BELL`             | `GhosttyTerminalBellFn`           | BEL character (0x07)                      |
  * | `GHOSTTY_TERMINAL_OPT_TITLE_CHANGED`    | `GhosttyTerminalTitleChangedFn`   | Title change via OSC 0 / OSC 2            |
  * | `GHOSTTY_TERMINAL_OPT_PWD_CHANGED`      | `GhosttyTerminalPwdChangedFn`     | Pwd change via OSC 7 / OSC 9 / OSC 1337   |
  * | `GHOSTTY_TERMINAL_OPT_ENQUIRY`          | `GhosttyTerminalEnquiryFn`        | ENQ character (0x05)                      |
  * | `GHOSTTY_TERMINAL_OPT_XTVERSION`        | `GhosttyTerminalXtversionFn`      | XTVERSION query (CSI > q)                 |
- * | `GHOSTTY_TERMINAL_OPT_SIZE`             | `GhosttyTerminalSizeFn`           | XTWINOPS size query (CSI 14/16/18 t)      |
+ * | `GHOSTTY_TERMINAL_OPT_SIZE`             | `GhosttyTerminalSizeFn`           | XTWINOPS query (CSI 14/16/18 t) or mode 2048 enable |
  * | `GHOSTTY_TERMINAL_OPT_COLOR_SCHEME`     | `GhosttyTerminalColorSchemeFn`    | Color scheme query (CSI ? 996 n)          |
  * | `GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES`| `GhosttyTerminalDeviceAttributesFn`| Device attributes query (CSI c / > c / = c)|
  * | `GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE`  | `GhosttyTerminalClipboardWriteFn` | Clipboard write via OSC 52 / OSC 1337     |
@@ -687,16 +688,18 @@ typedef GhosttyString (*GhosttyTerminalEnquiryFn)(GhosttyTerminal terminal,
                                                    void* userdata);
 
 /**
- * Callback function type for size queries (XTWINOPS).
+ * Callback function type for terminal size reports.
  *
- * Called in response to XTWINOPS size queries (CSI 14/16/18 t).
+ * Called in response to XTWINOPS size queries (CSI 14/16/18 t) and when VT
+ * input enables in-band size reports (mode 2048).
  * Return true and fill *out_size with the current terminal geometry,
- * or return false to silently ignore the query.
+ * or return false to suppress the report.
  *
  * @param terminal The terminal handle
  * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
  * @param[out] out_size Pointer to store the terminal size information
- * @return true if size was filled, false to ignore the query
+ * @return true if size was filled, false to suppress the XTWINOPS response or
+ * mode 2048 report
  *
  * @ingroup terminal
  */
@@ -748,9 +751,9 @@ typedef void (*GhosttyTerminalPwdChangedFn)(GhosttyTerminal terminal,
  * Callback function type for write_pty.
  *
  * Called when the terminal needs to write data back to the pty, for
- * example in response to a device status report or mode query. The
- * data is only valid for the duration of the call; callers must copy
- * it if it needs to persist.
+ * example in response to a device status report, mode query, or VT-driven
+ * mode 2048 enable. The data is only valid for the duration of the call;
+ * callers must copy it if it needs to persist.
  *
  * @param terminal The terminal handle
  * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
@@ -817,8 +820,9 @@ typedef enum GHOSTTY_ENUM_TYPED {
 
   /**
    * Callback invoked when the terminal needs to write data back
-   * to the pty (e.g. in response to a DECRQM query or device
-   * status report). Set to NULL to ignore such sequences.
+   * to the pty (e.g. in response to a DECRQM query, device status
+   * report, or VT-driven mode 2048 enable). Set to NULL to ignore such
+   * sequences.
    *
    * Input type: GhosttyTerminalWritePtyFn
    */
@@ -1138,8 +1142,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *
    * Continuation bytes reconstruct an escape sequence or UTF-8 codepoint
    * which was unfinished at the end of the most recent
-   * ghostty_terminal_vt_write() call. They are used automatically by terminal
-   * snapshots and may also be exported directly with the continuation APIs.
+   * VT write call. They are used automatically by terminal snapshots and may
+   * also be exported directly with the continuation APIs.
    *
    * Tracking is disabled by default. A nonzero value enables tracking and
    * sets its byte limit. Passing NULL or a pointer to zero disables tracking.
@@ -1337,9 +1341,9 @@ typedef enum GHOSTTY_ENUM_TYPED {
   /**
    * The terminal title as set by escape sequences (e.g. OSC 0/2).
    *
-   * Returns a borrowed string. The pointer is valid until the next call
-   * to ghostty_terminal_vt_write() or ghostty_terminal_reset(). An empty
-   * string (len=0) is returned when no title has been set.
+   * Returns a borrowed string. The pointer is valid until the next mutating
+   * terminal call. An empty string (len=0) is returned when no title has been
+   * set.
    *
    * Output type: GhosttyString *
    */
@@ -1349,9 +1353,9 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * The terminal's current working directory as set by escape sequences
    * (e.g. OSC 7).
    *
-   * Returns a borrowed string. The pointer is valid until the next call
-   * to ghostty_terminal_vt_write() or ghostty_terminal_reset(). An empty
-   * string (len=0) is returned when no pwd has been set.
+   * Returns a borrowed string. The pointer is valid until the next mutating
+   * terminal call. An empty string (len=0) is returned when no pwd has been
+   * set.
    *
    * Output type: GhosttyString *
    */
@@ -1597,6 +1601,32 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input/output type: GhosttyTerminalModeConfig *
    */
   GHOSTTY_TERMINAL_DATA_MODE = 37,
+
+  /**
+   * Whether VT processing is at ground.
+   *
+   * Ground is when the stream isn't in the middle of any type of sequence:
+   * UTF-8, ESC, CSI, OSC, etc. It is the stateless point of the stream.
+   *
+   * This is useful to know because it is a point at which you can
+   * safely insert out-of-band VT sequences. For example, while reading
+   * from a pty if you want to make your own changes, you can wait until
+   * the pty input reaches ground, then write yours.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_VT_GROUND = 38,
+
+  /**
+   * Whether the cursor is currently at a semantic shell prompt or input area.
+   *
+   * This depends on semantic prompt markers such as OSC 133. Returns false
+   * when semantic prompt information is unavailable or the alternate screen
+   * is active.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_AT_PROMPT = 39,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
@@ -1682,9 +1712,10 @@ GHOSTTY_API GhosttyResult ghostty_terminal_resize(GhosttyTerminal terminal,
  * The behavior of a NULL value is specific to each option and is
  * documented by the corresponding GhosttyTerminalOption value.
  *
- * Callbacks are invoked synchronously during ghostty_terminal_vt_write().
- * Callbacks must not call ghostty_terminal_vt_write() on the same
- * terminal (no reentrancy).
+ * Callbacks are invoked synchronously during VT writes. Callbacks must not
+ * call ghostty_terminal_vt_write() or
+ * ghostty_terminal_vt_write_until_ground() on the same terminal
+ * (no reentrancy).
  *
  * @param terminal The terminal handle (may be NULL, in which case this is a no-op)
  * @param option The option to set
@@ -1723,6 +1754,38 @@ GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
                                 size_t len);
 
 /**
+ * Write VT-encoded data, but only the shortest prefix needed to reach ground.
+ *
+ * Ground is when the stream isn't in the middle of any type of sequence:
+ * UTF-8, ESC, CSI, OSC, etc. It is the stateless point of the stream.
+ *
+ * This is useful to know because it is a point at which you can
+ * safely insert out-of-band VT sequences. For example, while reading
+ * from a pty if you want to make your own changes, you can wait until
+ * the pty input reaches ground, then write yours.
+ *
+ * If the stream is already at ground then this consumes nothing and returns
+ * GHOSTTY_SUCCESS. On success, out_consumed is the number of bytes consumed
+ * before reaching ground, including the byte that reaches it.
+ * GHOSTTY_NO_VALUE means the full slice was consumed without reaching ground.
+ *
+ * @param terminal The terminal handle (must not be NULL)
+ * @param data Pointer to the data to write, or NULL when len is zero
+ * @param len Length of the data in bytes
+ * @param[out] out_consumed Number of bytes consumed (must not be NULL)
+ * @return GHOSTTY_SUCCESS if ground was reached, GHOSTTY_NO_VALUE if all input
+ *         was consumed without reaching ground, or GHOSTTY_INVALID_VALUE if
+ *         an argument is invalid
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_vt_write_until_ground(
+    GhosttyTerminal terminal,
+    const uint8_t* data,
+    size_t len,
+    size_t* out_consumed);
+
+/**
  * Write the terminal's replay-safe VT continuation to a callback writer.
  *
  * The continuation is the exact byte suffix needed to reconstruct unfinished
@@ -1735,8 +1798,8 @@ GHOSTTY_API void ghostty_terminal_vt_write(GhosttyTerminal terminal,
  * GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES to a nonzero value before the
  * input that produced the continuation was written.
  *
- * The caller must serialize this operation with ghostty_terminal_vt_write()
- * and all other access to the same terminal.
+ * The caller must serialize this operation with both VT write functions and
+ * all other access to the same terminal.
  *
  * @param terminal Terminal to read from (must not be NULL)
  * @param writer Destination writer whose write callback must not be NULL

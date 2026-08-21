@@ -101,11 +101,10 @@ pub const ImageStorage = struct {
     /// This field must only be written via markMutated.
     generation: u64 = 0,
 
-    /// This is the next automatically assigned image ID. We start mid-way
-    /// through the u32 range to avoid collisions with buggy programs.
-    /// TODO: This isn't good enough, it's perfectly legal for programs
-    ///       to use IDs in the latter half of the range and collisions
-    ///       are not gracefully handled.
+    /// This is the next automatically assigned image ID for images
+    /// transmitted without an ID or number. We start mid-way through
+    /// the u32 range to stay clear of the low IDs client programs
+    /// typically pick. See nextImageId.
     next_image_id: u32 = 2147483647,
 
     /// This is the next automatically assigned placement ID. This is never
@@ -228,6 +227,40 @@ pub const ImageStorage = struct {
         self.total_limit = limit;
     }
 
+    /// Returns the next ID to automatically assign to an image that
+    /// was transmitted without an explicit ID (i=). The result is
+    /// never zero (zero means "no ID") and never an ID currently in
+    /// use, so an automatic ID never replaces an existing image.
+    pub fn nextImageId(
+        self: *ImageStorage,
+        mode: enum { explicit, implicit },
+    ) u32 {
+        // Starting ID depends on mode.
+        var id: u32 = switch (mode) {
+            // Yeah, starting from 1 is wasteful. This matches what Kitty
+            // does. In the future we can probably cache a low-water-mark
+            // based on delete behavior.
+            .explicit => 1,
+            .implicit => self.next_image_id,
+        };
+
+        // Go through all possible images. We have +2 because we can
+        // exceed the total by 1 (new ID).
+        const count: usize = self.images.count();
+        for (0..count + 2) |_| {
+            if (id != 0 and !self.images.contains(id)) break;
+            id +%= 1;
+        }
+
+        // Zero is never allowed.
+        if (id == 0) id = 1;
+
+        // Keep track of our next image id for implicit to speed that up.
+        if (mode == .implicit) self.next_image_id = id +% 1;
+
+        return id;
+    }
+
     /// Add an image to the storage. This will automatically free any existing
     /// image with the same ID. Prefer addPendingImage for pending data so the
     /// caller receives a completion token.
@@ -274,10 +307,14 @@ pub const ImageStorage = struct {
 
         log.debug("addImage image={}", .{img.withoutData()});
 
-        // Retransmitting a specific image ID replaces the old image and all
-        // of its placements, as required by the Kitty graphics protocol.
         if (gop.found_existing) {
+            // Retransmitting a specific image ID replaces the old image and all
+            // of its placements, as required by the Kitty graphics protocol.
             self.removePlacementsByImageId(s, img.id);
+
+            // Relative placements parented to the removed placements go too.
+            _ = self.removeOrphans(s, null);
+
             self.total_bytes -= gop.value_ptr.data.len();
             gop.value_ptr.deinit(alloc);
         }
@@ -329,13 +366,11 @@ pub const ImageStorage = struct {
             p,
         });
 
-        // Tracked pins are marked garbage when their underlying history is
-        // pruned. Kitty removes placements once they scroll out of retained
-        // history, so reclaim those placements before growing the map for a
-        // new one. If allocation below fails, the sweep is still a content
-        // mutation and must be visible to consumers.
-        const removed_garbage = self.removeGarbagePlacements(s);
-        errdefer if (removed_garbage) self.markMutated(io);
+        // When we add a placement, take this opportunity to reap garbage.
+        // Garbage are placements that disappeared off scrollback (were
+        // pruned). We don't clear Kitty state in the hot path so we do
+        // this opportunistically here.
+        self.reapGarbagePlacements(io, s);
 
         // The important piece here is that the placement ID needs to
         // be marked internal if it is zero. This allows multiple placements
@@ -372,30 +407,212 @@ pub const ImageStorage = struct {
         }
         gop.value_ptr.* = p;
 
+        // This always mutates
         self.markMutated(io);
     }
 
-    /// Remove pin-backed placements whose tracked content has been pruned.
-    /// Virtual placements have no tracked screen location and are retained.
-    fn removeGarbagePlacements(
+    /// How the row operation behind a scrollMarginsBegin/end pair moves
+    /// tracked pins, which determines how much repositioning work the
+    /// placements need.
+    pub const ScrollOp = enum {
+        /// The operation shifts the entire active window down (it
+        /// creates scrollback), so every placement anchored in the
+        /// active area changes active position and must be restored.
+        window_shift,
+
+        /// The operation moves rows in place within the scrolling
+        /// region: pins anchored outside the region rows keep their
+        /// active position without help, so only placements anchored
+        /// inside the region rows need handling. This is the common
+        /// case (e.g. a status bar image beside a scrolling pane
+        /// costs almost nothing per scroll).
+        in_place,
+    };
+
+    /// Adjust placements for a scroll of the terminal's scrolling region
+    /// by `delta` rows (negative moves content up). This implements the
+    /// Kitty graphics protocol behavior for scrolls bounded by margins:
+    /// placements entirely inside the scrolling region move with the content
+    /// and are clipped when the move would extend them past a margin (deleted
+    /// when fully clipped), while every other placement (straddling a margin,
+    /// outside the region, or in the scrollback) must not move at all.
+    ///
+    /// This is split into two phases around the row operation because
+    /// the various scroll implementations move tracked pins in
+    /// inconsistent ways (some shift the active area so every pin moves,
+    /// some rotate rows in place and adjust only pins inside the
+    /// region). We record the desired final position of every placement
+    /// up front in the returned state, whose end() repositions the pins
+    /// once the rows have settled, making the result independent of the
+    /// path taken. Every call must be paired with exactly one end().
+    ///
+    /// Callers must skip this entirely when the scrolling region is the
+    /// full screen: a full-screen scroll moves placements with their
+    /// anchored rows (possibly into the scrollback) via pin tracking,
+    /// which already matches kitty's marginless scroll behavior.
+    pub fn scrollMarginsBegin(
         self: *ImageStorage,
+        io: std.Io,
+        t: *terminal.Terminal,
+        delta: isize,
+        op: ScrollOp,
+    ) ScrollMargins {
+        const s: *terminal.Screen = t.screens.active;
+        assert(self == &s.kitty_images);
+        var result: ScrollMargins = .{ .screen = s };
+
+        const top: i64 = t.scrolling_region.top;
+        const bottom: i64 = t.scrolling_region.bottom;
+
+        var mutated = false;
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            const p: *Placement = entry.value_ptr;
+
+            // Virtual placements follow their placeholder cells and
+            // relative placements follow their parents, so neither is
+            // ever adjusted by scrolls, matching kitty.
+            const pin: *PageList.Pin = switch (p.location) {
+                .pin => |pin| pin,
+                .virtual, .relative => continue,
+            };
+
+            // Pruned placements are reaped by reapGarbagePlacements.
+            if (pin.garbage) continue;
+
+            // Placements anchored outside the active area (scrollback)
+            // are never touched by a scroll within the margins.
+            const coord = (s.pages.pointFromPin(
+                .active,
+                pin.*,
+            ) orelse continue).coord();
+            const y: i64 = coord.y;
+
+            // An in-place operation doesn't touch pins anchored outside
+            // the region rows, and a placement anchored there can never
+            // be entirely inside the region, so it needs no work at all.
+            if (op == .in_place and (y < top or y > bottom)) continue;
+
+            // The final position defaults to unmoved; restoring the pin
+            // to this exact spot afterwards is what stops the row
+            // operations from dragging the placement around.
+            var final_y: i64 = y;
+
+            inside: {
+                const image = self.images.get(entry.key_ptr.image_id) orelse break :inside;
+                const grid = p.gridSize(image, t);
+
+                // Unknown geometry (e.g. pixel sizes not yet reported)
+                // means we can't know the extent, so we can't consider
+                // the placement contained.
+                if (grid.rows == 0 or grid.cols == 0) break :inside;
+
+                // Only placements entirely within the scrolling region
+                // move. Kitty only has top/bottom margins so it only
+                // checks rows; the column check is our generalization
+                // for left/right margins and is trivially true for
+                // full-width regions.
+                if (y < top or y + grid.rows - 1 > bottom) break :inside;
+                const x: i64 = coord.x;
+                if (x < t.scrolling_region.left or
+                    @min(x + grid.cols - 1, @as(i64, t.cols) - 1) > t.scrolling_region.right) break :inside;
+
+                const new_y: i64 = y + delta;
+                const rows: i64 = grid.rows;
+                const top_clip: i64 = @max(0, top - new_y);
+                const bottom_clip: i64 = @max(0, new_y + rows - 1 - bottom);
+                const visible: bool = clip: {
+                    if (top_clip >= rows or bottom_clip >= rows) break :clip false;
+
+                    if (top_clip > 0) {
+                        if (!p.clipTop(
+                            image,
+                            t,
+                            @intCast(top_clip),
+                            grid.rows,
+                        )) break :clip false;
+                        mutated = true;
+                        final_y = top;
+                        break :clip true;
+                    }
+
+                    if (bottom_clip > 0) {
+                        if (!p.clipBottom(
+                            image,
+                            t,
+                            @intCast(bottom_clip),
+                            grid.rows,
+                        )) break :clip false;
+                        mutated = true;
+                    }
+
+                    final_y = new_y;
+                    break :clip true;
+                };
+
+                // Scrolled or clipped entirely out of the region: the
+                // placement is deleted, like kitty. The image itself is
+                // retained for future placements.
+                if (!visible) {
+                    self.removePlacement(s, entry);
+                    mutated = true;
+                    continue;
+                }
+            }
+
+            result.restores.append(s.alloc, .{
+                .pin = pin,
+                .x = pin.x,
+                .y = @intCast(final_y),
+            }) catch {
+                // OOM: this placement is left to the whims of the
+                // generic pin tracking. Degraded, but safe.
+                log.warn("OOM adjusting image placement for scroll", .{});
+                continue;
+            };
+        }
+
+        if (mutated) {
+            // Placements deleted by clipping may orphan relative placements.
+            // Orphans have no pins so this never touches the restores.
+            _ = self.removeOrphans(s, null);
+            self.markMutated(io);
+        }
+
+        return result;
+    }
+
+    /// Reap pin-backed placements whose tracked content has been pruned
+    /// from history, along with any relative placements orphaned by
+    /// that, marking the content mutation.
+    ///
+    /// Virtual and relative placements have no tracked screen location and
+    /// are never pruned themselves. Kitty removes placements once they
+    /// scroll out of retained history.
+    fn reapGarbagePlacements(
+        self: *ImageStorage,
+        io: std.Io,
         s: *terminal.Screen,
-    ) bool {
+    ) void {
         var removed = false;
         var it = self.placements.iterator();
         while (it.next()) |entry| {
             const pin = switch (entry.value_ptr.location) {
                 .pin => |pin| pin,
-                .virtual => continue,
+                .virtual, .relative => continue,
             };
             if (!pin.garbage) continue;
 
-            entry.value_ptr.deinit(s);
-            self.removePlacementByPtr(entry.key_ptr);
+            self.removePlacement(s, entry);
             removed = true;
         }
+        if (!removed) return;
 
-        return removed;
+        // If we removed a placement, then also remove any orphan
+        // children if this was a parent.
+        _ = self.removeOrphans(s, null);
+
+        self.markMutated(io);
     }
 
     fn clearPlacements(self: *ImageStorage, s: *terminal.Screen) void {
@@ -412,16 +629,280 @@ pub const ImageStorage = struct {
         var it = self.placements.iterator();
         while (it.next()) |entry| {
             if (entry.key_ptr.image_id != image_id) continue;
-            entry.value_ptr.deinit(s);
-            self.removePlacementByPtr(entry.key_ptr);
+            self.removePlacement(s, entry);
         }
     }
 
-    fn removePlacementByPtr(self: *ImageStorage, key: *PlacementKey) void {
-        const img = self.images.getPtr(key.image_id).?;
+    /// Remove a placement by its map entry, releasing any tracked pin
+    /// and keeping the image's placement count in sync. The entry must
+    /// point into the placements map (via iteration or getEntry).
+    fn removePlacement(
+        self: *ImageStorage,
+        s: *terminal.Screen,
+        entry: PlacementMap.Entry,
+    ) void {
+        entry.value_ptr.deinit(s);
+        const img = self.images.getPtr(entry.key_ptr.image_id).?;
         assert(img.metadata.placement_count > 0);
         img.metadata.placement_count -= 1;
-        self.placements.removeByPtr(key);
+        self.placements.removeByPtr(entry.key_ptr);
+    }
+
+    /// Remove relative placements whose parent placement no longer
+    /// exists, keeping a relative placement's lifetime tied to its
+    /// parent chain. Chains can be several links deep, so this loops
+    /// until a pass removes nothing to take out entire orphaned
+    /// subtrees. Returns true if anything was removed.
+    ///
+    /// If `delete_unused` is non-null, an image left without placements
+    /// by the reap is freed using it. This matches uppercase delete
+    /// semantics; every other removal path retains image data and
+    /// passes null.
+    ///
+    /// This must be called, outside of any placements iteration, after
+    /// every operation that removes placements. Kitty gets the same
+    /// effect lazily by dropping unresolvable placements while drawing;
+    /// we do it eagerly because our renderer never mutates terminal
+    /// state.
+    fn removeOrphans(
+        self: *ImageStorage,
+        s: *terminal.Screen,
+        delete_unused: ?Allocator,
+    ) bool {
+        var removed_any = false;
+        var removed = true;
+        while (removed) {
+            removed = false;
+            var it = self.placements.iterator();
+            while (it.next()) |entry| {
+                const rel = switch (entry.value_ptr.location) {
+                    .relative => |rel| rel,
+                    .pin, .virtual => continue,
+                };
+                if (self.placements.contains(rel.parent)) continue;
+
+                // Parent is gone, remove this placement.
+                const image_id = entry.key_ptr.image_id;
+                self.removePlacement(s, entry);
+                removed = true;
+                removed_any = true;
+
+                if (delete_unused) |alloc| self.deleteIfUnused(
+                    alloc,
+                    image_id,
+                );
+            }
+        }
+
+        return removed_any;
+    }
+
+    /// Maximum number of parent links in a relative placement chain,
+    /// matching the minimum specified in the spec and the actual
+    /// limit defined by Kitty at the time of authoring.
+    pub const parent_chain_limit = 8;
+
+    pub const ParentError = error{
+        /// The parent image (P=) does not exist.
+        ParentImageNotFound,
+        /// The parent image exists but the requested placement (Q=, or
+        /// any placement when Q is omitted) does not.
+        ParentPlacementNotFound,
+        /// The placement refers to itself as its own parent.
+        SelfParent,
+        /// The parent chain loops back to the placement being created.
+        Cycle,
+        /// The parent chain exceeds parent_chain_limit links.
+        TooDeep,
+        /// An ancestor in the chain no longer exists. This should not
+        /// happen since removeOrphans keeps chains intact, but we
+        /// check anyway rather than trusting the invariant.
+        AncestorNotFound,
+    };
+
+    /// Resolve and validate the parent reference (P=/Q=) of a relative
+    /// placement, returning the concrete key of the parent placement.
+    /// `child` is the key of the placement being created when it is
+    /// addressable (an explicit placement ID); null for placements that
+    /// will receive a fresh internal ID, which nothing can refer to yet.
+    ///
+    /// Checks: the parent must exist, the placement must not
+    /// parent itself, and the resulting ancestor chain must be acyclic
+    /// and within parent_chain_limit.
+    pub fn resolveParent(
+        self: *ImageStorage,
+        io: std.Io,
+        s: *terminal.Screen,
+        child: ?PlacementKey,
+        parent_image_id: u32,
+        parent_placement_id: u32,
+    ) ParentError!PlacementKey {
+        // Reap placements whose content has been pruned from history
+        // before resolving: a pruned parent must be reported as missing,
+        // not accepted and then immediately reaped by addPlacement's own
+        // sweep, which would store an orphan.
+        self.reapGarbagePlacements(io, s);
+
+        // If the parent doesn't exist we're already failed.
+        if (!self.images.contains(parent_image_id)) {
+            return error.ParentImageNotFound;
+        }
+
+        // Find the parent
+        const parent: PlacementKey = parent: {
+            // An explicit parent placement ID (Q=) selects exactly that
+            // placement.
+            if (parent_placement_id > 0) {
+                const key: PlacementKey = .{
+                    .image_id = parent_image_id,
+                    .placement_id = .{
+                        .tag = .external,
+                        .id = parent_placement_id,
+                    },
+                };
+                if (!self.placements.contains(key)) {
+                    return error.ParentPlacementNotFound;
+                }
+                break :parent key;
+            }
+
+            // No Q: pick a placement of the parent image. Kitty picks
+            // the oldest surviving placement; our placement map doesn't
+            // track creation order so we pick by PlacementId.preferredOver
+            // instead. This is unspecified so any behavior here is fine.
+            // In practice the parent image has a single placement, and
+            // clients use Q when it doesn't.
+            const best: PlacementId = best: {
+                var best: ?PlacementId = null;
+                var it = self.placements.keyIterator();
+                while (it.next()) |key| {
+                    if (key.image_id != parent_image_id) continue;
+                    const id = key.placement_id;
+                    const b = best orelse {
+                        best = id;
+                        continue;
+                    };
+                    if (id.preferredOver(b)) best = id;
+                }
+                break :best best orelse return error.ParentPlacementNotFound;
+            };
+
+            break :parent .{
+                .image_id = parent_image_id,
+                .placement_id = best,
+            };
+        };
+
+        // A placement cannot be its own parent. This must be checked
+        // before the chain walk so it reports EINVAL, not ECYCLE.
+        if (child) |c| if (parent.eql(c)) return error.SelfParent;
+
+        // Walk the would-be ancestor chain. `depth` counts parent links,
+        // starting at one for the link we are about to create.
+        var depth: usize = 1;
+        var key = parent;
+        while (true) {
+            if (child) |c| if (key.eql(c)) return error.Cycle;
+            const p = self.placements.get(key) orelse return error.AncestorNotFound;
+            const rel = switch (p.location) {
+                .relative => |rel| rel,
+                // A pin or virtual placement is the chain root.
+                .pin, .virtual => break,
+            };
+            if (depth >= parent_chain_limit) return error.TooDeep;
+            depth += 1;
+            key = rel.parent;
+        }
+
+        return parent;
+    }
+
+    /// The result of resolving a relative placement's parent chain:
+    /// the chain's root placement (always pin or virtual, never
+    /// relative) and the total cell offset from the root's origin.
+    pub const ResolvedChain = struct {
+        root_key: PlacementKey,
+        root: Placement,
+        horizontal_offset: i32,
+        vertical_offset: i32,
+    };
+
+    /// Resolve a relative placement's parent chain to its root,
+    /// accumulating the cell offsets (H=/V=) of every link on the way.
+    /// The placement's position is the root's origin plus the accumulated
+    /// offsets.
+    ///
+    /// Returns null when the chain is broken or too deep. Neither can
+    /// normally happen for stored placements (resolveParent validates
+    /// chains and removeOrphans removes broken ones), with one kitty
+    /// quirk: replacing an ancestor placement can deepen the chains
+    /// below it beyond parent_chain_limit after the fact.
+    pub fn resolveChain(
+        self: *const ImageStorage,
+        rel: Placement.Relative,
+    ) ?ResolvedChain {
+        var horizontal = rel.horizontal_offset;
+        var vertical = rel.vertical_offset;
+        var key = rel.parent;
+        var depth: usize = 1;
+        while (true) {
+            const p = self.placements.get(key) orelse return null;
+            switch (p.location) {
+                .relative => |parent_rel| {
+                    if (depth >= parent_chain_limit) return null;
+                    depth += 1;
+                    horizontal +|= parent_rel.horizontal_offset;
+                    vertical +|= parent_rel.vertical_offset;
+                    key = parent_rel.parent;
+                },
+
+                .pin, .virtual => return .{
+                    .root_key = key,
+                    .root = p,
+                    .horizontal_offset = horizontal,
+                    .vertical_offset = vertical,
+                },
+            }
+        }
+    }
+
+    /// Returns the placement that a unicode placeholder cell referencing
+    /// this image/placement ID pair targets, or null if there is none. A
+    /// zero placement ID targets one of the image's virtual placements,
+    /// chosen by PlacementId.preferredOver so the choice is stable (an
+    /// image rarely has more than one). This is the shared lookup used
+    /// both for sizing placeholder runs and for positioning relative
+    /// placements whose chain roots at a virtual placement.
+    pub fn placeholderTarget(
+        self: *const ImageStorage,
+        image_id: u32,
+        placement_id: u32,
+    ) ?struct { key: PlacementKey, placement: Placement } {
+        if (placement_id > 0) {
+            const key: PlacementKey = .{
+                .image_id = image_id,
+                .placement_id = .{ .tag = .external, .id = placement_id },
+            };
+            const p = self.placements.get(key) orelse return null;
+            return .{ .key = key, .placement = p };
+        }
+
+        var best: ?PlacementKey = null;
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.image_id != image_id) continue;
+            if (entry.value_ptr.location != .virtual) continue;
+            const b = best orelse {
+                best = entry.key_ptr.*;
+                continue;
+            };
+            if (entry.key_ptr.placement_id.preferredOver(b.placement_id)) {
+                best = entry.key_ptr.*;
+            }
+        }
+
+        const key = best orelse return null;
+        return .{ .key = key, .placement = self.placements.get(key).? };
     }
 
     /// Get an image by its ID. If the image doesn't exist, null is returned.
@@ -447,47 +928,56 @@ pub const ImageStorage = struct {
         return newest;
     }
 
+    /// Clear placements intersecting the active screen, then reclaim every
+    /// image with no remaining placement. Unlike protocol d=A, a terminal
+    /// clear also reclaims images that were already unplaced.
+    pub fn clearScreen(
+        self: *ImageStorage,
+        io: std.Io,
+        alloc: Allocator,
+        t: *terminal.Terminal,
+    ) void {
+        const placements_before = self.placements.count();
+        const images_before = self.images.count();
+
+        // Delete unused placements and images. Orphaned relative
+        // placements must be reaped before the image sweep so that
+        // their images are reclaimable too.
+        self.deleteVisiblePlacements(alloc, t, true);
+        _ = self.removeOrphans(t.screens.active, null);
+        var image_it = self.images.iterator();
+        while (image_it.next()) |entry| {
+            self.deleteIfUnused(alloc, entry.key_ptr.*);
+        }
+
+        // Mark mutated only if things changed.
+        if (self.placements.count() != placements_before or
+            self.images.count() != images_before) self.markMutated(io);
+    }
+
     /// Delete placements, images.
     pub fn delete(
         self: *ImageStorage,
         io: std.Io,
         alloc: Allocator,
         t: *terminal.Terminal,
-        cmd: command.Delete,
+        cmd: command.Delete.Action,
     ) void {
         // Deletes only ever remove placements/images, so comparing counts
         // before and after tells us whether anything actually changed.
-        // Only then do we mark a mutation. This matters because a
-        // delete-all runs on every screen clear (e.g. `ESC [ 2 J`), and
-        // we don't want empty clears to dirty the image state or bump
-        // the generation.
+        // Only then do we mark a mutation, so a delete that matches nothing
+        // doesn't dirty the image state or bump the generation.
         const placements_before = self.placements.count();
         const images_before = self.images.count();
         defer if (self.placements.count() != placements_before or
             self.images.count() != images_before) self.markMutated(io);
 
         switch (cmd) {
-            .all => |delete_images| {
-                var it = self.placements.iterator();
-                while (it.next()) |entry| {
-                    // Skip virtual placements
-                    switch (entry.value_ptr.location) {
-                        .pin => {},
-                        .virtual => continue,
-                    }
-
-                    // Deinit the placement and remove it
-                    const image_id = entry.key_ptr.image_id;
-                    entry.value_ptr.deinit(t.screens.active);
-                    self.removePlacementByPtr(entry.key_ptr);
-                    if (delete_images) self.deleteIfUnused(alloc, image_id);
-                }
-
-                if (delete_images) {
-                    var image_it = self.images.iterator();
-                    while (image_it.next()) |kv| self.deleteIfUnused(alloc, kv.key_ptr.*);
-                }
-            },
+            .all => |delete_images| self.deleteVisiblePlacements(
+                alloc,
+                t,
+                delete_images,
+            ),
 
             .id => |v| self.deleteById(
                 alloc,
@@ -576,8 +1066,7 @@ pub const ImageStorage = struct {
                     const img = self.imageById(entry.key_ptr.image_id) orelse continue;
                     const rect = entry.value_ptr.rect(img, t) orelse continue;
                     if (rect.top_left.x <= x and rect.bottom_right.x >= x) {
-                        entry.value_ptr.deinit(t.screens.active);
-                        self.removePlacementByPtr(entry.key_ptr);
+                        self.removePlacement(t.screens.active, entry);
                         if (v.delete) self.deleteIfUnused(alloc, img.id);
                     }
                 }
@@ -605,8 +1094,7 @@ pub const ImageStorage = struct {
                     var target_pin_copy = target_pin;
                     target_pin_copy.x = rect.top_left.x;
                     if (target_pin_copy.isBetween(rect.top_left, rect.bottom_right)) {
-                        entry.value_ptr.deinit(t.screens.active);
-                        self.removePlacementByPtr(entry.key_ptr);
+                        self.removePlacement(t.screens.active, entry);
                         if (v.delete) self.deleteIfUnused(alloc, img.id);
                     }
                 }
@@ -616,7 +1104,9 @@ pub const ImageStorage = struct {
                 var it = self.placements.iterator();
                 while (it.next()) |entry| {
                     switch (entry.value_ptr.location) {
-                        .pin => {},
+                        // Relative placements carry their own z value and
+                        // are matched by z deletes just like kitty does.
+                        .pin, .relative => {},
 
                         // Virtual placeholders cannot delete by z according
                         // to the spec.
@@ -625,30 +1115,35 @@ pub const ImageStorage = struct {
 
                     if (entry.value_ptr.z == v.z) {
                         const image_id = entry.key_ptr.image_id;
-                        entry.value_ptr.deinit(t.screens.active);
-                        self.removePlacementByPtr(entry.key_ptr);
+                        self.removePlacement(t.screens.active, entry);
                         if (v.delete) self.deleteIfUnused(alloc, image_id);
                     }
                 }
             },
 
             .range => |v| range: {
-                if (v.first <= 0 or v.last <= 0) {
-                    log.warn("delete range values must be greater than zero", .{});
-                    break :range;
-                }
-                if (v.first > v.last) {
-                    log.warn("delete range 'x' ({}) must be less than or equal to 'y' ({})", .{ v.first, v.last });
-                    break :range;
+                // Both bounds default to zero when omitted. An inverted range
+                // or a zero upper bound is not an error, it just selects
+                // nothing: image IDs are always non-zero.
+                if (v.last == 0 or v.first > v.last) break :range;
+
+                // Remove matching placements in one pass.
+                var placement_it = self.placements.iterator();
+                while (placement_it.next()) |entry| {
+                    if (entry.key_ptr.image_id < v.first or
+                        entry.key_ptr.image_id > v.last) continue;
+
+                    self.removePlacement(t.screens.active, entry);
                 }
 
-                var it = self.placements.iterator();
-                while (it.next()) |entry| {
-                    if (entry.key_ptr.image_id >= v.first and entry.key_ptr.image_id <= v.last) {
-                        const image_id = entry.key_ptr.image_id;
-                        entry.value_ptr.deinit(t.screens.active);
-                        self.removePlacementByPtr(entry.key_ptr);
-                        if (v.delete) self.deleteIfUnused(alloc, image_id);
+                // Uppercase deletion also frees matching images that are now
+                // unused, including images that had no placements initially.
+                if (!v.delete) break :range;
+                var image_it = self.images.iterator();
+                while (image_it.next()) |entry| {
+                    const image_id = entry.key_ptr.*;
+                    if (image_id >= v.first and image_id <= v.last) {
+                        self.deleteIfUnused(alloc, image_id);
                     }
                 }
             },
@@ -656,6 +1151,60 @@ pub const ImageStorage = struct {
             // We don't support animation frames yet so they are successfully
             // deleted!
             .animation_frames => {},
+        }
+
+        // Deleting placements orphans any relative placements parented
+        // to them (transitively). Their lifetime is tied to the parent
+        // so they are removed as well, and an uppercase delete also
+        // frees any image the cascade leaves without placements (the
+        // per-branch deleteIfUnused calls above ran while the orphans
+        // still counted as placements).
+        const delete_unused: bool = switch (cmd) {
+            .all, .intersect_cursor, .animation_frames => |v| v,
+            inline else => |v| v.delete,
+        };
+        _ = self.removeOrphans(
+            t.screens.active,
+            if (delete_unused) alloc else null,
+        );
+    }
+
+    /// Delete only non-virtual placements that intersect the active screen.
+    /// The protocol defines d=a/A in terms of visible placements, and an
+    /// uppercase delete only frees data for images selected by those
+    /// placements.
+    fn deleteVisiblePlacements(
+        self: *ImageStorage,
+        alloc: Allocator,
+        t: *terminal.Terminal,
+        delete_unused: bool,
+    ) void {
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            const pin = switch (entry.value_ptr.location) {
+                .pin => |pin| pin,
+                // Virtual placements are never selected by visible
+                // deletes per the protocol. Relative placements are
+                // removed with their parents instead (removeOrphans).
+                .virtual, .relative => continue,
+            };
+            if (pin.garbage) continue;
+
+            // Placements anchored in the active area are necessarily visible.
+            // Only compute their extent when the anchor is already in history
+            // and the bottom edge may still intersect the active area.
+            if (t.screens.active.pages.pointFromPin(
+                .active,
+                pin.*,
+            ) == null) {
+                const image = self.imageById(entry.key_ptr.image_id) orelse continue;
+                const rect = entry.value_ptr.rect(image, t) orelse continue;
+                if (t.screens.active.pages.pointFromPin(.active, rect.bottom_right) == null) continue;
+            }
+
+            const image_id = entry.key_ptr.image_id;
+            self.removePlacement(t.screens.active, entry);
+            if (delete_unused) self.deleteIfUnused(alloc, image_id);
         }
     }
 
@@ -667,28 +1216,27 @@ pub const ImageStorage = struct {
         placement_id: u32,
         delete_unused: bool,
     ) void {
+        var matched = placement_id == 0;
+
         // If no placement, we delete all placements with the ID
-        if (placement_id == 0) {
-            var it = self.placements.iterator();
-            while (it.next()) |entry| {
-                if (entry.key_ptr.image_id == image_id) {
-                    entry.value_ptr.deinit(s);
-                    self.removePlacementByPtr(entry.key_ptr);
-                }
-            }
-        } else {
-            if (self.placements.getEntry(.{
-                .image_id = image_id,
-                .placement_id = .{ .tag = .external, .id = placement_id },
-            })) |entry| {
-                entry.value_ptr.deinit(s);
-                self.removePlacementByPtr(entry.key_ptr);
-            }
+        if (placement_id == 0) self.removePlacementsByImageId(
+            s,
+            image_id,
+        ) else if (self.placements.getEntry(.{
+            .image_id = image_id,
+            .placement_id = .{
+                .tag = .external,
+                .id = placement_id,
+            },
+        })) |entry| {
+            self.removePlacement(s, entry);
+            matched = true;
         }
 
-        // If this is specified, then we also delete the image
-        // if it is no longer in use.
-        if (delete_unused) self.deleteIfUnused(alloc, image_id);
+        // A placement ID narrows the selection to that exact placement, so an
+        // unmatched selector must not free otherwise-unreferenced image data.
+        // https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
+        if (delete_unused and matched) self.deleteIfUnused(alloc, image_id);
     }
 
     /// Delete an image if it is unused.
@@ -720,8 +1268,7 @@ pub const ImageStorage = struct {
             const rect = entry.value_ptr.rect(img, t) orelse continue;
             if (rect.contains(target_pin)) {
                 if (filter) |f| if (!f(filter_ctx, entry.value_ptr.*)) continue;
-                entry.value_ptr.deinit(t.screens.active);
-                self.removePlacementByPtr(entry.key_ptr);
+                self.removePlacement(t.screens.active, entry);
                 if (delete_unused) self.deleteIfUnused(alloc, img.id);
             }
         }
@@ -786,8 +1333,13 @@ pub const ImageStorage = struct {
 
         // Evicting anything is a content mutation. This matters for the
         // setLimit path in particular, which doesn't otherwise mark it.
+        // Evicted placements can also orphan relative placements of
+        // other images, which must be reaped along with them.
         const images_before = self.images.count();
-        defer if (self.images.count() != images_before) self.markMutated(io);
+        defer if (self.images.count() != images_before) {
+            _ = self.removeOrphans(s, null);
+            self.markMutated(io);
+        };
 
         var evicted: usize = 0;
         while (evicted < req) {
@@ -807,8 +1359,7 @@ pub const ImageStorage = struct {
             var p_it = self.placements.iterator();
             while (p_it.next()) |entry| {
                 if (entry.key_ptr.image_id == c.id) {
-                    entry.value_ptr.deinit(s);
-                    self.removePlacementByPtr(entry.key_ptr);
+                    self.removePlacement(s, entry);
                 }
             }
 
@@ -826,15 +1377,62 @@ pub const ImageStorage = struct {
         return true;
     }
 
+    /// State returned by scrollMarginsBegin: the final active-area
+    /// position every surviving placement pin must be restored to once
+    /// the scrolled rows have settled. Every begin must be paired with
+    /// exactly one end() call after the scroll's row operations
+    /// complete.
+    pub const ScrollMargins = struct {
+        screen: *terminal.Screen,
+        restores: std.ArrayListUnmanaged(Restore) = .empty,
+
+        const Restore = struct {
+            pin: *PageList.Pin,
+            x: size.CellCountInt,
+            y: u32,
+        };
+
+        /// Reposition every recorded placement pin to its post-scroll
+        /// position and release the state. Must be called exactly
+        /// once, after the scroll's row operations complete.
+        pub fn end(self: *ScrollMargins) void {
+            for (self.restores.items) |restore| {
+                restore.pin.* = self.screen.pages.pin(.{ .active = .{
+                    .x = restore.x,
+                    .y = restore.y,
+                } }) orelse continue;
+            }
+            self.restores.deinit(self.screen.alloc);
+        }
+    };
+
     /// Every placement is uniquely identified by the image ID and the
     /// placement ID. If an image ID isn't specified it is assumed to be 0.
     /// Likewise, if a placement ID isn't specified it is assumed to be 0.
     pub const PlacementKey = struct {
         image_id: u32,
-        placement_id: packed struct {
-            tag: enum(u1) { internal, external },
-            id: u32,
-        },
+        placement_id: PlacementId,
+
+        pub fn eql(self: PlacementKey, other: PlacementKey) bool {
+            return std.meta.eql(self, other);
+        }
+    };
+
+    /// Internal placement IDs are assigned by us for placements created
+    /// without an explicit ID (p=0); external IDs are client-specified.
+    /// The two are separate namespaces, hence the tag.
+    pub const PlacementId = packed struct {
+        tag: enum(u1) { internal, external },
+        id: u32,
+
+        /// Deterministic preference order used when an operation must
+        /// pick a single placement out of several (kitty uses creation
+        /// order, which our map doesn't track): external IDs win over
+        /// internal ones, and lower IDs win within a tag.
+        pub fn preferredOver(self: PlacementId, other: PlacementId) bool {
+            if (self.tag != other.tag) return self.tag == .external;
+            return self.id < other.id;
+        }
     };
 
     pub const Placement = struct {
@@ -863,7 +1461,27 @@ pub const ImageStorage = struct {
             pin: *PageList.Pin,
 
             /// Virtual placement (U=1) for unicode placeholders.
-            virtual: void,
+            virtual,
+
+            /// Placed relative to a parent placement (P=/Q=). The
+            /// placement has no screen position of its own; it is
+            /// positioned at render time by resolving the parent chain
+            /// to its root (see resolveChain) and therefore follows the
+            /// parent through scrolls automatically. Its lifetime is
+            /// tied to the parent: removing any ancestor removes it
+            /// too (see removeOrphans).
+            relative: Relative,
+        };
+
+        pub const Relative = struct {
+            /// The parent placement. Resolved to a concrete key when
+            /// the placement is created, so the parent is guaranteed
+            /// to exist at that point.
+            parent: PlacementKey,
+
+            /// Cell offsets from the parent's origin (H=/V=).
+            horizontal_offset: i32 = 0,
+            vertical_offset: i32 = 0,
         };
 
         pub fn deinit(
@@ -872,7 +1490,7 @@ pub const ImageStorage = struct {
         ) void {
             switch (self.location) {
                 .pin => |p| s.pages.untrackPin(p),
-                .virtual => {},
+                .virtual, .relative => {},
             }
         }
 
@@ -894,6 +1512,58 @@ pub const ImageStorage = struct {
             return std.math.cast(u32, rounded) orelse std.math.maxInt(u32);
         }
 
+        pub const SourceRect = struct {
+            x: u32,
+            y: u32,
+            width: u32,
+            height: u32,
+        };
+
+        /// Returns the requested source rectangle intersected with the image.
+        /// A zero width or height requests the full corresponding image
+        /// dimension before intersection, as defined by the Kitty protocol.
+        pub fn sourceRect(self: Placement, image: Image) SourceRect {
+            const x = @min(self.source_x, image.width);
+            const y = @min(self.source_y, image.height);
+            return .{
+                .x = x,
+                .y = y,
+                .width = @min(
+                    if (self.source_width > 0) self.source_width else image.width,
+                    image.width - x,
+                ),
+                .height = @min(
+                    if (self.source_height > 0) self.source_height else image.height,
+                    image.height - y,
+                ),
+            };
+        }
+
+        /// Returns the placement offset clamped within the first cell. Pixel
+        /// geometry may temporarily be unavailable, in which case there is no
+        /// valid offset within the cell.
+        pub fn cellOffset(
+            self: Placement,
+            t: *const terminal.Terminal,
+        ) struct {
+            x: u32,
+            y: u32,
+        } {
+            const cell_width: u32 = t.width_px / t.cols;
+            const cell_height: u32 = t.height_px / t.rows;
+
+            return .{
+                .x = if (cell_width > 0)
+                    @min(self.x_offset, cell_width - 1)
+                else
+                    0,
+                .y = if (cell_height > 0)
+                    @min(self.y_offset, cell_height - 1)
+                else
+                    0,
+            };
+        }
+
         /// Returns the size of this placement's image in pixels,
         /// taking into account the source rectangle, specified
         /// rows/columns, and aspect ratio.
@@ -905,9 +1575,9 @@ pub const ImageStorage = struct {
             width: u32,
             height: u32,
         } {
-            // Height / width of the image in px.
-            const width = if (self.source_width > 0) self.source_width else image.width;
-            const height = if (self.source_height > 0) self.source_height else image.height;
+            const source = self.sourceRect(image);
+            const width = source.width;
+            const height = source.height;
 
             // If we don't have any specified cols or rows then the placement
             // should be the native size of the image, and doesn't need to be
@@ -924,6 +1594,7 @@ pub const ImageStorage = struct {
             // count and the height by the row count, because it should be.
             const cell_width: u32 = t.width_px / t.cols;
             const cell_height: u32 = t.height_px / t.rows;
+            const cell_offset = self.cellOffset(t);
 
             // If we have a specified cols AND rows then we calculate
             // the width and height from them directly, we don't need
@@ -933,8 +1604,8 @@ pub const ImageStorage = struct {
                 const calc_height = saturatingMul(cell_height, self.rows);
 
                 return .{
-                    .width = calc_width,
-                    .height = calc_height,
+                    .width = calc_width -| cell_offset.x,
+                    .height = calc_height -| cell_offset.y,
                 };
             }
 
@@ -944,7 +1615,10 @@ pub const ImageStorage = struct {
             // If only the columns were specified, we determine
             // the height of the image based on the aspect ratio.
             if (self.columns > 0) {
-                const calc_width = saturatingMul(cell_width, self.columns);
+                const calc_width = saturatingMul(
+                    cell_width,
+                    self.columns,
+                ) -| cell_offset.x;
                 const calc_height = scaleDimension(calc_width, height, width);
 
                 return .{
@@ -956,7 +1630,10 @@ pub const ImageStorage = struct {
             // Otherwise, only the rows were specified, so we
             // determine the width based on the aspect ratio.
             {
-                const calc_height = saturatingMul(cell_height, self.rows);
+                const calc_height = saturatingMul(
+                    cell_height,
+                    self.rows,
+                ) -| cell_offset.y;
                 const calc_width = scaleDimension(calc_height, width, height);
 
                 return .{
@@ -984,15 +1661,16 @@ pub const ImageStorage = struct {
             // Otherwise we calculate the pixel size, divide by
             // cell size, and round up to the nearest integer.
             const calc_size = self.pixelSize(image, t);
+            const cell_offset = self.cellOffset(t);
             return .{
                 .cols = std.math.divCeil(
                     u32,
-                    calc_size.width +| self.x_offset,
+                    calc_size.width +| cell_offset.x,
                     t.width_px / t.cols,
                 ) catch 0,
                 .rows = std.math.divCeil(
                     u32,
-                    calc_size.height +| self.y_offset,
+                    calc_size.height +| cell_offset.y,
                     t.height_px / t.rows,
                 ) catch 0,
             };
@@ -1000,9 +1678,82 @@ pub const ImageStorage = struct {
             //       in such a case it seems safe to return 0 for this.
         }
 
+        /// Permanently clip `count` rows off the top of this placement,
+        /// which currently spans `span` grid rows, by shrinking the
+        /// source rectangle (the requested source rect is materialized
+        /// into explicit values in the process). Used when a scroll
+        /// within margins pushes the placement past the top margin.
+        /// Requires 0 < count < span. Returns false if no visible
+        /// source pixels would remain, in which case the placement is
+        /// unmodified and should be deleted.
+        fn clipTop(
+            self: *Placement,
+            image: Image,
+            t: *const terminal.Terminal,
+            count: u32,
+            span: u32,
+        ) bool {
+            assert(count > 0 and count < span);
+            const src = self.sourceRect(image);
+            const crop: u32 = if (self.rows > 0)
+                // Scaled placement: each grid row shows an equal
+                // fraction of the source.
+                @intCast(@as(u64, src.height) * count / span)
+            else
+                // Native size: each grid row shows one cell height of
+                // source pixels (kitty does the same).
+                saturatingMul(t.height_px / t.rows, count);
+            if (crop >= src.height) return false;
+            self.source_x = src.x;
+            self.source_y = src.y + crop;
+            self.source_width = src.width;
+            self.source_height = src.height - crop;
+            if (self.rows > 0) self.rows -= count;
+            return true;
+        }
+
+        /// clipTop, but clipping `count` rows off the bottom.
+        fn clipBottom(
+            self: *Placement,
+            image: Image,
+            t: *const terminal.Terminal,
+            count: u32,
+            span: u32,
+        ) bool {
+            assert(count > 0 and count < span);
+            const src = self.sourceRect(image);
+            // An empty source can never be clipped smaller. This also
+            // guarantees we never store an explicit zero source height,
+            // which would be reinterpreted as "full image".
+            if (src.height == 0) return false;
+            if (self.rows > 0) {
+                const crop: u32 = @intCast(@as(u64, src.height) * count / span);
+                if (crop >= src.height) return false;
+                self.source_height = src.height - crop;
+                self.rows -= count;
+            } else {
+                // The remaining rows can show this many source pixels,
+                // with the first cell losing cellOffset pixels to the
+                // placement's y offset.
+                const visible = saturatingMul(t.height_px / t.rows, span - count);
+                const offset = self.cellOffset(t).y;
+                if (visible <= offset) return false;
+                self.source_height = @min(src.height, visible - offset);
+            }
+            self.source_x = src.x;
+            self.source_y = src.y;
+            self.source_width = src.width;
+            return true;
+        }
+
         /// Returns a selection of the entire rectangle this placement
         /// occupies within the screen. This can return null for a virtual
         /// placement or when unavailable pixel geometry makes it empty.
+        ///
+        /// Relative placements also return null: they have no screen
+        /// position of their own, so geometric queries (delete by
+        /// intersection, row, column, etc.) never match them directly.
+        /// They are instead removed when their parent chain is removed.
         pub fn rect(
             self: Placement,
             image: Image,
@@ -1011,7 +1762,7 @@ pub const ImageStorage = struct {
             const grid_size = self.gridSize(image, t);
             const pin = switch (self.location) {
                 .pin => |p| p,
-                .virtual => return null,
+                .virtual, .relative => return null,
             };
             if (pin.garbage) return null;
 
@@ -1176,7 +1927,7 @@ test "storage: placement count limit permits replacement" {
     try testing.expectEqual(@as(usize, 1), s.placements.count());
 }
 
-test "storage: delete all placements and images" {
+test "storage: delete all visible placements and matching images" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -1195,7 +1946,8 @@ test "storage: delete all placements and images" {
     s.dirty = false;
     s.delete(io, alloc, &t, .{ .all = true });
     try testing.expect(s.dirty);
-    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(3));
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
 }
@@ -1220,10 +1972,96 @@ test "storage: delete all placements and images preserves limit" {
     s.dirty = false;
     s.delete(io, alloc, &t, .{ .all = true });
     try testing.expect(s.dirty);
-    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(3));
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(@as(usize, 5000), s.total_limit);
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: delete all visible placements preserves scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const history_key: ImageStorage.PlacementKey = .{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    };
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        s.placements.get(history_key).?.location.pin.*,
+    ) == null);
+
+    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+
+    s.delete(io, alloc, &t, .{ .all = true });
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expect(s.placements.contains(history_key));
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(1));
+}
+
+test "storage: delete all includes placements spanning into active area" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 2,
+    });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const placement = s.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        placement.location.pin.*,
+    ) == null);
+    const rect = placement.rect(s.imageById(1).?, &t).?;
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        rect.bottom_right,
+    ) != null);
+
+    s.delete(io, alloc, &t, .{ .all = true });
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expectEqual(@as(usize, 0), s.images.count());
 }
 
 test "storage: delete all placements" {
@@ -1325,6 +2163,79 @@ test "storage: delete placement by specific id" {
     try testing.expectEqual(@as(usize, 2), s.placements.count());
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: uppercase id delete preserves image when placement does not match" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+
+    s.dirty = false;
+    const generation = s.generation;
+    s.delete(io, alloc, &t, .{ .id = .{
+        .delete = true,
+        .image_id = 1,
+        .placement_id = 7,
+    } });
+
+    try testing.expect(s.imageById(1) != null);
+    try testing.expect(!s.dirty);
+    try testing.expectEqual(generation, s.generation);
+}
+
+test "storage: uppercase id delete frees image after placement matches" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 9, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
+    });
+
+    s.dirty = false;
+    s.delete(io, alloc, &t, .{ .id = .{
+        .delete = true,
+        .image_id = 1,
+        .placement_id = 9,
+    } });
+
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expect(s.dirty);
+    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: uppercase id delete without placement frees unplaced image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+
+    s.dirty = false;
+    s.delete(io, alloc, &t, .{ .id = .{
+        .delete = true,
+        .image_id = 1,
+    } });
+
+    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expect(s.dirty);
 }
 
 test "storage: delete intersecting cursor" {
@@ -1733,6 +2644,164 @@ test "storage: delete images by range 4" {
     try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
 }
 
+test "storage: uppercase range deletes unplaced image data" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
+
+    s.delete(io, alloc, &t, .{
+        .range = .{
+            .delete = true,
+            // Zero is the default lower bound when x is omitted.
+            .first = 0,
+            .last = 2,
+        },
+    });
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(3));
+}
+
+test "storage: delete images by empty range" {
+    // Ranges that select nothing are a silent no-op, matching kitty, which
+    // performs no validation and filters with `x <= image_id <= y`.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    const tracked = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
+
+    // Inverted range.
+    s.delete(io, alloc, &t, .{ .range = .{ .delete = true, .first = 5, .last = 4 } });
+    try testing.expectEqual(@as(usize, 2), s.images.count());
+    try testing.expectEqual(@as(usize, 2), s.placements.count());
+
+    // Upper bound omitted, so it defaults to zero.
+    s.delete(io, alloc, &t, .{ .range = .{ .delete = true, .first = 5, .last = 0 } });
+    try testing.expectEqual(@as(usize, 2), s.images.count());
+    try testing.expectEqual(@as(usize, 2), s.placements.count());
+
+    // Both bounds omitted. Image IDs are never zero so this matches nothing.
+    s.delete(io, alloc, &t, .{ .range = .{ .delete = true, .first = 0, .last = 0 } });
+    try testing.expectEqual(@as(usize, 2), s.images.count());
+    try testing.expectEqual(@as(usize, 2), s.placements.count());
+
+    // Both placements survive, so both of their pins are still tracked.
+    try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
+}
+
+test "storage: erase display preserves scrollback and reclaims unplaced images" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    const s = &t.screens.active.kitty_images;
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const history_key: ImageStorage.PlacementKey = .{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    };
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        s.placements.get(history_key).?.location.pin.*,
+    ) == null);
+
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 3, .width = 1, .height = 1 });
+
+    t.eraseDisplay(.complete, false);
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expect(s.placements.contains(history_key));
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+    try testing.expect(s.images.contains(1));
+    try testing.expect(!s.images.contains(2));
+    try testing.expect(!s.images.contains(3));
+}
+
+test "storage: cell offsets stay within explicit destination rectangle" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+    t.width_px = 50; // 10 px per col
+    t.height_px = 100; // 20 px per row
+
+    // Explicit columns and rows describe the far cell boundaries. Offsets
+    // move the near edge inward without moving those far edges.
+    const placement: ImageStorage.Placement = .{
+        .location = .{ .virtual = {} },
+        .x_offset = 3,
+        .y_offset = 4,
+        .columns = 2,
+        .rows = 1,
+    };
+    const actual = placement.pixelSize(.{ .width = 4, .height = 3 }, &t);
+    try testing.expectEqual(@as(u32, 17), actual.width);
+    try testing.expectEqual(@as(u32, 16), actual.height);
+    try testing.expectEqual(@as(u32, 2), placement.gridSize(.{ .width = 4, .height = 3 }, &t).cols);
+    try testing.expectEqual(@as(u32, 1), placement.gridSize(.{ .width = 4, .height = 3 }, &t).rows);
+}
+
+test "storage: cell offsets clamp to cell bounds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+    t.width_px = 50; // 10 px per col
+    t.height_px = 100; // 20 px per row
+
+    const placement: ImageStorage.Placement = .{
+        .location = .{ .virtual = {} },
+        .x_offset = std.math.maxInt(u32),
+        .y_offset = std.math.maxInt(u32),
+        .columns = 1,
+        .rows = 1,
+    };
+    const offset = placement.cellOffset(&t);
+    try testing.expectEqual(@as(u32, 9), offset.x);
+    try testing.expectEqual(@as(u32, 19), offset.y);
+
+    // Even hostile offsets leave one pixel inside the requested cell.
+    const actual = placement.pixelSize(.{ .width = 1, .height = 1 }, &t);
+    try testing.expectEqual(@as(u32, 1), actual.width);
+    try testing.expectEqual(@as(u32, 1), actual.height);
+}
+
 test "storage: aspect ratio calculation when only columns or rows specified" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1778,6 +2847,50 @@ test "storage: aspect ratio calculation when only columns or rows specified" {
         try testing.expectEqual(@as(u32, 178), calc_size.width);
         try testing.expectEqual(@as(u32, 100), calc_size.height);
     }
+}
+
+test "storage: default source rectangle is intersected before sizing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+
+    const placement: ImageStorage.Placement = .{
+        .location = .{ .virtual = {} },
+        .source_x = 3,
+        .source_y = 1,
+    };
+    const actual = placement.pixelSize(.{ .width = 4, .height = 3 }, &t);
+    try testing.expectEqual(@as(u32, 1), actual.width);
+    try testing.expectEqual(@as(u32, 2), actual.height);
+}
+
+test "storage: explicit source rectangle is intersected before sizing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    // The requested 8x8 rectangle intersects this 10x10 image as 2x3.
+    // With a two-column destination, the clipped 2:3 aspect ratio produces
+    // a 20x30 pixel destination.
+    const placement: ImageStorage.Placement = .{
+        .location = .{ .virtual = {} },
+        .source_x = 8,
+        .source_y = 7,
+        .source_width = 8,
+        .source_height = 8,
+        .columns = 2,
+    };
+    const actual = placement.pixelSize(.{ .width = 10, .height = 10 }, &t);
+    try testing.expectEqual(@as(u32, 20), actual.width);
+    try testing.expectEqual(@as(u32, 30), actual.height);
 }
 
 test "storage: placement geometry handles untrusted dimensions" {
@@ -1827,8 +2940,8 @@ test "storage: placement geometry handles untrusted dimensions" {
         try testing.expectEqual(max, actual.height);
     }
 
-    // Pixel offsets are protocol-controlled too. Include them without
-    // allowing the grid-size numerator to wrap.
+    // Pixel offsets are protocol-controlled too. Clamp them to the cell
+    // before including them in grid geometry.
     t.width_px = 2;
     t.height_px = 2;
     {
@@ -1838,8 +2951,8 @@ test "storage: placement geometry handles untrusted dimensions" {
             .y_offset = max,
         };
         const actual = placement.gridSize(.{ .width = 1, .height = 1 }, &t);
-        try testing.expectEqual(max, actual.cols);
-        try testing.expectEqual(max, actual.rows);
+        try testing.expectEqual(@as(u32, 1), actual.cols);
+        try testing.expectEqual(@as(u32, 1), actual.rows);
     }
 
     const pin = try trackPin(&t, .{ .x = 0, .y = 0 });
@@ -2329,4 +3442,660 @@ test "storage: pending images share exact eviction ordering" {
     try testing.expect(s.images.contains(2));
     try testing.expect(!s.images.contains(3));
     try testing.expectEqual(@as(usize, 128), s.total_bytes);
+}
+
+test "storage: nextImageId number matches Kitty get_free_client_id" {
+    const testing = std.testing;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // Empty storage returns 1, as does Kitty.
+    try testing.expectEqual(@as(u32, 1), s.nextImageId(.explicit));
+
+    // Contiguous IDs from 1: the next ID after them.
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 3 });
+    try testing.expectEqual(@as(u32, 4), s.nextImageId(.explicit));
+
+    // The first gap is filled, even when higher IDs exist.
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 100 });
+    s.delete(io, alloc, &t, .{ .id = .{ .image_id = 2, .delete = true } });
+    try testing.expectEqual(@as(u32, 2), s.nextImageId(.explicit));
+
+    // 1 is reused as soon as it is free.
+    s.delete(io, alloc, &t, .{ .id = .{ .image_id = 1, .delete = true } });
+    try testing.expectEqual(@as(u32, 1), s.nextImageId(.explicit));
+}
+
+test "storage: nextImageId implicit skips in-use ids and zero" {
+    const testing = std.testing;
+    const io = testing.io;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // A client image already sits on the counter's first two values.
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2147483647 });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2147483648 });
+    try testing.expectEqual(@as(u32, 2147483649), s.nextImageId(.implicit));
+    try testing.expectEqual(@as(u32, 2147483650), s.nextImageId(.implicit));
+
+    // Wrapping skips zero, which means "no ID" protocol-wide.
+    s.next_image_id = std.math.maxInt(u32);
+    try testing.expectEqual(std.math.maxInt(u32), s.nextImageId(.implicit));
+    try testing.expectEqual(@as(u32, 1), s.nextImageId(.implicit));
+}
+
+test "storage: scroll margins placement inside region scrolls and clips at top" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 2-row image (10x10px cells) inside the region (rows 1-4).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 20,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(5, 1);
+
+    // Entirely inside: moves up with the content.
+    try t.index();
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
+    }
+
+    // Would extend above the top margin: anchored at the top margin
+    // with the top cell row clipped off the source.
+    try t.index();
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
+        try testing.expectEqual(@as(u32, 10), p.source_y);
+        try testing.expectEqual(@as(u32, 10), p.source_height);
+    }
+
+    // Fully clipped: deleted.
+    try t.index();
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+    // The image itself is retained.
+    try testing.expectEqual(@as(usize, 1), storage.images.count());
+}
+
+test "storage: scroll margins placement straddling region does not move" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 3-row image anchored at the top of a 2-row region: not entirely
+    // within the region, so region scrolls must not move it. This
+    // exercises the scrollback-creating path (region top at row 0).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 30,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
+    t.setTopAndBottomMargin(1, 2);
+    t.setCursorPos(2, 1);
+
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, pt.coord());
+    try testing.expectEqual(@as(u32, 0), p.source_y);
+    try testing.expectEqual(@as(u32, 0), p.source_height);
+}
+
+test "storage: scroll margins placement below region does not move" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // A "status bar" image below the bottom margin must stay put while
+    // the region above it scrolls (scrollback-creating path).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 5 }) },
+    });
+    t.setTopAndBottomMargin(1, 4);
+    t.setCursorPos(4, 1);
+
+    try t.index();
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 5 }, pt.coord());
+}
+
+test "storage: scroll margins reverse index clips at bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 2-row image at the bottom of the region (rows 1-4).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 20,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 3 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(2, 1);
+
+    // Moves down, with the bottom cell row clipped off the source.
+    t.reverseIndex();
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 4 }, pt.coord());
+        try testing.expectEqual(@as(u32, 0), p.source_y);
+        try testing.expectEqual(@as(u32, 10), p.source_height);
+    }
+
+    // Fully clipped: deleted.
+    t.reverseIndex();
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+}
+
+test "storage: scroll margins scaled placement clips proportionally" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // A 40px-tall image scaled into 2 rows, inside a 2-row region.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 40,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 1 }) },
+        .columns = 1,
+        .rows = 2,
+    });
+    t.setTopAndBottomMargin(2, 3);
+    t.setCursorPos(3, 1);
+
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, pt.coord());
+    try testing.expectEqual(@as(u32, 20), p.source_y);
+    try testing.expectEqual(@as(u32, 20), p.source_height);
+    try testing.expectEqual(@as(u32, 1), p.rows);
+    try testing.expectEqual(@as(u32, 1), p.columns);
+}
+
+test "storage: scroll margins left/right margins respect columns" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // One placement outside the left/right margin columns, one inside.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 2, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 2, .y = 2 }) },
+    });
+
+    t.modes.set(.enable_left_and_right_margin, true);
+    t.setLeftAndRightMargin(2, 8);
+
+    try t.scrollUp(1);
+
+    // Outside the margin columns: stays.
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 2 }, pt.coord());
+    }
+
+    // Inside: moves up.
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 2 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 2, .y = 1 }, pt.coord());
+    }
+}
+
+test "storage: scroll margins insert/delete lines do not move placements" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // Kitty does not scroll images for IL/DL, only for IND/RI/SU/SD.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(2, 1);
+
+    t.deleteLines(1);
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 2 }, pt.coord());
+    }
+
+    t.insertLines(1);
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 2 }, pt.coord());
+    }
+}
+
+test "storage: scroll without margins moves placement into scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // No margins: the placement follows its anchored row into the
+    // scrollback via pin tracking (kitty's marginless behavior).
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 20,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
+    t.setCursorPos(6, 1);
+
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        p.location.pin.*,
+    ) == null);
+    const pt = t.screens.active.pages.pointFromPin(.screen, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, pt.coord());
+}
+
+test "storage: scroll margins large scroll deletes inside placement" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+
+    try t.scrollUp(10);
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+}
+
+test "storage: scroll margins straddling placement pin inside region restored" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 2-row image anchored on the bottom margin row, extending below
+    // the region: not entirely inside, so it must not move even though
+    // the region scroll moves every tracked pin within the region rows.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 20,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 4 }) },
+    });
+    t.setTopAndBottomMargin(2, 5);
+    t.setCursorPos(5, 1);
+
+    try t.index();
+    const p = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 4 }, pt.coord());
+    try testing.expectEqual(@as(u32, 0), p.source_y);
+    try testing.expectEqual(@as(u32, 0), p.source_height);
+}
+
+test "storage: scroll margins multi-line scroll up with scrollback" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+
+    // 1-row image inside a region whose top is the screen top, so the
+    // scroll pushes text into the scrollback (window shift) while the
+    // image moves within the region.
+    const storage: *ImageStorage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+    });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 2 }) },
+    });
+    t.setTopAndBottomMargin(1, 4);
+
+    try t.scrollUp(2);
+    {
+        const p = storage.placements.get(.{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        }).?;
+        const pt = t.screens.active.pages.pointFromPin(.active, p.location.pin.*).?;
+        try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, pt.coord());
+    }
+
+    // Another two rows scrolls it out of the region: deleted.
+    try t.scrollUp(2);
+    try testing.expectEqual(@as(usize, 0), storage.placements.count());
+}
+
+test "storage: resolveChain accumulates offsets to the pin root" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
+    });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{
+        .location = .{ .relative = .{
+            .parent = .{
+                .image_id = 1,
+                .placement_id = .{ .tag = .external, .id = 1 },
+            },
+            .horizontal_offset = 2,
+            .vertical_offset = 1,
+        } },
+    });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 3, .{
+        .location = .{ .relative = .{
+            .parent = .{
+                .image_id = 1,
+                .placement_id = .{ .tag = .external, .id = 2 },
+            },
+            .horizontal_offset = -1,
+            .vertical_offset = 4,
+        } },
+    });
+
+    const grandchild = s.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 3 },
+    }).?;
+    const chain = s.resolveChain(grandchild.location.relative).?;
+    try testing.expect(chain.root_key.eql(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }));
+    try testing.expect(chain.root.location == .pin);
+    try testing.expectEqual(@as(i32, 1), chain.horizontal_offset);
+    try testing.expectEqual(@as(i32, 5), chain.vertical_offset);
+}
+
+test "storage: resolveChain finds virtual roots" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .virtual = {} },
+    });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 2, .{
+        .location = .{ .relative = .{
+            .parent = .{
+                .image_id = 1,
+                .placement_id = .{ .tag = .external, .id = 1 },
+            },
+            .horizontal_offset = 1,
+        } },
+    });
+
+    const child = s.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 2 },
+    }).?;
+    const chain = s.resolveChain(child.location.relative).?;
+    try testing.expect(chain.root.location == .virtual);
+    try testing.expect(chain.root_key.eql(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }));
+    try testing.expectEqual(@as(i32, 1), chain.horizontal_offset);
+    try testing.expectEqual(@as(i32, 0), chain.vertical_offset);
+}
+
+test "storage: eviction removes orphaned relative placements" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    s.total_limit = 8;
+
+    // Image 1 holds most of the byte budget and has a pin placement.
+    try s.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 2,
+        .height = 1,
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 0, 0, 0, 0 }) },
+    });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
+    });
+
+    // Image 2's placement is relative to image 1's placement.
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2 });
+    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{
+        .location = .{ .relative = .{ .parent = .{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 1 },
+        } } },
+    });
+
+    // Adding image 3 exceeds the limit and evicts image 1 (oldest),
+    // removing its placement, which orphans image 2's placement.
+    try s.addImage(io, alloc, t.screens.active, .{
+        .id = 3,
+        .width = 2,
+        .height = 1,
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 0, 0, 0, 0 }) },
+    });
+
+    try testing.expect(s.imageById(1) == null);
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expect(s.imageById(2) != null);
+}
+
+test "storage: placeholderTarget lookup" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 5, .{
+        .location = .{ .virtual = {} },
+    });
+
+    // Exact external ID match.
+    {
+        const target = s.placeholderTarget(1, 5).?;
+        const expected: ImageStorage.PlacementKey = .{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 5 },
+        };
+        try testing.expectEqual(expected, target.key);
+        try testing.expect(target.placement.location == .virtual);
+    }
+
+    // Zero placement ID falls back to the image's virtual placement.
+    {
+        const target = s.placeholderTarget(1, 0).?;
+        const expected: ImageStorage.PlacementKey = .{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 5 },
+        };
+        try testing.expectEqual(expected, target.key);
+    }
+
+    try testing.expect(s.placeholderTarget(1, 9) == null);
+    try testing.expect(s.placeholderTarget(2, 0) == null);
+
+    // With multiple virtual placements, the zero-ID fallback picks
+    // deterministically by PlacementId.preferredOver: lowest external.
+    try s.addPlacement(io, alloc, t.screens.active, 1, 3, .{
+        .location = .{ .virtual = {} },
+    });
+    {
+        const expected: ImageStorage.PlacementKey = .{
+            .image_id = 1,
+            .placement_id = .{ .tag = .external, .id = 3 },
+        };
+        try testing.expectEqual(expected, s.placeholderTarget(1, 0).?.key);
+    }
 }
