@@ -51,6 +51,7 @@ anhthang
 anmitalidev
 anthonyzhoon
 aprilnea
+arneshbanerjee
 arvin7liu
 athaapa
 atomk
@@ -60,6 +61,7 @@ b0uks
 b1nar10
 balazs-szucs
 barutsrb
+basteez
 bch
 bennettp123
 benodiwal
@@ -97,9 +99,14 @@ deblasis
 dervedro
 devsunb
 diaaeddin
+-didouougha slingshotting LLM output
+diego-moment
+diegoarmstrong
 dkinzler
 dmehala
+dmunozv04
 dobbylee
+dolzenko
 doprz
 douglance
 douglas
@@ -108,6 +115,7 @@ drepper
 dzhlobo
 ekaterinepapava
 elias8
+elitex45
 -enkr1
 enzowilliam
 ephemera
@@ -251,8 +259,10 @@ pluiedev
 pouwerkerk
 poweruser64
 prakhar54-byte
+preiter93
 prihlop
 priyans-hu
+pssalman
 puzza007
 qappell
 quinnypig
@@ -280,10 +290,12 @@ sanjj1
 secrus
 seruman
 seyoungjeong
+sghng
 shorsher
 silveirapf
 simonbcn
 slsrepo
+steven-tk
 sunshine-syz
 svmhdvn
 tasselx
@@ -296,6 +308,7 @@ ticclick
 tnagatomi
 trag1c
 tristan957
+tsacha
 turbolent
 tweedbeetle
 uhojin
@@ -319,4 +332,5 @@ ydah
 zenangst
 zenyr
 zeshi09
+zlitus
 zubb
