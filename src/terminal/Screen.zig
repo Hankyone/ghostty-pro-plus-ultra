@@ -397,11 +397,16 @@ pub fn reset(self: *Screen) void {
     self.pages.reset();
 
     // The above reset preserves tracked pins so we can still use
-    // our cursor pin, which should be at the top-left already.
+    // our cursor pin, which should be at the top-left already. The
+    // reset marks every tracked pin as garbage, but we keep using
+    // this one at its new valid position, so clear the flag: copies
+    // of the cursor pin (e.g. for Kitty image placements) must not
+    // be born garbage.
     const cursor_pin: *PageList.Pin = self.cursor.page_pin;
     assert(cursor_pin.node == self.pages.pages.first.?);
     assert(cursor_pin.x == 0);
     assert(cursor_pin.y == 0);
+    cursor_pin.garbage = false;
     const cursor_rac = cursor_pin.rowAndCell();
     self.cursor.deinit(self.alloc);
     self.cursor = .{
@@ -412,8 +417,14 @@ pub fn reset(self: *Screen) void {
 
     if (comptime build_options.kitty_graphics) {
         // Reset kitty graphics storage
+        const image_limits = self.kitty_images.image_limits;
+        const total_limit = self.kitty_images.total_limit;
         self.kitty_images.deinit(self.alloc, self);
-        self.kitty_images = .{ .dirty = true };
+        self.kitty_images = .{
+            .dirty = true,
+            .image_limits = image_limits,
+            .total_limit = total_limit,
+        };
     }
 
     // Reset our basic state
@@ -2872,16 +2883,7 @@ pub const SelectionString = struct {
 
     /// If true, trim whitespace around the selection.
     trim: bool = true,
-
-    /// If non-null, a stringmap will be written here. This will use
-    /// the same allocator as the call to selectionString. The string will
-    /// be duplicated here and in the return value so both must be freed.
-    map: ?*StringMap = null,
 };
-
-const selectionString_tw = tripwire.module(enum {
-    copy_map,
-}, selectionString);
 
 /// Returns the raw text associated with a selection. This will unwrap
 /// soft-wrapped edges. The returned slice is owned by the caller and allocated
@@ -2892,6 +2894,32 @@ pub fn selectionString(
     self: *Screen,
     alloc: Allocator,
     opts: SelectionString,
+) Allocator.Error![:0]const u8 {
+    return self.selectionStringImpl(alloc, opts, null);
+}
+
+/// Returns a StringMap associated with a selection. The map contains the
+/// selection's raw text and a mapping from each byte to its screen location.
+///
+/// The returned map is owned by the caller.
+pub fn selectionStringMap(
+    self: *Screen,
+    alloc: Allocator,
+    opts: SelectionString,
+) Allocator.Error!StringMap {
+    var pins: PinMap.Map = .empty;
+    errdefer pins.deinit(alloc);
+    return .{
+        .string = try self.selectionStringImpl(alloc, opts, &pins),
+        .map = pins,
+    };
+}
+
+fn selectionStringImpl(
+    self: *Screen,
+    alloc: Allocator,
+    opts: SelectionString,
+    pins: ?*PinMap.Map,
 ) Allocator.Error![:0]const u8 {
     // We'll use this as our buffer to build our string.
     var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -2908,35 +2936,15 @@ pub fn selectionString(
     );
     formatter.content = .{ .selection = opts.sel };
 
-    // If we have a string map, we need to set that up.
-    var pins: PinMap.Map = .empty;
-    defer pins.deinit(alloc);
-    if (opts.map != null) formatter.pin_map = .{
+    if (pins) |map| formatter.pin_map = .{
         .alloc = alloc,
-        .map = &pins,
+        .map = map,
     };
 
     // Emit. Since this is an allocating writer, a failed write
     // just becomes an OOM.
     formatter.format(&aw.writer) catch return error.OutOfMemory;
-
-    // Build our final text and if we have a string map set that up.
-    const text = try aw.toOwnedSliceSentinel(0);
-    errdefer alloc.free(text);
-    if (opts.map) |map| {
-        const map_string = try alloc.dupeZ(u8, text);
-        errdefer alloc.free(map_string);
-        try selectionString_tw.check(.copy_map);
-        map.* = .{
-            .string = map_string,
-            .map = pins,
-        };
-
-        // Ownership of the pin map moved to the string map.
-        pins = .empty;
-    }
-
-    return text;
+    return try aw.toOwnedSliceSentinel(0);
 }
 
 pub const SelectLine = struct {
@@ -3807,6 +3815,23 @@ test "Screen forwards optional scrollback limits" {
     );
     try testing.expectEqual(max_lines, s.pages.limits.lines.explicit);
     try testing.expect(!s.no_scrollback);
+}
+
+test "Screen reset cursor pin is not garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("hello, world");
+
+    // The page reset marks every tracked pin garbage but the screen
+    // keeps using the cursor pin, so it must come back clean: anything
+    // that copies it (e.g. Kitty image placements) would otherwise be
+    // born garbage and reaped.
+    s.reset();
+    try testing.expect(!s.cursor.page_pin.garbage);
 }
 
 test "Screen read and write" {
@@ -7797,6 +7822,14 @@ test "Screen: resize errors preserve state" {
         try testing.expectEqual(before.pages.viewport, s.pages.viewport);
         try testing.expectEqual(before_viewport_pin, s.pages.viewport_pin.*);
         try testing.expectEqual(before_tracked_pins, s.pages.countTrackedPins());
+        if (std.valgrind.runningOnValgrind() > 0) {
+            // This assertion deliberately compares the complete raw page,
+            // including semantically irrelevant struct padding.
+            std.valgrind.memcheck.makeMemDefined(before_page);
+            std.valgrind.memcheck.makeMemDefined(
+                s.pages.pages.first.?.page().memory,
+            );
+        }
         try testing.expectEqualSlices(
             u8,
             before_page,
@@ -11438,38 +11471,6 @@ test "Screen setAttribute splits page on OutOfSpace at max styles" {
         node_before_set.prev != null or
         s.cursor.page_pin.node != original_node;
     try testing.expect(page_was_split);
-}
-
-test "selectionString map allocation failure cleanup" {
-    // This test verifies that if toOwnedSlice fails when building
-    // the StringMap, we don't leak the already-allocated map.string.
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = testing.io;
-    var s = try Screen.init(io, alloc, .{ .cols = 10, .rows = 5, .max_scrollback_bytes = 0 });
-    defer s.deinit();
-
-    try s.testWriteString("hello");
-
-    // Get a selection
-    const sel = Selection.init(
-        s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
-        s.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?,
-        false,
-    );
-
-    // Trigger allocation failure on toOwnedSlice
-    var map: StringMap = undefined;
-    selectionString_tw.errorAlways(.copy_map, error.OutOfMemory);
-    const result = s.selectionString(alloc, .{
-        .sel = sel,
-        .map = &map,
-    });
-    try testing.expectError(error.OutOfMemory, result);
-    try selectionString_tw.end(.reset);
-
-    // If this test passes without memory leaks (when run with testing.allocator),
-    // it means the errdefer properly cleaned up map.string when toOwnedSlice failed.
 }
 
 test "Screen: promptClickMove line right basic" {
