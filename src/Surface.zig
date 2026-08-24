@@ -2299,13 +2299,14 @@ fn copySelectionToClipboards(
 
     const ScreenFormatter = terminal.formatter.ScreenFormatter;
     var aw: std.Io.Writer.Allocating = .init(alloc);
-    var contents: std.ArrayList(apprt.ClipboardContent) = .empty;
+    var contents_buf: [2]apprt.ClipboardContent = undefined;
+    var contents: std.ArrayList(apprt.ClipboardContent) = .initBuffer(&contents_buf);
     switch (format) {
         .plain => {
             var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/plain",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -2322,7 +2323,7 @@ fn copySelectionToClipboards(
 
             // Note: We don't apply codepoint mappings to VT format since it contains
             // escape sequences that should be preserved as-is
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/plain",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -2339,7 +2340,7 @@ fn copySelectionToClipboards(
 
             // Note: We don't apply codepoint mappings to HTML format since HTML
             // has its own character encoding and entity system
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/html",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -2350,7 +2351,7 @@ fn copySelectionToClipboards(
             var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/plain",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -2373,7 +2374,7 @@ fn copySelectionToClipboards(
             try formatter.format(&aw.writer);
 
             // Note: We don't apply codepoint mappings to HTML format
-            try contents.append(alloc, .{
+            contents.appendAssumeCapacity(.{
                 .mime = "text/html",
                 .data = try aw.toOwnedSliceSentinel(0),
             });
@@ -4410,12 +4411,10 @@ fn linkAtPin(
         .semantic_prompt_boundary = true,
     }) orelse return null;
 
-    var strmap: terminal.StringMap = undefined;
-    self.alloc.free(try screen.selectionString(self.alloc, .{
+    const strmap = try screen.selectionStringMap(self.alloc, .{
         .sel = line,
         .trim = false,
-        .map = &strmap,
-    }));
+    });
     defer strmap.deinit(self.alloc);
 
     for (self.config.links) |link| {
@@ -4913,10 +4912,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .text => |data| {
-            // For text we always allocate just because its easier to
-            // handle all cases that way.
-            const buf = try self.alloc.alloc(u8, data.len);
-            defer self.alloc.free(buf);
+            var stack = std.heap.stackFallback(256, self.alloc);
+            const alloc = stack.get();
+            const buf = try alloc.alloc(u8, data.len);
+            defer alloc.free(buf);
             const text = configpkg.string.parse(buf, data) catch |err| {
                 log.warn(
                     "error parsing text binding text={s} err={}",
@@ -5223,6 +5222,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .tab,
         ),
 
+        .prompt_window_title => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .prompt_title,
+            .window,
+        ),
+
         .set_surface_title => |v| {
             const title = try self.alloc.dupeZ(u8, v);
             defer self.alloc.free(title);
@@ -5239,6 +5244,16 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             return try self.rt_app.performAction(
                 .{ .surface = self },
                 .set_tab_title,
+                .{ .title = title },
+            );
+        },
+
+        .set_window_title => |v| {
+            const title = try self.alloc.dupeZ(u8, v);
+            defer self.alloc.free(title);
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .set_window_title,
                 .{ .title = title },
             );
         },
