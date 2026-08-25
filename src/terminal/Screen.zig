@@ -378,6 +378,16 @@ pub fn assertIntegrity(self: *const Screen) void {
         ) orelse unreachable;
         assert(self.cursor.x == pt.active.x);
         assert(self.cursor.y == pt.active.y);
+
+        // The cursor style and hyperlink if non-zero must reference
+        // real data in the page the pin is in.
+        const page: *const Page = self.cursor.page_pin.node.page();
+        if (self.cursor.style_id != style.default_id) {
+            assert(page.styles.refCount(page.memory, self.cursor.style_id) > 0);
+        }
+        if (self.cursor.hyperlink_id != 0) {
+            assert(page.hyperlink_set.refCount(page.memory, self.cursor.hyperlink_id) > 0);
+        }
     }
 }
 
@@ -397,11 +407,16 @@ pub fn reset(self: *Screen) void {
     self.pages.reset();
 
     // The above reset preserves tracked pins so we can still use
-    // our cursor pin, which should be at the top-left already.
+    // our cursor pin, which should be at the top-left already. The
+    // reset marks every tracked pin as garbage, but we keep using
+    // this one at its new valid position, so clear the flag: copies
+    // of the cursor pin (e.g. for Kitty image placements) must not
+    // be born garbage.
     const cursor_pin: *PageList.Pin = self.cursor.page_pin;
     assert(cursor_pin.node == self.pages.pages.first.?);
     assert(cursor_pin.x == 0);
     assert(cursor_pin.y == 0);
+    cursor_pin.garbage = false;
     const cursor_rac = cursor_pin.rowAndCell();
     self.cursor.deinit(self.alloc);
     self.cursor = .{
@@ -412,8 +427,14 @@ pub fn reset(self: *Screen) void {
 
     if (comptime build_options.kitty_graphics) {
         // Reset kitty graphics storage
+        const image_limits = self.kitty_images.image_limits;
+        const total_limit = self.kitty_images.total_limit;
         self.kitty_images.deinit(self.alloc, self);
-        self.kitty_images = .{ .dirty = true };
+        self.kitty_images = .{
+            .dirty = true,
+            .image_limits = image_limits,
+            .total_limit = total_limit,
+        };
     }
 
     // Reset our basic state
@@ -863,9 +884,31 @@ pub fn cursorReload(self: *Screen) void {
         .active,
         self.cursor.page_pin.*,
     ) orelse reset: {
+        // Our cached row/cell pointers may be invalid (that is often
+        // the reason cursorReload is being called), so refresh them
+        // from the pin first since cursorChangePin below marks the
+        // old cursor row as dirty.
+        const old_rac = self.cursor.page_pin.rowAndCell();
+        self.cursor.page_row = old_rac.row;
+        self.cursor.page_cell = old_rac.cell;
+
+        // The cursor style and hyperlink IDs are only valid within the
+        // page that the pin points at, so the pin change must go through
+        // cursorChangePin, which migrates them when the active top-left
+        // is on a different page. Writing the pin directly here would
+        // leave the cursor holding IDs that are dead or alias unrelated
+        // entries on the new page.
         const pin = self.pages.pin(.{ .active = .{} }).?;
-        self.cursor.page_pin.* = pin;
-        break :reset self.pages.pointFromPin(.active, pin).?;
+        self.cursor.x = 0; // Must be set before cursorChangePin
+        self.cursor.y = 0;
+        self.cursorChangePin(pin);
+
+        // cursorChangePin can trigger a page capacity adjustment which
+        // moves the pin again, so we re-read it to derive our point.
+        break :reset self.pages.pointFromPin(
+            .active,
+            self.cursor.page_pin.*,
+        ).?;
     };
 
     self.cursor.x = @intCast(pt.active.x);
@@ -873,20 +916,6 @@ pub fn cursorReload(self: *Screen) void {
     const page_rac = self.cursor.page_pin.rowAndCell();
     self.cursor.page_row = page_rac.row;
     self.cursor.page_cell = page_rac.cell;
-
-    // If we have a style, we need to ensure it is in the page because this
-    // method may also be called after a page change.
-    if (self.cursor.style_id != style.default_id) {
-        self.manualStyleUpdate() catch |err| {
-            // This failure should not happen because manualStyleUpdate
-            // handles page splitting, overflow, and more. This should only
-            // happen if we're out of RAM. In this case, we'll just degrade
-            // gracefully back to the default style.
-            log.err("failed to update style on cursor reload err={}", .{err});
-            self.cursor.style = .{};
-            self.cursor.style_id = 0;
-        };
-    }
 }
 
 /// Scroll the active area and keep the cursor at the bottom of the screen.
@@ -1476,6 +1505,10 @@ inline fn cursorChangePin(self: *Screen, new: Pin) void {
     if (self.cursor.hyperlink != null) {
         const old_page: *Page = self.cursor.page_pin.node.page();
         old_page.hyperlink_set.release(old_page.memory, self.cursor.hyperlink_id);
+        // Zero the ID, it is invalid now and style changes below may
+        // run integrity checks. We still have self.cursor.hyperlink to
+        // rebuild this later.
+        self.cursor.hyperlink_id = 0;
     }
 
     // Update our pin to the new page
@@ -1497,8 +1530,9 @@ inline fn cursorChangePin(self: *Screen, new: Pin) void {
 
     // On the new page, we need to migrate our hyperlink
     if (self.cursor.hyperlink) |link| {
-        // So we don't attempt to free any memory in the replaced page.
-        self.cursor.hyperlink_id = 0;
+        // startHyperlink will try to free old hyperlinks, so set this
+        // to null. We free it ourselves later since we're doing some
+        // ref-counting shenanigans in this function.
         self.cursor.hyperlink = null;
 
         // Re-add
@@ -2872,16 +2906,7 @@ pub const SelectionString = struct {
 
     /// If true, trim whitespace around the selection.
     trim: bool = true,
-
-    /// If non-null, a stringmap will be written here. This will use
-    /// the same allocator as the call to selectionString. The string will
-    /// be duplicated here and in the return value so both must be freed.
-    map: ?*StringMap = null,
 };
-
-const selectionString_tw = tripwire.module(enum {
-    copy_map,
-}, selectionString);
 
 /// Returns the raw text associated with a selection. This will unwrap
 /// soft-wrapped edges. The returned slice is owned by the caller and allocated
@@ -2892,6 +2917,32 @@ pub fn selectionString(
     self: *Screen,
     alloc: Allocator,
     opts: SelectionString,
+) Allocator.Error![:0]const u8 {
+    return self.selectionStringImpl(alloc, opts, null);
+}
+
+/// Returns a StringMap associated with a selection. The map contains the
+/// selection's raw text and a mapping from each byte to its screen location.
+///
+/// The returned map is owned by the caller.
+pub fn selectionStringMap(
+    self: *Screen,
+    alloc: Allocator,
+    opts: SelectionString,
+) Allocator.Error!StringMap {
+    var pins: PinMap.Map = .empty;
+    errdefer pins.deinit(alloc);
+    return .{
+        .string = try self.selectionStringImpl(alloc, opts, &pins),
+        .map = pins,
+    };
+}
+
+fn selectionStringImpl(
+    self: *Screen,
+    alloc: Allocator,
+    opts: SelectionString,
+    pins: ?*PinMap.Map,
 ) Allocator.Error![:0]const u8 {
     // We'll use this as our buffer to build our string.
     var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -2908,35 +2959,15 @@ pub fn selectionString(
     );
     formatter.content = .{ .selection = opts.sel };
 
-    // If we have a string map, we need to set that up.
-    var pins: PinMap.Map = .empty;
-    defer pins.deinit(alloc);
-    if (opts.map != null) formatter.pin_map = .{
+    if (pins) |map| formatter.pin_map = .{
         .alloc = alloc,
-        .map = &pins,
+        .map = map,
     };
 
     // Emit. Since this is an allocating writer, a failed write
     // just becomes an OOM.
     formatter.format(&aw.writer) catch return error.OutOfMemory;
-
-    // Build our final text and if we have a string map set that up.
-    const text = try aw.toOwnedSliceSentinel(0);
-    errdefer alloc.free(text);
-    if (opts.map) |map| {
-        const map_string = try alloc.dupeZ(u8, text);
-        errdefer alloc.free(map_string);
-        try selectionString_tw.check(.copy_map);
-        map.* = .{
-            .string = map_string,
-            .map = pins,
-        };
-
-        // Ownership of the pin map moved to the string map.
-        pins = .empty;
-    }
-
-    return text;
+    return try aw.toOwnedSliceSentinel(0);
 }
 
 pub const SelectLine = struct {
@@ -3809,6 +3840,23 @@ test "Screen forwards optional scrollback limits" {
     try testing.expect(!s.no_scrollback);
 }
 
+test "Screen reset cursor pin is not garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 1000 });
+    defer s.deinit();
+    try s.testWriteString("hello, world");
+
+    // The page reset marks every tracked pin garbage but the screen
+    // keeps using the cursor pin, so it must come back clean: anything
+    // that copies it (e.g. Kitty image placements) would otherwise be
+    // born garbage and reaped.
+    s.reset();
+    try testing.expect(!s.cursor.page_pin.garbage);
+}
+
 test "Screen read and write" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -4112,6 +4160,82 @@ test "Screen write regrows compacted page capacity" {
     try testing.expect(page.styles.count() >= 1);
     try testing.expect(page.hyperlink_set.count() >= 1);
     try testing.expect(page.graphemeCount() >= 1);
+}
+
+// The cursor style and hyperlink IDs are only meaningful within the page
+// the cursor pin points at. scrollClear can move the active area onto a
+// later page while the cursor pin stays with its content on an earlier
+// page (now scrollback), so the reset in cursorReload must migrate both
+// references to the destination page. It previously replaced the pin
+// directly and then released the old style ID on the new page.
+test "Screen scrollClear across pages migrates cursor style and hyperlink" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{
+        .cols = 10,
+        .rows = 10,
+        .max_scrollback_bytes = std.math.maxInt(usize),
+    });
+    defer s.deinit();
+
+    // Fill the first page so the active area spans two pages.
+    const first_page_size = s.pages.pages.first.?.capacity().rows;
+    s.pages.pages.first.?.page().pauseIntegrityChecks(true);
+    for (0..first_page_size - 5) |_| {
+        try s.testWriteString("\n");
+    }
+    s.pages.pages.first.?.page().pauseIntegrityChecks(false);
+    try s.testWriteString("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+    try testing.expect(s.pages.pages.first != s.pages.pages.last);
+
+    // Move the cursor to the top of the active area, which is on the
+    // first page, and give it a style and a hyperlink there.
+    s.cursorAbsolute(0, 0);
+    try testing.expect(s.cursor.page_pin.node == s.pages.pages.first.?);
+    try s.setAttribute(.{ .bold = {} });
+    try s.startHyperlink("https://example.com/", null);
+
+    const old_page: *Page = s.cursor.page_pin.node.page();
+    const old_style_id = s.cursor.style_id;
+    const old_hyperlink_id = s.cursor.hyperlink_id;
+    try testing.expect(old_style_id != style.default_id);
+    try testing.expect(old_hyperlink_id != 0);
+
+    // All ten active rows are non-empty, so this moves the active area
+    // fully onto the second page while the cursor pin stays with its
+    // old row, which is now scrollback.
+    try s.scrollClear();
+
+    // The cursor was moved to the new active top-left on the second
+    // page with its style and hyperlink references rebuilt there.
+    const new_page: *Page = s.cursor.page_pin.node.page();
+    try testing.expect(new_page != old_page);
+    try testing.expect(s.cursor.style_id != style.default_id);
+    try testing.expect(s.cursor.hyperlink_id != 0);
+    try testing.expect(new_page.styles.refCount(
+        new_page.memory,
+        s.cursor.style_id,
+    ) > 0);
+    try testing.expect(new_page.hyperlink_set.refCount(
+        new_page.memory,
+        s.cursor.hyperlink_id,
+    ) > 0);
+
+    // The cursor's references on the old page were released. Nothing
+    // else referenced either entry, so both are dead there now.
+    try testing.expectEqual(0, old_page.styles.refCount(
+        old_page.memory,
+        old_style_id,
+    ));
+    try testing.expectEqual(0, old_page.hyperlink_set.refCount(
+        old_page.memory,
+        old_hyperlink_id,
+    ));
+
+    // Printing attaches the migrated style and hyperlink to a cell.
+    try s.testWriteString("B");
 }
 
 test "Screen cursorCopy hyperlink deref new page" {
@@ -7797,6 +7921,14 @@ test "Screen: resize errors preserve state" {
         try testing.expectEqual(before.pages.viewport, s.pages.viewport);
         try testing.expectEqual(before_viewport_pin, s.pages.viewport_pin.*);
         try testing.expectEqual(before_tracked_pins, s.pages.countTrackedPins());
+        if (std.valgrind.runningOnValgrind() > 0) {
+            // This assertion deliberately compares the complete raw page,
+            // including semantically irrelevant struct padding.
+            std.valgrind.memcheck.makeMemDefined(before_page);
+            std.valgrind.memcheck.makeMemDefined(
+                s.pages.pages.first.?.page().memory,
+            );
+        }
         try testing.expectEqualSlices(
             u8,
             before_page,
@@ -11438,38 +11570,6 @@ test "Screen setAttribute splits page on OutOfSpace at max styles" {
         node_before_set.prev != null or
         s.cursor.page_pin.node != original_node;
     try testing.expect(page_was_split);
-}
-
-test "selectionString map allocation failure cleanup" {
-    // This test verifies that if toOwnedSlice fails when building
-    // the StringMap, we don't leak the already-allocated map.string.
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    const io = testing.io;
-    var s = try Screen.init(io, alloc, .{ .cols = 10, .rows = 5, .max_scrollback_bytes = 0 });
-    defer s.deinit();
-
-    try s.testWriteString("hello");
-
-    // Get a selection
-    const sel = Selection.init(
-        s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
-        s.pages.pin(.{ .active = .{ .x = 4, .y = 0 } }).?,
-        false,
-    );
-
-    // Trigger allocation failure on toOwnedSlice
-    var map: StringMap = undefined;
-    selectionString_tw.errorAlways(.copy_map, error.OutOfMemory);
-    const result = s.selectionString(alloc, .{
-        .sel = sel,
-        .map = &map,
-    });
-    try testing.expectError(error.OutOfMemory, result);
-    try selectionString_tw.end(.reset);
-
-    // If this test passes without memory leaks (when run with testing.allocator),
-    // it means the errdefer properly cleaned up map.string when toOwnedSlice failed.
 }
 
 test "Screen: promptClickMove line right basic" {
