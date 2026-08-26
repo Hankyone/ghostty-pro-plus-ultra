@@ -15,6 +15,7 @@ struct AboutIconView: View {
     var body: some View {
         Image("AppIconImage")
             .resizable()
+<<<<<<< HEAD
             .aspectRatio(contentMode: .fit)
             .frame(height: 128)
             .scaleEffect(isPressed ? 0.94 : (isHovering ? 1.06 : 1.0))
@@ -37,5 +38,8 @@ struct AboutIconView: View {
                 }
             }
             .accessibilityLabel("Ghostty Pro Plus Ultra icon")
+=======
+            .scaledToFit()
+>>>>>>> upstream/main
     }
 }

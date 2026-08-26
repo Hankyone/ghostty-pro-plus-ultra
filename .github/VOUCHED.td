@@ -51,6 +51,7 @@ anhthang
 anmitalidev
 anthonyzhoon
 aprilnea
+arneshbanerjee
 arvin7liu
 athaapa
 atomk
@@ -60,6 +61,7 @@ b0uks
 b1nar10
 balazs-szucs
 barutsrb
+basteez
 bch
 bennettp123
 benodiwal
@@ -72,6 +74,7 @@ bo2themax
 bousii
 brentschroeter
 brianc442
+by-nelson
 c0x0o
 carldaws
 carlvillads
@@ -97,9 +100,14 @@ deblasis
 dervedro
 devsunb
 diaaeddin
+-didouougha slingshotting LLM output
+diego-moment
+diegoarmstrong
 dkinzler
 dmehala
+dmunozv04
 dobbylee
+dolzenko
 doprz
 douglance
 douglas
@@ -108,6 +116,7 @@ drepper
 dzhlobo
 ekaterinepapava
 elias8
+elitex45
 -enkr1
 enzowilliam
 ephemera
@@ -147,6 +156,7 @@ hulet
 i999rri
 icodesign
 illiakrauchanka
+j-c-m
 j0hnm4r5
 jacobsandlund
 jake-stewart
@@ -235,6 +245,7 @@ nolinmcfarland
 nouritsu
 nwehg
 ocean6954
+ollioddi
 oshdubh
 otomn
 paaloeye
@@ -251,8 +262,10 @@ pluiedev
 pouwerkerk
 poweruser64
 prakhar54-byte
+preiter93
 prihlop
 priyans-hu
+pssalman
 puzza007
 qappell
 quinnypig
@@ -265,6 +278,7 @@ rgehan
 rhodes-b
 rightaditya
 rjwittams
+rkoten
 rmengelbrecht
 rmunn
 rockorager
@@ -280,12 +294,16 @@ sanjj1
 secrus
 seruman
 seyoungjeong
+sghng
 shorsher
 silveirapf
 simonbcn
 slsrepo
+steven-tk
 sunshine-syz
 svmhdvn
+tacherasasi
+-tangivis
 tasselx
 tbrundige
 tdgroot
@@ -294,8 +312,11 @@ thirstycrow
 thoutbeckers
 ticclick
 tnagatomi
+tothedarktowercame
 trag1c
 tristan957
+tsacha
+tuananh
 turbolent
 tweedbeetle
 uhojin
@@ -303,6 +324,7 @@ unphased
 unsaltedscholar
 uzaaft
 vancluever
+vasilmytsyk
 vaughanandrews
 -vectorpeak Stupid bot cosplaying as a maintainer
 vegerot
@@ -319,4 +341,5 @@ ydah
 zenangst
 zenyr
 zeshi09
+zlitus
 zubb
