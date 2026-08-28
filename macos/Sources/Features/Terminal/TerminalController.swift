@@ -1462,7 +1462,6 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         self.relabelTabs(refreshSidebars: false)
         self.fixTabBar()
         self.syncSidebarWidth()
-        terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: true)
     }
 
     private func syncSidebarWidth() {
@@ -1475,11 +1474,6 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             splitView.setPosition(targetWidth, ofDividerAt: 0)
         }
         (window as? TerminalWindow)?.setSidebarTitlebarWidth(targetWidth)
-    }
-
-    override func windowDidResignKey(_ notification: Notification) {
-        super.windowDidResignKey(notification)
-        terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: false)
     }
 
     override func windowDidMove(_ notification: Notification) {
