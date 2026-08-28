@@ -252,13 +252,19 @@ DMG_NAME="GhosttyProPlusUltra-${VERSION}.dmg"
 # Clean up any previous DMG
 rm -f "$DMG_NAME" ./Ghostty*.dmg
 
+# create-dmg 1.3+ takes <output.dmg> <source_folder>, and --codesign instead of --identity.
+DMG_STAGE=$(mktemp -d)
+trap 'rm -rf "$DMG_STAGE"' EXIT
+cp -R "$APP" "$DMG_STAGE/"
 npx create-dmg \
-    --identity="$CERT_NAME" \
-    "$APP" \
-    ./ 2>/dev/null || true
-
-# create-dmg names the file based on the app name
-mv ./"Ghostty Pro Plus Ultra"*.dmg "$DMG_NAME" 2>/dev/null || mv ./Ghostty*.dmg "$DMG_NAME" 2>/dev/null || true
+    --volname "Ghostty Pro Plus Ultra" \
+    --app-drop-link 425 185 \
+    --codesign "$CERT_NAME" \
+    --overwrite \
+    "$ROOT_DIR/$DMG_NAME" \
+    "$DMG_STAGE"
+rm -rf "$DMG_STAGE"
+trap - EXIT
 
 if [ ! -f "$DMG_NAME" ]; then
     echo "Error: DMG creation failed."
