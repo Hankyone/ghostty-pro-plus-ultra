@@ -46,6 +46,7 @@ alexfeijoo44
 alexjuca
 alosarjos
 amadeus
+and-rs
 andrejdaskalov
 anhthang
 anmitalidev
@@ -160,6 +161,7 @@ j-c-m
 j0hnm4r5
 jacobsandlund
 jake-stewart
+jakeriksen
 -jamesarch Bad AI etiquette
 jamylak
 jarred-sumner
@@ -183,6 +185,7 @@ khipp
 kierancanter
 kirwiisp
 kjvdven
+kleshzz
 kloneets
 knu
 -kody-w
@@ -211,6 +214,7 @@ marrocco-simone
 masterflitzer
 matkotiric
 mattn
+mgsloan
 micaeljarniac
 michielvk
 miguelelgallo
@@ -301,6 +305,7 @@ simonbcn
 slsrepo
 steven-tk
 sunshine-syz
+svector-anu
 svmhdvn
 tacherasasi
 -tangivis
@@ -309,6 +314,7 @@ tbrundige
 tdgroot
 tdslot
 thirstycrow
+-thomas-trijindev No human in the loop
 thoutbeckers
 ticclick
 tnagatomi
