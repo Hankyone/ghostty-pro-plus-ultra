@@ -24,6 +24,7 @@ const cell_c = @import("cell.zig");
 const row_c = @import("row.zig");
 const grid_ref_c = @import("grid_ref.zig");
 const grid_ref_tracked_c = @import("grid_ref_tracked.zig");
+const search_c = @import("search.zig");
 const selection_c = @import("selection.zig");
 const style_c = @import("style.zig");
 const color = @import("../color.zig");
@@ -104,15 +105,17 @@ const TerminalWrapper = struct {
     /// created by `new` or transferred from snapshot decoding until `free`.
     /// Freestanding owners contain no native allocation and expose failing I/O.
     io: Io,
-    /// We also need to store a temp dir path for some operations (e.g., kitty
-    /// graphics). This provides stable storage for the API calls.
-    tmp_dir_path: [max_path_bytes]u8,
+    /// Allocator-owned copy of the temporary directory path for some
+    /// operations (e.g. kitty graphics). This is only allocated once the
+    /// embedder sets the option.
+    tmp_dir_path: ?[]u8 = null,
     /// The terminfo name reported for XTGETTCAP "TN". The stream handler holds
     /// a slice into this.
     terminfo_name_buf: [Handler.max_terminfo_name_bytes]u8,
     stream: Stream,
     effects: Effects = .{},
     tracked_grid_refs: std.AutoArrayHashMapUnmanaged(*grid_ref_tracked_c.TrackedGridRef, void) = .{},
+    searches: std.AutoArrayHashMapUnmanaged(*search_c.SearchWrapper, void) = .{},
 
     /// Fetches a `TerminalWrapper` reference from a `Handler`.
     fn fromHandler(handler: *Handler) *TerminalWrapper {
@@ -412,14 +415,8 @@ const Effects = struct {
 
         for (contents, write.contents) |*c_content, content| {
             c_content.* = .{
-                .mime = .{
-                    .ptr = content.mime.ptr,
-                    .len = content.mime.len,
-                },
-                .data = .{
-                    .ptr = content.data.ptr,
-                    .len = content.data.len,
-                },
+                .mime = .init(content.mime),
+                .data = .init(content.data),
             };
         }
 
@@ -556,14 +553,8 @@ const Effects = struct {
         const func = wrapper.effects.desktop_notification orelse return;
         const request: DesktopNotification = .{
             .size = @sizeOf(DesktopNotification),
-            .title = .{
-                .ptr = notification.title.ptr,
-                .len = notification.title.len,
-            },
-            .body = .{
-                .ptr = notification.body.ptr,
-                .len = notification.body.len,
-            },
+            .title = .init(notification.title),
+            .body = .init(notification.body),
         };
         func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
     }
@@ -658,10 +649,7 @@ const Effects = struct {
             .apc => |apc_value| .{
                 .apc = .{
                     .truncated = apc_value.truncated,
-                    .content = .{
-                        .ptr = apc_value.content.ptr,
-                        .len = apc_value.content.len,
-                    },
+                    .content = .init(apc_value.content),
                 },
             },
         });
@@ -726,7 +714,6 @@ fn wrap(
     wrapper.* = .{
         .terminal = t,
         .io = io,
-        .tmp_dir_path = undefined,
         .terminfo_name_buf = undefined,
         .stream = Stream.init(.{
             .allocator = alloc,
@@ -1106,7 +1093,9 @@ pub fn continuation_alloc(
 
     // Ownership crosses the ABI here; callers release this exact pointer and
     // length with ghostty_free and the same allocator selection.
-    out_ptr.* = bytes.ptr;
+    // An idle parser has no continuation. Never export the empty Zig slice's
+    // sentinel pointer to a foreign runtime.
+    out_ptr.* = if (bytes.len == 0) null else bytes.ptr;
     out_len.* = bytes.len;
     return .success;
 }
@@ -1361,8 +1350,9 @@ fn setTyped(
         },
         .color_palette => {
             wrapper.terminal.colors.palette.changeDefault(
+                wrapper.terminal.gpa(),
                 if (value) |v| color.paletteZval(v) else color.default,
-            );
+            ) catch return .out_of_memory;
             wrapper.terminal.flags.dirty.palette = true;
         },
         .kitty_image_storage_limit => {
@@ -1391,22 +1381,31 @@ fn setTyped(
         },
         .kitty_image_medium_temp_file => {
             if (comptime !build_options.kitty_graphics) return .success;
+            const alloc = wrapper.terminal.gpa();
             if (value) |v| {
-                if (v.len > wrapper.tmp_dir_path.len) return .out_of_memory;
-                @memcpy(wrapper.tmp_dir_path[0..v.len], v.ptr[0..v.len]);
+                if (v.len > max_path_bytes) return .out_of_memory;
+                const path = alloc.dupe(u8, v.ptr[0..v.len]) catch
+                    return .out_of_memory;
                 var it = wrapper.terminal.screens.all.iterator();
                 while (it.next()) |entry| {
                     const screen = entry.value.*;
                     screen.kitty_images.image_limits.temporary_file = .{
-                        .enabled = .{ .directory = wrapper.tmp_dir_path[0..v.len] },
+                        .enabled = .{ .directory = path },
                     };
                 }
+
+                // Every screen points at the new copy now so the previous
+                // one can be released.
+                if (wrapper.tmp_dir_path) |old| alloc.free(old);
+                wrapper.tmp_dir_path = path;
             } else {
                 var it = wrapper.terminal.screens.all.iterator();
                 while (it.next()) |entry| {
                     const screen = entry.value.*;
                     screen.kitty_images.image_limits.temporary_file = .disabled;
                 }
+                if (wrapper.tmp_dir_path) |old| alloc.free(old);
+                wrapper.tmp_dir_path = null;
             }
         },
         .apc_max_bytes => {
@@ -1725,7 +1724,7 @@ fn getTyped(
         .color_background_default => out.* = (t.colors.background.default orelse return .no_value).cval(),
         .color_cursor_default => out.* = (t.colors.cursor.default orelse return .no_value).cval(),
         .color_palette => out.* = color.paletteCval(&t.colors.palette.current),
-        .color_palette_default => out.* = color.paletteCval(&t.colors.palette.original),
+        .color_palette_default => out.* = color.paletteCval(t.colors.palette.original),
         .kitty_image_storage_limit => {
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = @intCast(t.screens.active.kitty_images.total_limit);
@@ -1740,7 +1739,7 @@ fn getTyped(
                 .enabled => |d| d.directory,
                 .disabled => "",
             };
-            out.* = .{ .ptr = dir.ptr, .len = dir.len };
+            out.* = .init(dir);
         },
         .kitty_image_medium_shared_mem => {
             if (comptime !build_options.kitty_graphics) return .no_value;
@@ -1855,8 +1854,11 @@ pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
 
     for (wrapper.tracked_grid_refs.keys()) |ref| ref.terminal = null;
     wrapper.tracked_grid_refs.deinit(alloc);
+    for (wrapper.searches.keys()) |search| search.terminal = null;
+    wrapper.searches.deinit(alloc);
     wrapper.stream.deinit();
     t.deinit(alloc);
+    if (wrapper.tmp_dir_path) |path| alloc.free(path);
     wrapper.io.deinit(alloc);
     alloc.destroy(t);
     alloc.destroy(wrapper);
@@ -2003,9 +2005,9 @@ test "continuation buffer and allocator export exact suffix" {
         &out_ptr,
         &out_len,
     ));
-    const allocated = out_ptr orelse return error.TestExpectedEqual;
-    defer lib.alloc.default(&lib.alloc.test_allocator).free(allocated[0..out_len]);
-    try testing.expectEqualStrings("\x1b[31", allocated[0..out_len]);
+    const allocated = (out_ptr orelse return error.TestExpectedEqual)[0..out_len];
+    defer lib.alloc.default(&lib.alloc.test_allocator).free(allocated);
+    try testing.expectEqualStrings("\x1b[31", allocated);
 
     vt_write(t, "m", 1);
     try testing.expectEqual(
@@ -2013,6 +2015,13 @@ test "continuation buffer and allocator export exact suffix" {
         continuation_buf(t, null, 0, &required),
     );
     try testing.expectEqual(@as(usize, 0), required);
+
+    // Completing the sequence must return an empty, allocation-free result.
+    const failing: CAllocator = .fromZig(&std.mem.Allocator.failing);
+    try testing.expectEqual(Result.success, continuation_alloc(t, &failing, &out_ptr, &out_len));
+    defer @import("allocator.zig").free(&failing, out_ptr, out_len);
+    try testing.expectEqual(null, out_ptr);
+    try testing.expectEqual(@as(usize, 0), out_len);
 }
 
 test "continuation export tracks split UTF-8" {
@@ -4349,6 +4358,20 @@ test "title_changed without callback is silent" {
 
     // OSC 2 without a callback should not crash
     vt_write(t, "\x1B]2;Hello\x1B\\", 10);
+}
+
+test "kitty_image_medium_temp_file empty output" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer free(t);
+
+    const empty: lib.String = .{ .ptr = "", .len = 0 };
+    try testing.expectEqual(Result.success, set(t, .kitty_image_medium_temp_file, &empty));
+    var result: lib.String = undefined;
+    try testing.expectEqual(Result.success, get(t, .kitty_image_medium_temp_file, &result));
+    try testing.expectEqual(@as(usize, 0), result.len);
+    try testing.expectEqual(@as([*]const u8, ""), result.ptr);
 }
 
 test "set desktop_notification callback" {
