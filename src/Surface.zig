@@ -496,9 +496,6 @@ pub fn init(
     var derived_config = try DerivedConfig.init(alloc, config);
     errdefer derived_config.deinit();
 
-    // Initialize our renderer with our initialized surface.
-    try Renderer.surfaceInit(rt_surface);
-
     // Determine our DPI configurations so we can properly configure
     // font points to pixels and handle other high-DPI scaling factors.
     const content_scale = try rt_surface.getContentScale();
@@ -577,7 +574,6 @@ pub fn init(
         rt_surface,
         &self.renderer,
         &self.renderer_state,
-        app_mailbox,
     );
     errdefer render_thread.deinit();
 
@@ -739,10 +735,6 @@ pub fn init(
     // to duplicate.
     try self.resize(self.size.screen);
 
-    // Give the renderer one more opportunity to finalize any surface
-    // setup on the main thread prior to spinning up the rendering thread.
-    try renderer_impl.finalizeSurfaceInit(rt_surface);
-
     // Start our renderer thread
     self.renderer_thr = try std.Thread.spawn(
         .{},
@@ -848,9 +840,6 @@ pub fn deinit(self: *Surface) void {
         self.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop, may stall err={}", .{err});
         self.renderer_thr.join();
-
-        // We need to become the active rendering thread again
-        self.renderer.threadEnter(self.rt_surface) catch unreachable;
     }
 
     // Stop our IO thread
@@ -1146,6 +1135,8 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             const body = std.mem.sliceTo(&notification.body, 0);
             try self.showDesktopNotification(title, body);
         },
+
+        .redraw => self.redraw(),
 
         .renderer_health => |health| self.updateRendererHealth(health),
 
@@ -1765,6 +1756,18 @@ fn updateScrollbar(self: *Surface, scrollbar: terminal.Scrollbar) void {
         scrollbar,
     ) catch |err| {
         log.warn("failed to notify app of scrollbar change err={}", .{err});
+    };
+}
+
+/// Called when the render thread has pushed a new frame.
+/// Notifies the apprt to redraw this surface.
+fn redraw(self: *Surface) void {
+    _ = self.rt_app.performAction(
+        .{ .surface = self },
+        .render,
+        {},
+    ) catch |err| {
+        log.warn("failed to notify app of frame present err={}", .{err});
     };
 }
 
@@ -2420,31 +2423,29 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
 fn setSelectionAndCopy(self: *Surface, sel: terminal.Selection) !void {
     try self.setSelection(sel);
 
-    // If copy on select is false then exit early.
-    if (self.config.copy_on_select == .false) return;
-
     switch (self.config.copy_on_select) {
-        .false => unreachable, // handled above with an early exit
+        .none => {},
+
+        // The selection clipboard is set if supported, otherwise nothing is copied.
+        .primary => try self.copySelectionToClipboards(
+            sel,
+            &.{.selection},
+            .mixed,
+        ),
+
+        // Only the standard clipboard is set.
+        .clipboard => try self.copySelectionToClipboards(
+            sel,
+            &.{.standard},
+            .mixed,
+        ),
 
         // Both standard and selection clipboards are set.
-        .clipboard => try self.copySelectionToClipboards(
+        .both => try self.copySelectionToClipboards(
             sel,
             &.{ .standard, .selection },
             .mixed,
         ),
-
-        // The selection clipboard is set if supported, otherwise the standard.
-        .true => {
-            const clipboard: apprt.Clipboard = if (self.rt_surface.supportsClipboard(.selection))
-                .selection
-            else
-                .standard;
-            try self.copySelectionToClipboards(
-                sel,
-                &.{clipboard},
-                .mixed,
-            );
-        },
     }
 }
 
@@ -2521,6 +2522,25 @@ fn queueRender(self: *Surface) !void {
     try self.renderer_thread.wakeup.notify();
 }
 
+/// Called by the apprt when the surface's display is realized.
+/// Notifies the renderer so it can begin rendering.
+/// Safe to call from the main thread.
+pub fn displayRealized(self: *Surface) !void {
+    try self.renderer.displayRealized();
+}
+
+/// Called by the apprt when the surface's display is unrealized (the surface
+/// is being destroyed or reparented). Safe to call from the main thread.
+pub fn displayUnrealized(self: *Surface) void {
+    self.renderer.displayUnrealized();
+
+    // Wake the render thread so it notices `display_realized` is now false
+    // and releases GPU resources (swap chain and shaders).
+    self.renderer_thread.wakeup.notify() catch |err| {
+        log.warn("failed to notify renderer thread of unrealize err={}", .{err});
+    };
+}
+
 pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
@@ -2560,6 +2580,16 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 
     // Mail the IO thread
     self.queueIo(.{ .resize = self.size }, .unlocked);
+
+    // Mail the render thread so it updates its padding and screen size.
+    _ = self.renderer_thread.mailbox.push(
+        global.io(),
+        .{ .resize = self.size },
+        .forever,
+    );
+    self.queueRender() catch |err| {
+        log.warn("failed to notify renderer of resize err={}", .{err});
+    };
 }
 
 /// Recalculate the balanced padding if needed.
@@ -3933,7 +3963,7 @@ pub fn mouseButtonCallback(
         // The selection clipboard is only updated for left-click drag when
         // the left button is released. This is to avoid the clipboard
         // being updated on every mouse move which would be noisy.
-        if (self.config.copy_on_select != .false) {
+        if (self.config.copy_on_select != .none) {
             const prev_ = self.io.terminal.screens.active.selection;
             if (prev_) |prev| {
                 try self.setSelectionAndCopy(terminal.Selection.init(
@@ -4091,22 +4121,16 @@ pub fn mouseButtonCallback(
         }
     }
 
-    // Middle-click paste source follows copy-on-select: when copy-on-select
-    // targets the selection clipboard, middle-click reads from it; when
-    // copy-on-select targets the system clipboard, middle-click reads from
-    // that instead. Falls back to the standard clipboard on platforms that
-    // do not support the selection clipboard.
+    // Middle-click action, either ignore, or paste from clipboard or paste from the selection clipboard if supported.
     if (button == .middle and action == .press) switch (self.config.middle_click_action) {
         .ignore => {},
+        .@"clipboard-paste" => {
+            _ = try self.startClipboardRequest(.standard, .{ .paste = .standard });
+        },
         .@"primary-paste" => {
-            const clipboard: apprt.Clipboard = switch (self.config.copy_on_select) {
-                .clipboard => .standard,
-                .true, .false => if (self.rt_surface.supportsClipboard(.selection))
-                    .selection
-                else
-                    .standard,
-            };
-            _ = try self.startClipboardRequest(clipboard, .{ .paste = clipboard });
+            if (self.rt_surface.supportsClipboard(.selection)) {
+                _ = try self.startClipboardRequest(.selection, .{ .paste = .selection });
+            }
         },
     };
 
