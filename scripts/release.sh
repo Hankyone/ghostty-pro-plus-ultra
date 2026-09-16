@@ -253,10 +253,12 @@ DMG_NAME="GhosttyProPlusUltra-${VERSION}.dmg"
 rm -f "$DMG_NAME" ./Ghostty*.dmg
 
 # create-dmg 1.3+ takes <output.dmg> <source_folder>, and --codesign instead of --identity.
+# Skip Finder automation so releases never take over the user's desktop.
 DMG_STAGE=$(mktemp -d)
 trap 'rm -rf "$DMG_STAGE"' EXIT
 cp -R "$APP" "$DMG_STAGE/"
 npx create-dmg \
+    --skip-jenkins \
     --volname "Ghostty Pro Plus Ultra" \
     --app-drop-link 425 185 \
     --codesign "$CERT_NAME" \
