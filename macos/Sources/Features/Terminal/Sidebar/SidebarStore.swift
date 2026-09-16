@@ -324,7 +324,7 @@ final class SidebarStore {
                 hasher.combine(window.title)
                 hasher.combine(notificationTexts[ObjectIdentifier(window)])
                 if let ctrl = window.windowController as? BaseTerminalController,
-                   let surface = ctrl.focusedSurface {
+                   let surface = ctrl.primarySurface {
                     hasher.combine(surface.id)
                     // Normalize tilde paths for fingerprint consistency
                     hasher.combine((surface.pwd as NSString?)?.expandingTildeInPath)
@@ -361,7 +361,11 @@ final class SidebarStore {
 
         let items = tabWindows.map { w -> TabItem in
             let controller = w.windowController as? BaseTerminalController
-            let surface = controller?.focusedSurface
+            // Anchor the row to the tab's primary (original) surface, not
+            // whichever split happens to be focused — otherwise clicking
+            // between splits flips the row's title/pwd/project and rewrites
+            // the persisted tab order (see tabOrderKey).
+            let surface = controller?.primarySurface
             let wid = ObjectIdentifier(w)
             let sid = surface?.id
             let pwd = surface?.pwd
@@ -617,7 +621,7 @@ final class SidebarStore {
         for group in groups {
             for w in group.windows {
                 guard let controller = w.windowController as? BaseTerminalController,
-                      let surface = controller.focusedSurface else { continue }
+                      let surface = controller.primarySurface else { continue }
                 let sid = surface.id
                 liveSurfaceIds.insert(sid)
 
@@ -814,9 +818,14 @@ final class SidebarStore {
     }
 
     /// Surface UUID string used for persisted tab ordering.
+    ///
+    /// Uses the tab's primary surface rather than the focused one: with
+    /// splits, `focusedSurface` changes on every click, which used to make a
+    /// split tab look like a "new" key, get appended to the end of the
+    /// persisted order, and bounce the sidebar row on each focus flip.
     func tabOrderKey(for window: NSWindow) -> String? {
         guard let controller = window.windowController as? BaseTerminalController,
-              let surfaceId = controller.focusedSurface?.id else { return nil }
+              let surfaceId = controller.primarySurface?.id else { return nil }
         return surfaceId.uuidString
     }
 
