@@ -1,6 +1,16 @@
 import AppKit
 
 extension NSWindow {
+    /// Hit-test window coordinates against the entire content hierarchy, including overlays.
+    func contentViewHitTest(at point: NSPoint) -> NSView? {
+        guard let contentView else { return nil }
+        // NSView.hitTest expects its superview's coordinates, not its own.
+        // Converting into a flipped content view (such as NSSplitView) first
+        // would flip the point twice and target the opposite terminal pane.
+        let location = contentView.superview?.convert(point, from: nil) ?? point
+        return contentView.hitTest(location)
+    }
+
     /// Get the CGWindowID type for the window (used for low level CoreGraphics APIs).
     var cgWindowId: CGWindowID? {
         // "If the window doesn’t have a window device, the value of this
