@@ -3295,6 +3295,11 @@ pub fn selectWord(
         var it = pin.cellIterator(.right_down, null);
         var prev = it.next().?; // Consume one, our start
         while (it.next()) |p| {
+            // Only cross a row boundary if the previous row wraps.
+            if (prev.x == prev.node.cols() - 1 and !prev.rowAndCell().row.wrap) {
+                break :end prev;
+            }
+
             const rac = p.rowAndCell();
             const cell = rac.cell;
 
@@ -3308,12 +3313,6 @@ pub fn selectWord(
                 cell.content.codepoint.data,
             ) != null;
             if (this_boundary != expect_boundary) break :end prev;
-
-            // If we are going to the next row and it isn't wrapped, we
-            // return the previous.
-            if (p.x == p.node.cols() - 1 and !rac.row.wrap) {
-                break :end p;
-            }
 
             prev = p;
         }
@@ -10198,6 +10197,78 @@ test "Screen: selectWord" {
             .x = 2,
             .y = 2,
         } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Screen: selectWord at hard line breaks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    const cases = [_]struct { cols: size.CellCountInt, text: []const u8 }{
+        .{ .cols = 5, .text = "abcde\nfghij" },
+        .{ .cols = 5, .text = "     \n     " },
+        .{ .cols = 1, .text = "a\nb" },
+        .{ .cols = 1, .text = " \n " },
+    };
+    for (cases) |case| {
+        var s = try init(io, alloc, .{
+            .cols = case.cols,
+            .rows = 2,
+            .max_scrollback_bytes = 0,
+        });
+        defer s.deinit();
+        try s.testWriteString(case.text);
+
+        for (0..2) |y| {
+            for (0..case.cols) |x| {
+                var sel = s.selectWord(s.pages.pin(.{ .active = .{
+                    .x = @intCast(x),
+                    .y = @intCast(y),
+                } }).?, &.{ 0, ' ' }).?;
+                defer sel.deinit(&s);
+                try testing.expectEqual(point.Point{ .screen = .{
+                    .x = 0,
+                    .y = @intCast(y),
+                } }, s.pages.pointFromPin(.screen, sel.start()).?);
+                try testing.expectEqual(point.Point{ .screen = .{
+                    .x = case.cols - 1,
+                    .y = @intCast(y),
+                } }, s.pages.pointFromPin(.screen, sel.end()).?);
+            }
+        }
+    }
+}
+
+test "Screen: selectWord across soft-wrap at right edge" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback_bytes = 0,
+    });
+    defer s.deinit();
+    try s.testWriteString("abcdefghij\nklmno");
+
+    for (0..2) |y| {
+        for (0..5) |x| {
+            var sel = s.selectWord(s.pages.pin(.{ .active = .{
+                .x = @intCast(x),
+                .y = @intCast(y),
+            } }).?, &.{ 0, ' ' }).?;
+            defer sel.deinit(&s);
+            try testing.expectEqual(point.Point{ .screen = .{
+                .x = 0,
+                .y = 0,
+            } }, s.pages.pointFromPin(.screen, sel.start()).?);
+            try testing.expectEqual(point.Point{ .screen = .{
+                .x = 4,
+                .y = 1,
+            } }, s.pages.pointFromPin(.screen, sel.end()).?);
+        }
     }
 }
 
