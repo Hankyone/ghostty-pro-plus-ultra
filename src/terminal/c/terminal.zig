@@ -15,6 +15,7 @@ const apc = @import("../apc.zig");
 const kitty = @import("../kitty/key.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
 const modes = @import("../modes.zig");
+const mouse = @import("../mouse.zig");
 const point = @import("../point.zig");
 const size = @import("../size.zig");
 const device_attributes = @import("../device_attributes.zig");
@@ -198,14 +199,20 @@ pub const UnknownStringSequence = extern struct {
     content: lib.String,
 };
 
+/// An OSC sequence whose number is not implemented.
+///
+/// C: GhosttyTerminalUnknownOscSequence
+pub const UnknownOscSequence = osc.Command.Unknown.C;
+
 /// An unsupported terminal sequence reported to the C callback.
 ///
 /// C: GhosttyTerminalUnknownSequence
 pub const UnknownSequence = union(Tag) {
     apc: UnknownStringSequence,
+    osc: UnknownOscSequence,
 
     /// C: GhosttyTerminalUnknownSequenceTag
-    pub const Tag = lib.Enum(lib.target, &.{"apc"});
+    pub const Tag = lib.Enum(lib.target, &.{ "apc", "osc" });
 
     const c_union = lib.TaggedUnion(
         lib.target,
@@ -631,6 +638,7 @@ const Effects = struct {
                     .content = .init(apc_value.content),
                 },
             },
+            .osc => |osc_value| .{ .osc = osc_value.cval() },
         });
         func(@ptrCast(wrapper), wrapper.effects.userdata, &value);
     }
@@ -1434,8 +1442,12 @@ fn setTyped(
             wrapper,
             if (value) |ptr| ptr.* else default_continuation_max_bytes,
         ),
-        .unknown_max_bytes => wrapper.stream.handler.apc_handler.unknown_max_bytes =
-            if (value) |ptr| ptr.* else 0,
+        .unknown_max_bytes => {
+            // One limit applies to every unknown sequence type.
+            const max_bytes = if (value) |ptr| ptr.* else 0;
+            wrapper.stream.handler.apc_handler.unknown_max_bytes = max_bytes;
+            wrapper.stream.parser.osc_parser.unknown_max_bytes = max_bytes;
+        },
         .clipboard_write_max_bytes => wrapper.stream.handler.kitty_clipboard_write_max_bytes =
             if (value) |ptr| ptr.* else kitty_clipboard.max_write_size,
         .resize_pull_scrollback => wrapper.terminal.flags.resize_pull_scrollback =
@@ -1579,6 +1591,7 @@ pub const TerminalData = enum(c_int) {
     vt_ground = 38,
     cursor_at_prompt = 39,
     clipboard_write_max_bytes = 40,
+    mouse_shape = 41,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1593,6 +1606,7 @@ pub const TerminalData = enum(c_int) {
             .vt_ground,
             .cursor_at_prompt,
             => bool,
+            .mouse_shape => mouse.Shape,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
             .scrollbar => TerminalScrollbar,
@@ -1694,6 +1708,7 @@ fn getTyped(
             t.modes.get(.mouse_event_normal) or
             t.modes.get(.mouse_event_button) or
             t.modes.get(.mouse_event_any),
+        .mouse_shape => out.* = t.mouse_shape,
         .title => {
             const title = t.getTitle() orelse "";
             out.* = .{ .ptr = title.ptr, .len = title.len };
@@ -4613,6 +4628,7 @@ test "set unknown_sequence callback" {
         var last_userdata: ?*anyopaque = null;
         var last_tag: UnknownSequence.Tag = .apc;
         var last_truncated: bool = false;
+        var last_terminator: osc.Terminator.C = .st;
         var content: [64]u8 = undefined;
         var content_len: usize = 0;
 
@@ -4625,10 +4641,21 @@ test "set unknown_sequence callback" {
             last_terminal = terminal_;
             last_userdata = ud;
             last_tag = sequence.tag;
-            const apc_value = sequence.value.apc;
-            last_truncated = apc_value.truncated;
-            content_len = @min(apc_value.content.len, content.len);
-            @memcpy(content[0..content_len], apc_value.content.ptr[0..content_len]);
+            const str: lib.String = switch (sequence.tag) {
+                .apc => str: {
+                    const apc_value = sequence.value.apc;
+                    last_truncated = apc_value.truncated;
+                    break :str apc_value.content;
+                },
+                .osc => str: {
+                    const osc_value = sequence.value.osc;
+                    last_truncated = osc_value.truncated;
+                    last_terminator = osc_value.terminator;
+                    break :str osc_value.content;
+                },
+            };
+            content_len = @min(str.len, content.len);
+            @memcpy(content[0..content_len], str.ptr[0..content_len]);
         }
     };
     S.count = 0;
@@ -4648,6 +4675,7 @@ test "set unknown_sequence callback" {
         @ptrCast(&max_bytes),
     ));
     try testing.expectEqual(max_bytes, t.?.stream.handler.apc_handler.unknown_max_bytes);
+    try testing.expectEqual(max_bytes, t.?.stream.parser.osc_parser.unknown_max_bytes);
 
     // A byte limit without a callback performs no external effect.
     const before_callback = "\x1B_abc;xy\x1B\\";
@@ -4687,11 +4715,34 @@ test "set unknown_sequence callback" {
     vt_write(t, aborted, aborted.len);
     try testing.expectEqual(@as(usize, 2), S.count);
 
+    // Unknown OSCs share the callback and the byte limit.
+    const osc_st = "\x1B]7400;x\x1B\\";
+    vt_write(t, osc_st, osc_st.len);
+    try testing.expectEqual(@as(usize, 3), S.count);
+    try testing.expectEqual(UnknownSequence.Tag.osc, S.last_tag);
+    try testing.expect(!S.last_truncated);
+    try testing.expectEqual(osc.Terminator.C.st, S.last_terminator);
+    try testing.expectEqualStrings("7400;x", S.content[0..S.content_len]);
+
+    const osc_bel = "\x1B]7400;abcdef\x07";
+    vt_write(t, osc_bel, osc_bel.len);
+    try testing.expectEqual(@as(usize, 4), S.count);
+    try testing.expectEqual(UnknownSequence.Tag.osc, S.last_tag);
+    try testing.expect(S.last_truncated);
+    try testing.expectEqual(osc.Terminator.C.bel, S.last_terminator);
+    try testing.expectEqualStrings("7400;abc", S.content[0..S.content_len]);
+
+    // Aborted unknown OSCs and supported OSCs are not reported.
+    const osc_aborted = "\x1B]7400;x\x18\x1B]2;title\x07";
+    vt_write(t, osc_aborted, osc_aborted.len);
+    try testing.expectEqual(@as(usize, 4), S.count);
+
     // Clearing the callback restores the null fast path immediately.
     try testing.expectEqual(Result.success, set(t, .unknown_sequence, null));
     try testing.expect(t.?.stream.handler.unknown_sequence == null);
     vt_write(t, before_callback, before_callback.len);
-    try testing.expectEqual(@as(usize, 2), S.count);
+    vt_write(t, osc_st, osc_st.len);
+    try testing.expectEqual(@as(usize, 4), S.count);
 
     // A NULL limit disables capture even after reinstalling the callback.
     try testing.expectEqual(Result.success, set(
@@ -4701,8 +4752,10 @@ test "set unknown_sequence callback" {
     ));
     try testing.expectEqual(Result.success, set(t, .unknown_max_bytes, null));
     try testing.expectEqual(@as(usize, 0), t.?.stream.handler.apc_handler.unknown_max_bytes);
+    try testing.expectEqual(@as(usize, 0), t.?.stream.parser.osc_parser.unknown_max_bytes);
     vt_write(t, before_callback, before_callback.len);
-    try testing.expectEqual(@as(usize, 2), S.count);
+    vt_write(t, osc_st, osc_st.len);
+    try testing.expectEqual(@as(usize, 4), S.count);
 }
 
 test "set pwd_changed callback" {
@@ -6341,4 +6394,39 @@ test "get_multi null keys returns invalid_value" {
     var cols: u16 = 0;
     var values = [_]?*anyopaque{@ptrCast(&cols)};
     try testing.expectEqual(Result.invalid_value, get_multi(null, 1, null, &values, null));
+}
+
+test "get mouse_shape" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer free(t);
+
+    var shape: mouse.Shape = undefined;
+    try testing.expectEqual(Result.success, get(t, .mouse_shape, @ptrCast(&shape)));
+    try testing.expectEqual(mouse.Shape.text, shape);
+
+    const cases = .{
+        .{ "\x1b]22;pointer\x07", mouse.Shape.pointer },
+        .{ "\x1b]22;crosshair\x1b\\", mouse.Shape.crosshair },
+        // Invalid names leave the last accepted shape unchanged.
+        .{ "\x1b]22;not-a-pointer-shape\x07", mouse.Shape.crosshair },
+        // Hyperlinks don't override the application's requested shape.
+        .{ "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\", mouse.Shape.crosshair },
+        .{ "\x1b]22;default\x07", mouse.Shape.default },
+        .{ "\x1b]22;text\x07", mouse.Shape.text },
+    };
+    inline for (cases) |case| {
+        vt_write(t, case[0], case[0].len);
+        try testing.expectEqual(Result.success, get(t, .mouse_shape, @ptrCast(&shape)));
+        try testing.expectEqual(case[1], shape);
+    }
+
+    // An incomplete OSC must not update the shape before its terminator.
+    const prefix = "\x1b]22;wait";
+    vt_write(t, prefix, prefix.len);
+    try testing.expectEqual(Result.success, get(t, .mouse_shape, @ptrCast(&shape)));
+    try testing.expectEqual(mouse.Shape.text, shape);
+    vt_write(t, "\x07", 1);
+    try testing.expectEqual(Result.success, get(t, .mouse_shape, @ptrCast(&shape)));
+    try testing.expectEqual(mouse.Shape.wait, shape);
 }
