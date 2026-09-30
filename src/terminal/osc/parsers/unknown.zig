@@ -12,16 +12,6 @@ const Command = osc.Command;
 pub fn parse(parser: *Parser, terminator_ch: ?u8) ?*Command {
     assert(parser.state == .unknown or parser.state == .unknown_truncated);
 
-    // The VT parser also calls `end` when a program cancels a sequence
-    // with CAN or SUB. Cancelled unknown sequences are dropped, the same
-    // as unknown APC sequences.
-    if (terminator_ch) |ch| switch (ch) {
-        std.ascii.control_code.can,
-        std.ascii.control_code.sub,
-        => return null,
-        else => {},
-    };
-
     const cap = &parser.capture.?;
     parser.command = .{ .unknown = .{
         .content = cap.trailing(),

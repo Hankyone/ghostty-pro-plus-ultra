@@ -1038,14 +1038,35 @@ pub const Parser = struct {
         }
     }
 
-    /// End the sequence and return the command, if any. If the return value
-    /// is null, then no valid command was found. The optional terminator_ch
-    /// is the final character in the OSC sequence. This is used to determine
-    /// the response terminator.
+    /// End the sequence and return the command it contains, or null if it
+    /// isn't a valid command.
+    ///
+    /// `terminator_ch` is the byte that ended the sequence. Commands that
+    /// reply to the program end their reply the same way: BEL (0x07) gets
+    /// a BEL reply, and any other byte, or null, gets an ST reply.
+    ///
+    /// A program can also cancel a sequence partway through by sending CAN
+    /// or SUB instead of a terminator. Pass that byte as `terminator_ch`.
+    /// The sequence is then discarded and this returns null, whatever
+    /// command it contained. This matches xterm.
+    ///
+    /// ```zig
+    /// p.nextSlice("2;hello");
+    ///
+    /// // The program sent CAN instead of BEL, so the title never changes.
+    /// const cmd = p.end(std.ascii.control_code.can); // null
+    /// ```
     ///
     /// The returned pointer is only valid until the next call to the parser.
-    /// Callers should copy out any data they wish to retain across calls.
+    /// Copy out any data you need to keep.
     pub fn end(self: *Parser, terminator_ch: ?u8) ?*Command {
+        if (terminator_ch) |ch| switch (ch) {
+            std.ascii.control_code.can,
+            std.ascii.control_code.sub,
+            => return null,
+            else => {},
+        };
+
         return switch (self.state) {
             .start => null,
 
@@ -1135,6 +1156,29 @@ pub const Parser = struct {
 test {
     _ = parsers;
     _ = encoding;
+}
+
+test "Parser end with CAN or SUB cancels the command" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    // A fixed capture (OSC 2) cancelled by CAN.
+    for ("2;title") |ch| p.next(ch);
+    try testing.expect(p.end(std.ascii.control_code.can) == null);
+
+    // An allocating capture (OSC 52) cancelled by SUB.
+    p.reset();
+    for ("52;c;Zm9v") |ch| p.next(ch);
+    try testing.expect(p.end(std.ascii.control_code.sub) == null);
+
+    // The parser still works normally after a cancel.
+    p.reset();
+    for ("2;title") |ch| p.next(ch);
+    const cmd = p.end(std.ascii.control_code.bel).?.*;
+    try testing.expect(cmd == .change_window_title);
+    try testing.expectEqualStrings("title", cmd.change_window_title);
 }
 
 test "Parser allocating captures have a hard limit" {

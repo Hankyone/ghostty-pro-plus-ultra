@@ -540,7 +540,6 @@ class AppDelegate: NSObject,
         // but I haven't seen it happen in releases. I'm unsure why.
         guard applicationHasBecomeActive else { return true }
 
-#if compiler(>=6.4)
         if #available(macOS 27.0, *) {
             // It seems that with macOS 27, running an App Intent against an already
             // running app (from Shortcuts, Spotlight, the `shortcuts` CLI, ...)
@@ -563,7 +562,6 @@ class AppDelegate: NSObject,
                 return true
             }
         }
-#endif
 
         // No visible windows, open a new one.
         _ = TerminalController.newWindow(ghostty)
