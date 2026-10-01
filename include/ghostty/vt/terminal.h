@@ -2508,7 +2508,8 @@ GHOSTTY_API void ghostty_terminal_reset(GhosttyTerminal terminal);
  *
  * Changes the number of columns and rows in the terminal. The primary
  * screen will reflow content if wraparound mode is enabled; the alternate
- * screen does not reflow. If the dimensions are unchanged, this is a no-op.
+ * screen does not reflow. If the dimensions are unchanged, the grid is
+ * left as is, but everything below still applies.
  *
  * This also updates the terminal's pixel dimensions (used for image
  * protocols and size reports), disables synchronized output mode (allowed
