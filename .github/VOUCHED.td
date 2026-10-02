@@ -87,6 +87,7 @@ clemg
 cmwetherell
 crayxt
 craziestowl
+-creativision meatproxying
 cristeahub
 curtismoncoq
 -cznorth Automated advertising + likely AI communication
@@ -239,6 +240,7 @@ mistertea
 mitchellh
 miupa
 mjbommar
+mlabbe
 mohshami
 molechowski
 moonmao42
