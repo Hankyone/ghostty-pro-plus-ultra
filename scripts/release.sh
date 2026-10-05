@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="Hankyone/ghostty-pro-plus-ultra"
-CERT_NAME="Developer ID Application: Anouar Mansour (K32684A887)"
+CERT_NAME="72E91F1F83C1A443E00BA5C7DB5D17E123D8191A"
 APPLE_ID="hankyone@gmail.com"
 TEAM_ID="K32684A887"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
