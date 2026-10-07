@@ -121,6 +121,7 @@ drepper
 dungdm93
 dzhlobo
 ekaterinepapava
+ekusiadadus
 elias8
 elitex45
 -enkr1
@@ -220,6 +221,7 @@ luisnquin
 lynicis
 mac0ne
 maddythewisp
+magnussp
 mahnokropotkinvich
 marijagjorgjieva
 markdorison
