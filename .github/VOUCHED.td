@@ -143,6 +143,7 @@ fornwall
 francescarpi
 francislata
 fru1tworld
+gaborbernat
 gadgetman6
 gagbo
 ghokun
@@ -275,6 +276,7 @@ nolinmcfarland
 nouritsu
 nwehg
 ocean6954
+ollieatkinson
 ollioddi
 oshdubh
 otomn
