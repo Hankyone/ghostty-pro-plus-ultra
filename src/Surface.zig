@@ -2235,6 +2235,13 @@ fn resolvePathForOpening(
 /// Returns the x/y coordinate of where the IME (Input Method Editor)
 /// keyboard should be rendered.
 pub fn imePoint(self: *const Surface) apprt.IMEPos {
+    const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+    return self.imePointScaled(content_scale);
+}
+
+/// Same as `imePoint`, but divides our sizes by the given scale instead
+/// of the content scale.
+pub fn imePointScaled(self: *const Surface, scale: apprt.ContentScale) apprt.IMEPos {
     self.renderer_state.mutex.lockUncancelable(global.io());
     const cursor = self.renderer_state.terminal.screens.active.cursor;
     const preedit_width: usize = if (self.renderer_state.preedit) |preedit| preedit.width() else 0;
@@ -2244,7 +2251,6 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
     // in the visible portion of the screen.
 
     // Our sizes are all scaled so we need to send the unscaled values back.
-    const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
 
     const x: f64 = x: {
         // Simple x * cell width gives the top-left corner, then add padding offset
@@ -2254,7 +2260,7 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
         x += @as(f64, @floatFromInt(self.size.cell.width)) / 2;
 
         // And scale it
-        x /= content_scale.x;
+        x /= scale.x;
 
         break :x x;
     };
@@ -2267,7 +2273,7 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
         y += @floatFromInt(self.size.cell.height);
 
         // And scale it
-        y /= content_scale.y;
+        y /= scale.y;
 
         break :y y;
     };
@@ -2276,7 +2282,7 @@ pub fn imePoint(self: *const Surface) apprt.IMEPos {
     // rendering only renders in a single line.
     const height: f64 = height: {
         var height: f64 = @floatFromInt(self.size.cell.height);
-        height /= content_scale.y;
+        height /= scale.y;
         break :height height;
     };
     const width: f64 = width: {
