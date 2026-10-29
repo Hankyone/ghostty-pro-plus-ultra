@@ -44,6 +44,7 @@ alex19ep
 alexbathome
 alexfeijoo44
 alexjuca
+aljohri
 alosarjos
 amadeus
 and-rs
@@ -69,6 +70,7 @@ bennettp123
 benodiwal
 bernsno
 beryesa
+binaryfire
 bitigchi
 bkircher
 bleikurr
@@ -85,6 +87,7 @@ charliie-dev
 chernetskyi
 chronologos
 clemg
+clinta
 cmwetherell
 complexsplit
 crayxt
@@ -114,6 +117,7 @@ diego-moment
 diegoarmstrong
 dkinzler
 dmehala
+dmkenney
 dmunozv04
 dobbylee
 dolzenko
@@ -175,6 +179,7 @@ hulet
 i999rri
 ibaios
 icodesign
+-ifmael
 illiakrauchanka
 j-c-m
 j0hnm4r5
@@ -221,6 +226,7 @@ kristofersoler
 kylesower
 laxystem
 lebdron
+lehni
 lepips
 liby
 linustalacko
@@ -287,6 +293,7 @@ nwehg
 ocean6954
 ollieatkinson
 ollioddi
+olrtg
 oshdubh
 otomn
 paaloeye
@@ -333,8 +340,10 @@ rmengelbrecht
 rmunn
 robmorgan
 rockorager
+romen
 ronijacobson
 rpfaeffle
+rtgibbons
 ruoyouz
 ruseel
 sahilkmishra
@@ -363,6 +372,7 @@ tasselx
 tbrundige
 tdgroot
 tdslot
+thapakrish
 thirstycrow
 -thomas-trijindev No human in the loop
 thomasfedb
