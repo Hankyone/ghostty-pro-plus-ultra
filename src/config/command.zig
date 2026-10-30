@@ -63,10 +63,12 @@ pub const Command = union(enum) {
             break :tag .{ .shell, trimmed };
         };
 
+        if (str.len == 0) return error.ValueRequired;
+
         switch (tag) {
             .shell => {
                 // We have a shell command, so we can just dupe it.
-                const copy = try alloc.dupeZ(u8, std.mem.trim(u8, str, " "));
+                const copy = try alloc.dupeSentinel(u8, std.mem.trim(u8, str, " "), 0);
                 self.* = .{ .shell = copy };
             },
 
@@ -80,7 +82,7 @@ pub const Command = union(enum) {
                     ' ',
                 );
                 while (args.next()) |arg| {
-                    const copy = try alloc.dupeZ(u8, arg);
+                    const copy = try alloc.dupeSentinel(u8, arg, 0);
                     try builder.append(alloc, copy);
                 }
 
@@ -97,7 +99,7 @@ pub const Command = union(enum) {
         alloc: Allocator,
     ) Allocator.Error![:0]const u8 {
         return switch (self.*) {
-            .shell => |v| try alloc.dupeZ(u8, v),
+            .shell => |v| try alloc.dupeSentinel(u8, v, 0),
             .direct => |v| try std.mem.joinZ(alloc, " ", v),
         };
     }
@@ -156,10 +158,10 @@ pub const Command = union(enum) {
         alloc: Allocator,
     ) Allocator.Error!Self {
         return switch (self.*) {
-            .shell => |v| .{ .shell = try alloc.dupeZ(u8, v) },
+            .shell => |v| .{ .shell = try alloc.dupeSentinel(u8, v, 0) },
             .direct => |v| direct: {
                 const copy = try alloc.alloc([:0]const u8, v.len);
-                for (v, 0..) |arg, i| copy[i] = try alloc.dupeZ(u8, arg);
+                for (v, 0..) |arg, i| copy[i] = try alloc.dupeSentinel(u8, arg, 0);
                 break :direct .{ .direct = copy };
             },
         };
@@ -207,6 +209,8 @@ pub const Command = union(enum) {
         try testing.expectError(error.ValueRequired, v.parseCLI(alloc, null));
         try testing.expectError(error.ValueRequired, v.parseCLI(alloc, ""));
         try testing.expectError(error.ValueRequired, v.parseCLI(alloc, " "));
+        try testing.expectError(error.ValueRequired, v.parseCLI(alloc, "direct:"));
+        try testing.expectError(error.ValueRequired, v.parseCLI(alloc, "shell:"));
     }
 
     test "Command: parseCLI shell expanded" {
