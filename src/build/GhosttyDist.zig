@@ -24,7 +24,7 @@ pub fn init(b: *std.Build, cfg: *const Config) !GhosttyDist {
     // Get the resources we're going to inject into the source tarball.
     // lib-vt doesn't need GTK resources or frame data.
     const alloc = b.allocator;
-    var resources: std.ArrayListUnmanaged(Resource) = .empty;
+    var resources: std.ArrayList(Resource) = .empty;
     if (!cfg.emit_lib_vt) {
         {
             const gtk = SharedDeps.gtkDistResources(b);
@@ -237,11 +237,11 @@ pub const Resource = struct {
 
     /// Returns true if the dist path exists at build time.
     pub fn exists(self: *const Resource, b: *std.Build) bool {
-        if (b.build_root.handle.access(b.graph.io, self.dist, .{})) {
+        if (b.root.access(b.graph.io, self.dist, .{})) {
             // If we have a ".git" directory then we're a git checkout
             // and we never want to use the dist path. This shouldn't happen
             // so show a warning to the user.
-            if (b.build_root.handle.access(b.graph.io, ".git", .{})) {
+            if (b.root.access(b.graph.io, ".git", .{})) {
                 std.log.warn(
                     "dist resource '{s}' should not be in a git checkout",
                     .{self.dist},
