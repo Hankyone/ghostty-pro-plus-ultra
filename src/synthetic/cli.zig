@@ -7,6 +7,7 @@ const cli = @import("../cli.zig");
 /// predictably named files under `cli/`.
 pub const Action = enum {
     ascii,
+    erase,
     kitty,
     osc,
     styled,
@@ -23,6 +24,7 @@ pub const Action = enum {
     pub fn Struct(comptime action: Action) type {
         return switch (action) {
             .ascii => @import("cli/Ascii.zig"),
+            .erase => @import("cli/Erase.zig"),
             .kitty => @import("cli/Kitty.zig"),
             .osc => @import("cli/Osc.zig"),
             .styled => @import("cli/Styled.zig"),
@@ -110,8 +112,8 @@ fn mainActionImpl(
 
 test {
     // Make sure we ref all our actions
-    inline for (@typeInfo(Action).@"enum".fields) |field| {
-        const action = @field(Action, field.name);
+    inline for (@typeInfo(Action).@"enum".field_names) |field| {
+        const action = @field(Action, field);
         const Impl = Action.Struct(action);
         _ = Impl;
     }

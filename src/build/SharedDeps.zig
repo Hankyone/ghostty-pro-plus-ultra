@@ -929,7 +929,7 @@ pub fn addSimd(
         const HWY_AVX3_DL: c_int = 1 << 7;
         const HWY_AVX3: c_int = 1 << 8;
 
-        var flags: std.ArrayListUnmanaged([]const u8) = .empty;
+        var flags: std.ArrayList([]const u8) = .empty;
 
         // Zig 0.13 bug: https://github.com/ziglang/zig/issues/20414
         // To workaround this we just disable AVX512 support completely.
@@ -1048,7 +1048,7 @@ fn gtkDistResourcesUncached(b: *std.Build) GtkResources {
         translate_c.addImportToModule(b, "adw_c", check_exe.root_module, .{
             .source = .{ .includes = .{ .files = &.{.{ .path = "adwaita.h" }} } },
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_system_libs = &.{"libadwaita-1"},
         }) catch unreachable;
 
