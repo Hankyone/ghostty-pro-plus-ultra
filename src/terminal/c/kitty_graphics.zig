@@ -55,11 +55,14 @@ pub const Data = enum(c_int) {
     placement_iterator = 1,
     generation = 2,
 
+    _,
+
     pub fn OutType(comptime self: Data) type {
         return switch (self) {
             .invalid => void,
             .placement_iterator => PlacementIterator,
             .generation => u64,
+            _ => void,
         };
     }
 };
@@ -80,6 +83,8 @@ pub const PlacementData = enum(c_int) {
     rows = 11,
     z = 12,
 
+    _,
+
     pub fn OutType(comptime self: PlacementData) type {
         return switch (self) {
             .invalid => void,
@@ -95,6 +100,7 @@ pub const PlacementData = enum(c_int) {
             .rows,
             => u32,
             .z => i32,
+            _ => void,
         };
     }
 };
@@ -108,6 +114,7 @@ pub fn get(
 
     return switch (data) {
         .invalid => .invalid_value,
+        _ => .unsupported,
         inline else => |comptime_data| getTyped(
             graphics_,
             comptime_data,
@@ -133,6 +140,7 @@ fn getTyped(
             };
         },
         .generation => out.* = storage.generation,
+        _ => comptime unreachable,
     }
     return .success;
 }
@@ -158,9 +166,12 @@ pub const PlacementLayer = enum(c_int) {
 pub const PlacementIteratorOption = enum(c_int) {
     layer = 0,
 
+    _,
+
     pub fn InType(comptime self: PlacementIteratorOption) type {
         return switch (self) {
             .layer => PlacementLayer,
+            _ => void,
         };
     }
 };
@@ -184,6 +195,8 @@ pub const ImageData = enum(c_int) {
     data_len = 8,
     generation = 9,
 
+    _,
+
     pub fn OutType(comptime self: ImageData) type {
         return switch (self) {
             .invalid => void,
@@ -193,9 +206,34 @@ pub const ImageData = enum(c_int) {
             .data_ptr => [*]const u8,
             .data_len => usize,
             .generation => u64,
+            _ => void,
         };
     }
 };
+
+pub fn animation_tick(
+    graphics_: KittyGraphics,
+    now_ms: u64,
+    next_ms: ?*u64,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const out = next_ms orelse return .invalid_value;
+    const storage = graphics_;
+
+    // The tick needs an Io only to hand out new generation numbers.
+    // The storage handle doesn't carry one, but TinyIo has no state,
+    // so a fresh one works just as well as the terminal's.
+    const delay = storage.animationTick(
+        terminal_c.Io.init.io(),
+        now_ms,
+    ) orelse return .no_value;
+    // The Zig tick returns a delay. The C API returns the absolute
+    // time instead, so callers don't have to remember when they
+    // called.
+    out.* = now_ms +| delay;
+    return .success;
+}
 
 pub fn image_get_handle(
     graphics_: KittyGraphics,
@@ -216,6 +254,7 @@ pub fn image_get(
 
     return switch (data) {
         .invalid => .invalid_value,
+        _ => .unsupported,
         inline else => |comptime_data| imageGetTyped(
             image_,
             comptime_data,
@@ -268,6 +307,7 @@ fn imageGetTyped(
         .data_ptr => out.* = (image.renderData().bytes() orelse return .no_value).ptr,
         .data_len => out.* = image.renderData().len(),
         .generation => out.* = image.generation,
+        _ => comptime unreachable,
     }
 
     return .success;
@@ -304,13 +344,8 @@ pub fn placement_iterator_set(
 ) callconv(lib.calling_conv) Result {
     if (comptime !build_options.kitty_graphics) return .no_value;
 
-    if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(PlacementIteratorOption, @intFromEnum(option)) orelse {
-            return .invalid_value;
-        };
-    }
-
     return switch (option) {
+        _ => .unsupported,
         inline else => |comptime_option| placementIteratorSetTyped(
             iter_,
             comptime_option,
@@ -326,7 +361,9 @@ fn placementIteratorSetTyped(
 ) Result {
     const iter = iter_ orelse return .invalid_value;
     switch (option) {
-        .layer => iter.layer_filter = value.*,
+        .layer => iter.layer_filter = lib.enumFromPtr(PlacementLayer, value) orelse
+            return .invalid_value,
+        _ => comptime unreachable,
     }
     return .success;
 }
@@ -353,6 +390,7 @@ pub fn placement_get(
 
     return switch (data) {
         .invalid => .invalid_value,
+        _ => .unsupported,
         inline else => |comptime_data| placementGetTyped(
             iter_,
             comptime_data,
@@ -409,6 +447,7 @@ fn placementGetTyped(
         .columns => out.* = val.columns,
         .rows => out.* = val.rows,
         .z => out.* = val.z,
+        _ => comptime unreachable,
     }
 
     return .success;
@@ -544,6 +583,8 @@ pub const PlacementRenderInfo = extern struct {
     source_y: u32 = 0,
     source_width: u32 = 0,
     source_height: u32 = 0,
+
+    pub const sized_base = "source_height";
 };
 
 pub fn placement_render_info(
@@ -559,33 +600,33 @@ pub fn placement_render_info(
     const iter = iter_ orelse return .invalid_value;
     const entry = iter.entry orelse return .invalid_value;
     const out = out_ orelse return .invalid_value;
-    if (out.size < @sizeOf(PlacementRenderInfo)) return .invalid_value;
+    if (!lib.sizedCheck(.output, out)) return .invalid_value;
 
     const p = entry.value_ptr;
-
     const ps = p.pixelSize(image.*, wrapper.terminal);
-    out.pixel_width = ps.width;
-    out.pixel_height = ps.height;
-
     const gs = p.gridSize(image.*, wrapper.terminal);
-    out.grid_cols = gs.cols;
-    out.grid_rows = gs.rows;
-
     const vp = computeViewportPos(p, image, wrapper.terminal);
-    out.viewport_col = vp.col;
-    out.viewport_row = vp.row;
-    out.viewport_visible = vp.visible;
-
     const source = p.sourceRect(image.*);
-    out.source_x = source.x;
-    out.source_y = source.y;
-    out.source_width = source.width;
-    out.source_height = source.height;
+    lib.sizedWrite(out, .{
+        .pixel_width = ps.width,
+        .pixel_height = ps.height,
+        .grid_cols = gs.cols,
+        .grid_rows = gs.rows,
+        .viewport_col = vp.col,
+        .viewport_row = vp.row,
+        .viewport_visible = vp.visible,
+        .source_x = source.x,
+        .source_y = source.y,
+        .source_width = source.width,
+        .source_height = source.height,
+    });
 
     return .success;
 }
 
-/// Compute viewport-relative position of a placement.
+/// Compute viewport-relative position of a placement, for the C API
+/// functions that inspect the storage. Drawing doesn't use this. The
+/// render state positions placements on its own.
 ///
 /// Converts the placement's internal pin to viewport-relative column
 /// and row coordinates by getting screen-absolute coordinates for
@@ -603,12 +644,11 @@ fn computeViewportPos(
     t: *Terminal,
 ) struct { col: i32, row: i32, visible: bool } {
     // Virtual placements use unicode placeholders and don't have a
-    // screen position — they are rendered inline by the text layout.
-    // Relative placements are anchored at the root of their parent
-    // chain, offset by the accumulated chain offsets. A chain rooted
-    // at a virtual placement has no resolvable position here: its
-    // origin is the parent's placeholder cells, which only a renderer
-    // scanning the screen can locate.
+    // screen position of their own. Relative placements are anchored at
+    // the root of their parent chain, offset by the accumulated chain
+    // offsets. A chain rooted at a virtual placement has no resolvable
+    // position here: its origin is the parent's placeholder cells, which
+    // the render state finds while it scans the captured rows.
     const origin: struct {
         pin: *const PageList.Pin,
         col_offset: i32 = 0,
@@ -1065,7 +1105,8 @@ test "image_get exposes pending metadata without a data pointer" {
     var data_ptr: [*]const u8 = undefined;
     try testing.expectEqual(Result.no_value, image_get(img, .data_ptr, @ptrCast(&data_ptr)));
 
-    const pixels = try alloc.dupe(u8, "*" ** 12);
+    const pixels = try alloc.alloc(u8, 12);
+    @memset(pixels, '*');
     try testing.expect(pending.complete(graphics, testing.io, pixels));
     const completed_img = image_get_handle(graphics, 42);
     try testing.expect(completed_img != null);
@@ -1664,6 +1705,22 @@ test "placement_render_info returns all fields" {
     try testing.expectEqual(1, ri.source_width);
     try testing.expectEqual(2, ri.source_height);
 
+    // The size rule: below the base layout is rejected and nothing is
+    // written, exactly the base layout is enough, and a newer caller's
+    // tail is left untouched.
+    ri = .{ .size = lib.sizedBaseEnd(PlacementRenderInfo) - 1 };
+    try testing.expectEqual(Result.invalid_value, placement_render_info(iter, img, t, &ri));
+    try testing.expectEqual(0, ri.grid_cols);
+    ri = .{ .size = lib.sizedBaseEnd(PlacementRenderInfo) };
+    try testing.expectEqual(Result.success, placement_render_info(iter, img, t, &ri));
+    try testing.expectEqual(2, ri.source_height);
+    const Larger = extern struct { ri: PlacementRenderInfo, extra: [8]u8 };
+    var large: Larger = .{ .ri = .{ .size = @sizeOf(Larger) }, .extra = @splat(0xaa) };
+    try testing.expectEqual(Result.success, placement_render_info(iter, img, t, &large.ri));
+    try testing.expectEqual(@sizeOf(Larger), large.ri.size);
+    try testing.expectEqual(10, large.ri.grid_cols);
+    try testing.expectEqual(@as([8]u8, @splat(0xaa)), large.extra);
+
     const entry = iter.?.entry.?;
     const pin = switch (entry.value_ptr.location) {
         .pin => |pin| pin,
@@ -2135,4 +2192,126 @@ test "generation never recurs across resets and screen switches" {
     try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
     try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen)));
     try testing.expect(gen > gen_alt);
+}
+
+test "animation_tick advances a running animation" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer terminal_c.free(t);
+
+    // Place a red 1x1 RGBA image and add a blue second frame that
+    // shows for 40ms. The first frame starts with no display time,
+    // so give it 30ms. Then start looping playback.
+    const cmds = "\x1b_Ga=T,f=32,i=1,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\" ++
+        "\x1b_Ga=f,f=32,i=1,s=1,v=1,z=40;AAD//w==\x1b\\" ++
+        "\x1b_Ga=a,i=1,r=1,z=30\x1b\\" ++
+        "\x1b_Ga=a,i=1,s=3\x1b\\";
+    terminal_c.vt_write(t, cmds.ptr, cmds.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+
+    const Snapshot = struct {
+        gen: u64,
+        pixel: [4]u8,
+
+        fn read(g: KittyGraphics) !@This() {
+            const img = image_get_handle(g, 1) orelse return error.TestUnexpectedResult;
+            var gen: u64 = 0;
+            var ptr: [*]const u8 = undefined;
+            try testing.expectEqual(Result.success, image_get(img, .generation, @ptrCast(&gen)));
+            try testing.expectEqual(Result.success, image_get(img, .data_ptr, @ptrCast(&ptr)));
+            return .{ .gen = gen, .pixel = ptr[0..4].* };
+        }
+    };
+    const red: [4]u8 = .{ 255, 0, 0, 255 };
+    const blue: [4]u8 = .{ 0, 0, 255, 255 };
+
+    // The first tick starts the first frame's 30ms timer.
+    var next: u64 = 0;
+    const s0 = try Snapshot.read(graphics);
+    try testing.expectEqualSlices(u8, &red, &s0.pixel);
+    try testing.expectEqual(Result.success, animation_tick(graphics, 1000, &next));
+    try testing.expectEqual(@as(u64, 1030), next);
+    try testing.expectEqual(s0, try Snapshot.read(graphics));
+
+    // An early tick changes nothing and reports the same time.
+    try testing.expectEqual(Result.success, animation_tick(graphics, 1010, &next));
+    try testing.expectEqual(@as(u64, 1030), next);
+    try testing.expectEqual(s0, try Snapshot.read(graphics));
+
+    // On time, the blue frame shows with a new generation.
+    try testing.expectEqual(Result.success, animation_tick(graphics, 1030, &next));
+    try testing.expectEqual(@as(u64, 1070), next);
+    const s1 = try Snapshot.read(graphics);
+    try testing.expectEqualSlices(u8, &blue, &s1.pixel);
+    try testing.expect(s1.gen > s0.gen);
+
+    // It then loops back to the first frame.
+    try testing.expectEqual(Result.success, animation_tick(graphics, 1070, &next));
+    try testing.expectEqual(@as(u64, 1100), next);
+    const s2 = try Snapshot.read(graphics);
+    try testing.expectEqualSlices(u8, &red, &s2.pixel);
+    try testing.expect(s2.gen > s1.gen);
+
+    // After a stop command (a=a,s=1) the tick reports nothing to
+    // play and leaves next_ms and the image alone.
+    const stop = "\x1b_Ga=a,i=1,s=1\x1b\\";
+    terminal_c.vt_write(t, stop.ptr, stop.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    next = 42;
+    try testing.expectEqual(Result.no_value, animation_tick(graphics, 1100, &next));
+    try testing.expectEqual(@as(u64, 42), next);
+    try testing.expectEqual(s2, try Snapshot.read(graphics));
+}
+
+test "animation_tick without animations returns no value" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer terminal_c.free(t);
+
+    var graphics: KittyGraphics = undefined;
+    var next: u64 = 0;
+
+    // Empty storage.
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    try testing.expectEqual(Result.no_value, animation_tick(graphics, 0, &next));
+
+    // A placed static image.
+    const transmit = "\x1b_Ga=T,f=32,i=1,s=1,v=1,c=1,r=1;/wAA/w==\x1b\\";
+    terminal_c.vt_write(t, transmit.ptr, transmit.len);
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    try testing.expectEqual(Result.no_value, animation_tick(graphics, 0, &next));
+    try testing.expectEqual(Result.no_value, animation_tick(graphics, 1000, &next));
+}
+
+test "animation_tick null out returns invalid_value" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer terminal_c.free(t);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    try testing.expectEqual(Result.invalid_value, animation_tick(graphics, 0, null));
 }

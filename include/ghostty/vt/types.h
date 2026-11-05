@@ -84,13 +84,28 @@
 
 /**
  * Result codes for libghostty-vt operations.
+ *
+ * Functions that can fail return one of these codes. GHOSTTY_SUCCESS is
+ * zero and every error is negative, so `result < 0` tests for any error.
+ *
+ * Functions that read or write values by key, such as
+ * ghostty_terminal_get(), return GHOSTTY_UNSUPPORTED for a key that this
+ * version of the library does not know. See @ref keys_sec for how to use
+ * that to support older versions of the library.
  */
 typedef enum GHOSTTY_ENUM_TYPED {
     /** Operation completed successfully */
     GHOSTTY_SUCCESS = 0,
     /** Operation failed due to failed allocation */
     GHOSTTY_OUT_OF_MEMORY = -1,
-    /** Operation failed due to invalid value */
+    /**
+     * An argument is not valid.
+     *
+     * For example, a NULL pointer where a value is required, an enum value
+     * that is out of range, or a sized struct whose size is too small.
+     * When a key is involved, this means the library knows the key but a
+     * value passed with it is wrong. Compare GHOSTTY_UNSUPPORTED.
+     */
     GHOSTTY_INVALID_VALUE = -2,
     /** Operation failed because the provided buffer was too small */
     GHOSTTY_OUT_OF_SPACE = -3,
@@ -106,6 +121,16 @@ typedef enum GHOSTTY_ENUM_TYPED {
      * with the operation's allow flag set.
      */
     GHOSTTY_REJECTED = -7,
+    /**
+     * The key is not known to this version of the library.
+     *
+     * Returned by the functions that read or write values by key when the
+     * key is newer than the library. Nothing is read or written. This
+     * usually means the program was built with a newer header than the
+     * library it is running with. Check for it to fall back gracefully, as
+     * shown in @ref keys_compat_sec.
+     */
+    GHOSTTY_UNSUPPORTED = -8,
     GHOSTTY_RESULT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyResult;
 
@@ -187,6 +212,14 @@ typedef struct GhosttyRenderStateRowIteratorImpl* GhosttyRenderStateRowIterator;
  * @ingroup render
  */
 typedef struct GhosttyRenderStateRowCellsImpl* GhosttyRenderStateRowCells;
+
+/**
+ * Opaque handle to an iterator over the image placements of a render
+ * state.
+ *
+ * @ingroup render
+ */
+typedef struct GhosttyRenderStateImageIteratorImpl* GhosttyRenderStateImageIterator;
 
 /**
  * Opaque handle to a terminal search.
@@ -335,7 +368,8 @@ typedef struct {
  *
  * Example:
  * @code
- * GhosttyFormatterTerminalOptions opts = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
+ * GhosttyTerminalSelectionFormatOptions opts =
+ *     GHOSTTY_INIT_SIZED(GhosttyTerminalSelectionFormatOptions);
  * opts.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
  * opts.trim = true;
  * @endcode
@@ -351,6 +385,28 @@ typedef struct {
 #define GHOSTTY_INIT_SIZED(type) \
   ((type){ .size = sizeof(type) })
 #endif
+
+/**
+ * Initialize a sized struct at runtime.
+ *
+ * This does the same thing as GHOSTTY_INIT_SIZED(). It sets every byte of
+ * the struct to zero and then stores `size` in the struct's `size` field.
+ * It is meant for language bindings that cannot use a C macro. Pass the
+ * size of the struct as your binding lays it out, which is `sizeof` of the
+ * struct in the header the binding was built from. See @ref sized_sec.
+ *
+ * @code{.c}
+ * GhosttyRenderStateCursor cursor;
+ * ghostty_sized_init(&cursor, sizeof(cursor));
+ * @endcode
+ *
+ * If `ptr` is NULL, or `size` is too small to hold the `size` field
+ * itself, this function does nothing.
+ *
+ * @param ptr The struct to initialize, or NULL
+ * @param size The size of the struct in bytes
+ */
+GHOSTTY_API void ghostty_sized_init(void* ptr, size_t size);
 
 /**
  * Return the versioned libghostty-vt C type manifest for the current target.
@@ -389,11 +445,11 @@ typedef struct {
  *       "values": { "INVALID": 0, "DIRTY": 3, "MAX_VALUE": 2147483647 }
  *     },
  *     "GhosttyStyleColor": {
- *       "kind": "struct", "size": 16, "align": 8,
+ *       "kind": "struct", "size": 4, "align": 1,
  *       "fields": {
- *         "tag": { "offset": 0, "size": 4,
+ *         "tag": { "offset": 0, "size": 1,
  *                  "type": "GhosttyStyleColorTag" },
- *         "value": { "offset": 8, "size": 8,
+ *         "value": { "offset": 1, "size": 3,
  *                    "type": "GhosttyStyleColorValue", "tag": "tag",
  *                    "arms": { "NONE": null, "PALETTE": "palette",
  *                              "RGB": "rgb" } }

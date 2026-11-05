@@ -28,6 +28,8 @@ pub const BuildInfo = enum(c_int) {
     version_pre = 9,
     version_build = 10,
 
+    _,
+
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: BuildInfo) type {
         return switch (self) {
@@ -36,22 +38,29 @@ pub const BuildInfo = enum(c_int) {
             .optimize => OptimizeMode,
             .version_string, .version_pre, .version_build => lib.String,
             .version_major, .version_minor, .version_patch => usize,
+            _ => void,
         };
     }
 };
+
+/// The library version as a null-terminated string, for ghostty_version.
+/// It has the same text as the version_string build info.
+const version_z: [:0]const u8 = std.fmt.comptimePrint(
+    "{s}",
+    .{build_options.version_string},
+);
+
+/// C: ghostty_version
+pub fn version() callconv(lib.calling_conv) [*:0]const u8 {
+    return version_z.ptr;
+}
 
 pub fn get(
     data: BuildInfo,
     out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
-    if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(BuildInfo, @intFromEnum(data)) orelse {
-            log.warn("build_info invalid data value={d}", .{@intFromEnum(data)});
-            return .invalid_value;
-        };
-    }
-
     return switch (data) {
+        _ => .unsupported,
         .invalid => .invalid_value,
         inline else => |comptime_data| getTyped(
             comptime_data,
@@ -70,10 +79,10 @@ fn getTyped(
         .kitty_graphics => out.* = build_options.kitty_graphics,
         .tmux_control_mode => out.* = build_options.tmux_control_mode,
         .optimize => out.* = switch (builtin.mode) {
-            .Debug => .debug,
-            .ReleaseSafe => .release_safe,
-            .ReleaseSmall => .release_small,
-            .ReleaseFast => .release_fast,
+            .debug => .debug,
+            .safe => .release_safe,
+            .small => .release_small,
+            .fast => .release_fast,
         },
         .version_string => out.* = .{ .ptr = build_options.version_string.ptr, .len = build_options.version_string.len },
         .version_major => out.* = build_options.version_major,
@@ -93,6 +102,7 @@ fn getTyped(
                 out.* = .{ .ptr = "", .len = 0 };
             }
         },
+        _ => comptime unreachable,
     }
 
     return .success;
@@ -124,10 +134,10 @@ test "get optimize" {
     var value: OptimizeMode = undefined;
     try testing.expectEqual(Result.success, get(.optimize, @ptrCast(&value)));
     try testing.expectEqual(switch (builtin.mode) {
-        .Debug => .debug,
-        .ReleaseSafe => .release_safe,
-        .ReleaseSmall => .release_small,
-        .ReleaseFast => .release_fast,
+        .debug => .debug,
+        .safe => .release_safe,
+        .small => .release_small,
+        .fast => .release_fast,
     }, value);
 }
 
@@ -169,6 +179,16 @@ test "get version_build" {
     const testing = std.testing;
     var value: lib.String = undefined;
     try testing.expectEqual(Result.success, get(.version_build, @ptrCast(&value)));
+}
+
+test "version" {
+    const testing = std.testing;
+    const value = std.mem.span(version());
+    try testing.expectEqualStrings(build_options.version_string, value);
+
+    var string: lib.String = undefined;
+    try testing.expectEqual(Result.success, get(.version_string, @ptrCast(&string)));
+    try testing.expectEqualStrings(string.ptr[0..string.len], value);
 }
 
 test "get invalid" {
