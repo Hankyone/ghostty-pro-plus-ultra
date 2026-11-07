@@ -75,10 +75,17 @@ pub const Handler = struct {
     /// programs.
     xt_checksum_report: bool = false,
 
-    /// The APC command handler maintains the APC state. APC is like
-    /// CSI or OSC, but it is a private escape sequence that is used
-    /// to send commands to the terminal emulator. This is used by
-    /// the kitty graphics protocol.
+    /// Collects APC strings (`ESC _ ... ESC \`) as they arrive. Programs
+    /// use APC to send commands to the terminal, such as Kitty graphics.
+    ///
+    /// A command runs only when its APC ends with the string terminator.
+    /// If the program cancels the APC with CAN or SUB, or another 8-bit
+    /// control byte aborts it, the command is discarded. For example, this
+    /// input stores no image because CAN (0x18) cancels it:
+    ///
+    /// ```
+    /// ESC _ G a=t,f=24,s=1,v=1,i=7;AAAA 0x18
+    /// ```
     apc_handler: apc.Handler = .{},
 
     /// The DCS command handler maintains state for DCS queries.
@@ -135,6 +142,10 @@ pub const Handler = struct {
     ///     .osc_unknown_max_bytes = 4096,
     /// });
     /// ```
+    ///
+    /// Only complete sequences are reported. A sequence the program
+    /// cancels with CAN or SUB, or that another 8-bit control byte
+    /// aborts, is discarded without calling this.
     ///
     /// The callback runs while the stream processes input. It may write a
     /// reply to the pty, and the reply stays in order with the terminal's
@@ -606,6 +617,14 @@ pub const Handler = struct {
         };
     }
 
+    /// The stream's hook for runs it knows are printable ASCII.
+    pub fn vtPrintAscii(self: *Handler, bytes: []const u8) void {
+        self.terminal.printSliceAscii(bytes) catch |err| {
+            self.semantic_failure = true;
+            log.warn("error handling VT action action=print_slice err={}", .{err});
+        };
+    }
+
     fn unknownSequence(self: *Handler, value: UnknownSequence) void {
         const func = self.unknown_sequence orelse return;
         func(self, value);
@@ -629,6 +648,8 @@ pub const Handler = struct {
                 self.terminal.carriageReturn();
             },
             .reverse_index => self.terminal.reverseIndex(),
+            .back_index => self.terminal.backIndex(),
+            .forward_index => self.terminal.forwardIndex(),
             .cursor_up => self.terminal.cursorUp(value.value),
             .cursor_down => self.terminal.cursorDown(value.value),
             .cursor_left => self.terminal.cursorLeft(value.value),
@@ -652,6 +673,8 @@ pub const Handler = struct {
             .erase_chars => self.terminal.eraseChars(value),
             .insert_lines => self.terminal.insertLines(value),
             .insert_blanks => self.terminal.insertBlanks(value),
+            .insert_columns => self.terminal.insertColumns(value),
+            .delete_columns => self.terminal.deleteColumns(value),
             .delete_lines => self.terminal.deleteLines(value),
             .scroll_up => try self.terminal.scrollUp(value),
             .scroll_down => self.terminal.scrollDown(value),
@@ -690,10 +713,7 @@ pub const Handler = struct {
             .restore_cursor => self.terminal.restoreCursor(),
             .invoke_charset => self.terminal.invokeCharset(value.bank, value.charset, value.locking),
             .configure_charset => self.terminal.configureCharset(value.slot, value.charset),
-            .set_attribute => switch (value) {
-                .unknown => {},
-                else => try self.terminal.setAttribute(value),
-            },
+            .set_attributes => try self.terminal.setAttributes(value.parser()),
             .protected_mode_off => self.terminal.setProtectedMode(.off),
             .protected_mode_iso => self.terminal.setProtectedMode(.iso),
             .protected_mode_dec => self.terminal.setProtectedMode(.dec),
@@ -881,10 +901,11 @@ pub const Handler = struct {
         // Values are hex-encoded uppercase, matching the static map. The
         // buffer fits any name allowed above, so the print cannot fail.
         var buf: [max_tn_response_bytes]u8 = undefined;
-        self.writePty(std.fmt.bufPrintZ(
+        self.writePty(std.mem.printSentinel(
             &buf,
             "\x1bP1+r" ++ encoded_tn_key ++ "={X}\x1b\\",
             .{name},
+            0,
         ) catch unreachable);
     }
 
@@ -1131,8 +1152,9 @@ pub const Handler = struct {
             data: []const u8,
         ) error{ OutOfMemory, WriteFailed }!void {
             const handler = self.handler;
-            var stack = std.heap.stackFallback(256, handler.terminal.gpa());
-            const alloc = stack.get();
+            var stack_buf: [256]u8 = undefined;
+            var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, handler.terminal.gpa());
+            const alloc = stack.allocator();
 
             var aw: std.Io.Writer.Allocating = .init(alloc);
             defer aw.deinit();
@@ -1362,8 +1384,9 @@ pub const Handler = struct {
 
             // Status packets fit on the stack; DATA packets carry the
             // clipboard contents and fall back to the heap.
-            var stack = std.heap.stackFallback(1024, handler.terminal.gpa());
-            const alloc = stack.get();
+            var stack_buf: [1024]u8 = undefined;
+            var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, handler.terminal.gpa());
+            const alloc = stack.allocator();
             var aw: std.Io.Writer.Allocating = .init(alloc);
             defer aw.deinit();
             try (kitty_clipboard.ReadSuccess{
@@ -1640,8 +1663,9 @@ pub const Handler = struct {
 
         // Our responses carry at most a status and the echoed id so
         // they virtually always fit on the stack.
-        var stack = std.heap.stackFallback(1024, self.terminal.gpa());
-        const alloc = stack.get();
+        var stack_buf: [1024]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.terminal.gpa());
+        const alloc = stack.allocator();
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
         response.encode(&aw.writer) catch return;
@@ -1657,8 +1681,9 @@ pub const Handler = struct {
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Responses are usually small (queries, errors) but data
         // serving can produce many chunks, so fall back to the heap.
-        var stack = std.heap.stackFallback(512, self.terminal.gpa());
-        const response_alloc = stack.get();
+        var stack_buf: [512]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.terminal.gpa());
+        const response_alloc = stack.allocator();
         var aw: std.Io.Writer.Allocating = .init(response_alloc);
         defer aw.deinit();
 
@@ -1688,8 +1713,9 @@ pub const Handler = struct {
         const func = self.effects.device_attributes orelse return;
         const attrs = func(self);
 
-        var stack = std.heap.stackFallback(128, self.terminal.gpa());
-        const alloc = stack.get();
+        var stack_buf: [128]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.terminal.gpa());
+        const alloc = stack.allocator();
 
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
@@ -1721,10 +1747,12 @@ pub const Handler = struct {
                 const pos = self.cursorReportPos();
 
                 var buf: [64]u8 = undefined;
-                const resp = std.fmt.bufPrintZ(&buf, "\x1B[{};{}R", .{
-                    pos.y + 1,
-                    pos.x + 1,
-                }) catch return;
+                const resp = std.mem.printSentinel(
+                    &buf,
+                    "\x1B[{};{}R",
+                    .{ pos.y + 1, pos.x + 1 },
+                    0,
+                ) catch return;
                 self.writePty(resp);
             },
 
@@ -1734,10 +1762,15 @@ pub const Handler = struct {
                 const pos = self.cursorReportPos();
 
                 var buf: [64]u8 = undefined;
-                const resp = std.fmt.bufPrintZ(&buf, "\x1B[?{};{};1R", .{
-                    pos.y + 1,
-                    pos.x + 1,
-                }) catch return;
+                const resp = std.mem.printSentinel(
+                    &buf,
+                    "\x1B[?{};{};1R",
+                    .{
+                        pos.y + 1,
+                        pos.x + 1,
+                    },
+                    0,
+                ) catch return;
                 self.writePty(resp);
             },
 
@@ -1782,10 +1815,11 @@ pub const Handler = struct {
     fn reportXtversion(self: *Handler) void {
         const version = if (self.effects.xtversion) |func| func(self) else "";
         var buf: [288]u8 = undefined;
-        const resp = std.fmt.bufPrintZ(
+        const resp = std.mem.printSentinel(
             &buf,
             "\x1BP>|{s}\x1B\\",
             .{if (version.len > 0) version else "libghostty"},
+            0,
         ) catch return;
         self.writePty(resp);
     }
@@ -1807,11 +1841,9 @@ pub const Handler = struct {
     fn reportSize(self: *Handler, style: csi.SizeReportStyle) void {
         // Almost all size reports will fit in 256 bytes so try that
         // on the stack before falling back to a heap allocation.
-        var stack = std.heap.stackFallback(
-            256,
-            self.terminal.gpa(),
-        );
-        const alloc = stack.get();
+        var stack_buf: [256]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.terminal.gpa());
+        const alloc = stack.allocator();
 
         // Allocating writing to accumulate the response.
         var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -1936,9 +1968,14 @@ pub const Handler = struct {
     fn queryKittyKeyboard(self: *Handler) void {
         // Max response is "\x1b[?31u\x00" (7 bytes): the flags are a u5 (max 31).
         var buf: [32]u8 = undefined;
-        const resp = std.fmt.bufPrintZ(&buf, "\x1b[?{}u", .{
-            self.terminal.screens.active.kitty_keyboard.current().int(),
-        }) catch return;
+        const resp = std.mem.printSentinel(
+            &buf,
+            "\x1b[?{}u",
+            .{
+                self.terminal.screens.active.kitty_keyboard.current().int(),
+            },
+            0,
+        ) catch return;
         self.writePty(resp);
     }
 
@@ -2068,8 +2105,9 @@ pub const Handler = struct {
     ) !void {
         if (requests.count() == 0) return;
 
-        var stack = std.heap.stackFallback(1024, self.terminal.gpa());
-        const alloc = stack.get();
+        var stack_buf: [1024]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.terminal.gpa());
+        const alloc = stack.allocator();
         var response: std.Io.Writer.Allocating = .init(alloc);
         defer response.deinit();
         const writer = &response.writer;
@@ -2128,7 +2166,7 @@ pub const Handler = struct {
                         self.terminal.flags.dirty.palette = true;
                         self.terminal.colors.palette.reset(@intCast(i));
                     }
-                    mask.* = .initEmpty();
+                    mask.* = .empty;
                 },
 
                 .query => |target| {
@@ -2165,7 +2203,7 @@ pub const Handler = struct {
                 .background,
                 .cursor,
                 => {
-                    try writer.print("\x1b]{d};", .{@intFromEnum(dynamic)});
+                    try writer.print("\x1b]{d};", .{@backingInt(dynamic)});
                     try c.encodeRgb16(writer);
                     try writer.writeAll(terminator.string());
                 },
@@ -2186,8 +2224,9 @@ pub const Handler = struct {
         self: *Handler,
         request: kitty_color.OSC,
     ) !void {
-        var stack = std.heap.stackFallback(1024, self.terminal.gpa());
-        const alloc = stack.get();
+        var stack_buf: [1024]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, self.terminal.gpa());
+        const alloc = stack.allocator();
         var response: std.Io.Writer.Allocating = .init(alloc);
         defer response.deinit();
         const writer = &response.writer;
@@ -2242,14 +2281,22 @@ pub const Handler = struct {
         }
     }
 
+    /// Finish the current APC and run its command. `terminated` is false
+    /// when the APC was cancelled or aborted, and then nothing runs.
     fn apcEnd(self: *Handler, terminated: bool) void {
         const io = self.terminal.io();
         const alloc = self.terminal.gpa();
         var result = self.apc_handler.end() orelse return;
         defer result.deinit(alloc);
+
+        // ECMA-48 says a cancelled or aborted string is thrown away, so
+        // its command must not run. We still call end() above so the APC
+        // handler resets and frees what it collected.
+        if (!terminated) return;
+
         switch (result) {
             .unknown => |*unknown| {
-                if (terminated) self.unknownSequence(.{ .apc = .{
+                self.unknownSequence(.{ .apc = .{
                     .content = unknown.content,
                     .truncated = unknown.truncated,
                 } });
@@ -2967,6 +3014,64 @@ test "attributes" {
     try testing.expectEqualStrings("Bold", str);
 }
 
+test "SGR with several attributes interns one style" {
+    const Style = @import("style.zig").Style;
+
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    // A styled cell that keeps its style alive.
+    s.nextSlice("\x1B[31mA");
+    const screen = t.screens.active;
+    const page = screen.cursor.page_pin.node.page();
+    try testing.expectEqual(@as(usize, 1), page.styles.count());
+
+    // Reset, then several attributes in one sequence.
+    s.nextSlice("\x1B[0;1;3;4;38;2;10;20;30;48;5;200mBC");
+    try testing.expectEqual(@as(usize, 2), page.styles.count());
+
+    const id = screen.cursor.style_id;
+    const want = page.styles.get(page.memory, id);
+    try testing.expect(want.eql(screen.cursor.style));
+    try testing.expect(want.flags.bold);
+    try testing.expect(want.flags.italic);
+    try testing.expectEqual(.single, want.flags.underline);
+    try testing.expectEqual(
+        Style.Color.rgb(.{ .r = 10, .g = 20, .b = 30 }),
+        want.fg_color,
+    );
+    try testing.expectEqual(Style.Color.palette(200), want.bg_color);
+
+    // Both printed cells reference the new style.
+    for (1..3) |x| {
+        const cell = screen.pages.getCell(.{ .active = .{
+            .x = @intCast(x),
+        } }).?.cell;
+        try testing.expectEqual(id, cell.style_id);
+    }
+
+    // The first cell keeps its own style.
+    const a = screen.pages.getCell(.{ .active = .{} }).?.cell;
+    try testing.expect(a.style_id != id);
+    try testing.expectEqual(
+        Style.Color.palette(1),
+        page.styles.get(page.memory, a.style_id).fg_color,
+    );
+
+    // A sequence that ends where it started changes nothing.
+    s.nextSlice("\x1B[0;1;3;4;38;2;10;20;30;48;5;200m");
+    try testing.expectEqual(id, screen.cursor.style_id);
+    try testing.expectEqual(@as(usize, 2), page.styles.count());
+
+    // A sequence that ends at the default style releases nothing in use.
+    s.nextSlice("\x1B[1;0m");
+    try testing.expectEqual(@as(u16, 0), screen.cursor.style_id);
+    try testing.expectEqual(@as(usize, 2), page.styles.count());
+}
+
 test "DECRQSS responses" {
     var t: Terminal = try .init(
         testing.io,
@@ -3014,6 +3119,11 @@ test "DECRQSS responses" {
     // Overline
     s.nextSlice("\x1B[0;53m\x1BP$qm\x1B\\");
     try S.expectResponse("\x1BP1$r0;53m\x1B\\");
+
+    // Several attributes in one sequence
+    s.nextSlice("\x1B[0;1;3;4:3;38;5;100;48;2;1;2;3m\x1BP$qm\x1B\\");
+    try S.expectResponse("\x1BP1$r0;1;3;4:3;38:5:100;48:2::1:2:3m\x1B\\");
+    s.nextSlice("\x1B[0;53m");
 
     // Requests larger than the parser's fixed request buffer are ignored,
     // and the next DCS command must still be processed normally.
@@ -3174,11 +3284,11 @@ test "XTGETTCAP TN responses" {
         std.fmt.bytesToHex("xterm-256color", .upper) ++ "\x1B\\");
 
     // A maximum-length name is still reported in full.
-    const max_name = "a" ** Handler.max_terminfo_name_bytes;
-    s.handler.terminfo_name = max_name;
+    const max_name: [Handler.max_terminfo_name_bytes]u8 = @splat('a');
+    s.handler.terminfo_name = &max_name;
     s.nextSlice(tn_query);
     try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("TN", .upper) ++ "=" ++
-        std.fmt.bytesToHex(max_name.*, .upper) ++ "\x1B\\");
+        std.fmt.bytesToHex(max_name, .upper) ++ "\x1B\\");
 
     // An empty name is silent; "Co" is still answered.
     s.handler.terminfo_name = "";
@@ -3188,7 +3298,8 @@ test "XTGETTCAP TN responses" {
         std.fmt.bytesToHex("256", .upper) ++ "\x1B\\");
 
     // As are names beyond the maximum length.
-    s.handler.terminfo_name = "a" ** (Handler.max_terminfo_name_bytes + 1);
+    const long_name: [Handler.max_terminfo_name_bytes + 1]u8 = @splat('a');
+    s.handler.terminfo_name = &long_name;
     s.nextSlice(tn_query);
     try testing.expectEqual(@as(usize, 0), S.calls);
     try testing.expect(!s.handler.semantic_failure);
@@ -3271,7 +3382,7 @@ test "glyph protocol APC with write_pty callback" {
         var last_response: ?[:0]const u8 = null;
         fn writePty(_: *Handler, data: []const u8) void {
             if (last_response) |old| testing.allocator.free(old);
-            last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
+            last_response = testing.allocator.dupeSentinel(u8, data, 0) catch @panic("OOM");
         }
     };
     S.last_response = null;
@@ -3450,7 +3561,7 @@ test "OSC color query responses" {
 
         fn writePty(_: *Handler, data: []const u8) void {
             reset();
-            last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
+            last_response = testing.allocator.dupeSentinel(u8, data, 0) catch @panic("OOM");
         }
     };
     S.last_response = null;
@@ -3601,7 +3712,7 @@ test "kitty color protocol query responses" {
 
         fn writePty(_: *Handler, data: []const u8) void {
             reset();
-            last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
+            last_response = testing.allocator.dupeSentinel(u8, data, 0) catch @panic("OOM");
         }
     };
     S.last_response = null;
@@ -5479,7 +5590,7 @@ test "request mode DECRQM with write_pty callback" {
             var last_response: ?[:0]const u8 = null;
             fn writePty(_: *Handler, data: []const u8) void {
                 if (last_response) |old| testing.allocator.free(old);
-                last_response = testing.allocator.dupeZ(u8, data) catch @panic("OOM");
+                last_response = testing.allocator.dupeSentinel(u8, data, 0) catch @panic("OOM");
             }
         };
         S.last_response = null;
@@ -6739,6 +6850,28 @@ test "kitty graphics via APC" {
     try testing.expectEqual(.rgb, img.format);
 }
 
+test "kitty graphics APC cancelled or aborted is discarded" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    // CAN (0x18) and SUB (0x1A) cancel the APC, and CSI (0x9B), like
+    // any 8-bit control other than ST, aborts it. Either way the
+    // transmit command must not run, so image 7 is never stored.
+    for ([_][]const u8{ "\x18", "\x1a", "\x9b" }) |ending| {
+        var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10 });
+        defer t.deinit(testing.allocator);
+
+        const handler: Handler = .init(&t);
+        var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+        defer s.deinit();
+
+        s.nextSlice("\x1b_Ga=t,f=24,s=1,v=1,i=7;AAAA");
+        s.nextSlice(ending);
+
+        const storage = &t.screens.active.kitty_images;
+        try testing.expect(storage.imageById(7) == null);
+    }
+}
+
 test "continuation reconstructs standard stream without duplicate effects" {
     const S = struct {
         var bell_count: usize = 0;
@@ -6891,7 +7024,7 @@ test "continuation reconstructs standard stream without duplicate effects" {
 
 test "kitty dnd: query response" {
     const S = struct {
-        var pty: std.ArrayListUnmanaged(u8) = .empty;
+        var pty: std.ArrayList(u8) = .empty;
         fn writePty(_: *Handler, data: []const u8) void {
             pty.appendSlice(testing.allocator, data) catch unreachable;
         }
@@ -6913,7 +7046,7 @@ test "kitty dnd: query response" {
 
 test "kitty dnd: register, drop, and serve data" {
     const S = struct {
-        var pty: std.ArrayListUnmanaged(u8) = .empty;
+        var pty: std.ArrayList(u8) = .empty;
         fn writePty(_: *Handler, data: []const u8) void {
             pty.appendSlice(testing.allocator, data) catch unreachable;
         }
@@ -6989,7 +7122,7 @@ test "kitty dnd: state updates work without write_pty effect" {
 
 test "kitty dnd: registration survives terminal reset" {
     const S = struct {
-        var pty: std.ArrayListUnmanaged(u8) = .empty;
+        var pty: std.ArrayList(u8) = .empty;
         fn writePty(_: *Handler, data: []const u8) void {
             pty.appendSlice(testing.allocator, data) catch unreachable;
         }
@@ -7020,8 +7153,8 @@ test "kitty dnd: registration survives terminal reset" {
 
 test "kitty dnd: effect reports registration, acceptance, and conclusion" {
     const S = struct {
-        var events: std.ArrayListUnmanaged(kitty_dnd.Event) = .empty;
-        var mimes: std.ArrayListUnmanaged(u8) = .empty;
+        var events: std.ArrayList(kitty_dnd.Event) = .empty;
+        var mimes: std.ArrayList(u8) = .empty;
 
         fn clear() void {
             events.deinit(testing.allocator);
@@ -7299,9 +7432,9 @@ test "paste: large text streams to the pty in chunks" {
 
     // Two full chunks and a partial one with the frame, never the
     // whole thing at once.
-    const data = "x" ** 10_000;
+    const data: [10_000]u8 = @splat('x');
     try testing.expect(try handler.paste(.{
-        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = data }} },
+        .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = &data }} },
     }));
     const total = data.len + "\x1b[200~\x1b[201~".len;
     try testing.expectEqual(
@@ -7493,7 +7626,7 @@ test "paste: mode 5522 sends an event the program can read with" {
 
     // Listing packet: base64 of "text/plain image/png\n".
     var expected_buf: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
         "\x1b]5522;type=read:status=OK:pw={s}\x1b\\" ++
             "\x1b]5522;type=read:status=DATA:mime=Lg==:pw={s};dGV4dC9wbGFpbiBpbWFnZS9wbmcK\x1b\\" ++
@@ -7505,7 +7638,7 @@ test "paste: mode 5522 sends an event the program can read with" {
     // The program reads with the password and the name "Paste event":
     // the read arrives granted, exactly once.
     var read_buf: [256]u8 = undefined;
-    const read = try std.fmt.bufPrint(
+    const read = try std.mem.print(
         &read_buf,
         "\x1b]5522;type=read:pw={s}:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\",
         .{pw_b64},

@@ -44,6 +44,7 @@ alex19ep
 alexbathome
 alexfeijoo44
 alexjuca
+aljohri
 alosarjos
 amadeus
 and-rs
@@ -52,9 +53,11 @@ anhthang
 anmitalidev
 anthonyzhoon
 aprilnea
+arc-source-coder
 aredmondd
 arneshbanerjee
 arvin7liu
+aryanhamedani
 athaapa
 atomk
 aurelleb
@@ -69,6 +72,7 @@ bennettp123
 benodiwal
 bernsno
 beryesa
+binaryfire
 bitigchi
 bkircher
 bleikurr
@@ -78,13 +82,16 @@ brentschroeter
 brianc442
 by-nelson
 c0x0o
+cammeresi
 carldaws
 carlvillads
 cespare
 charliie-dev
 chernetskyi
 chronologos
+clavinjune
 clemg
+clinta
 cmwetherell
 complexsplit
 crayxt
@@ -98,8 +105,10 @@ d-dudas
 daiimus
 damyanbogoev
 danneu
+danudey
 danulqua
 dariogriffo
+database64128
 dave92082
 davey-hughes
 davidhodge
@@ -114,6 +123,7 @@ diego-moment
 diegoarmstrong
 dkinzler
 dmehala
+dmkenney
 dmunozv04
 dobbylee
 dolzenko
@@ -124,6 +134,7 @@ douglas-macgregor
 drepper
 dungdm93
 dzhlobo
+edsarmiento
 ekaterinepapava
 ekusiadadus
 elias8
@@ -150,6 +161,7 @@ fru1tworld
 gaborbernat
 gadgetman6
 gagbo
+ghdtjdwn
 ghokun
 gmile
 gordonbondon
@@ -162,6 +174,7 @@ h3nock
 hackattack
 hakonhagland
 halosatrio
+hamidp
 heaths
 heddxh heddxh
 heitoraugustoln
@@ -175,6 +188,7 @@ hulet
 i999rri
 ibaios
 icodesign
+-ifmael
 illiakrauchanka
 j-c-m
 j0hnm4r5
@@ -186,7 +200,9 @@ jamylak
 jarred-sumner
 jcollie
 jesusvazquez
+jglanz
 jguthmiller
+jin-eden
 jmcgover
 jmr
 johnslavik
@@ -221,6 +237,7 @@ kristofersoler
 kylesower
 laxystem
 lebdron
+lehni
 lepips
 liby
 linustalacko
@@ -234,6 +251,7 @@ mac0ne
 maddythewisp
 magnussp
 mahnokropotkinvich
+mangkoran
 marijagjorgjieva
 markdorison
 markhuot
@@ -287,6 +305,7 @@ nwehg
 ocean6954
 ollieatkinson
 ollioddi
+olrtg
 oshdubh
 otomn
 paaloeye
@@ -333,8 +352,10 @@ rmengelbrecht
 rmunn
 robmorgan
 rockorager
+romen
 ronijacobson
 rpfaeffle
+rtgibbons
 ruoyouz
 ruseel
 sahilkmishra
@@ -352,6 +373,7 @@ silveirapf
 simonbcn
 slowdub
 slsrepo
+sm010422
 stepankandrushin
 steven-tk
 sunshine-syz
@@ -363,12 +385,14 @@ tasselx
 tbrundige
 tdgroot
 tdslot
+thapakrish
 thirstycrow
 -thomas-trijindev No human in the loop
 thomasfedb
 thoutbeckers
 ticclick
 tnagatomi
+tonypapousek
 toppk
 tothedarktowercame
 trag1c
@@ -396,6 +420,8 @@ yabbal
 yak3d
 yamshta
 ydah
+yeager
+yinxiangshi
 -zaviro
 zenangst
 zenyr
