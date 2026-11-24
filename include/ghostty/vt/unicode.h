@@ -8,21 +8,24 @@
 #ifndef GHOSTTY_VT_UNICODE_H
 #define GHOSTTY_VT_UNICODE_H
 
-/** @defgroup unicode Unicode Utilities
+/** @addtogroup unicode
  *
- * Unicode codepoint properties matching the terminal's text layout
- * semantics.
+ * These measure text the same way the terminal does, with the same width table
+ * and the same grapheme cluster rules.
  *
- * ## Basic Usage
+ * Use them to predict the layout of text you haven't written to the terminal,
+ * such as an IME preedit overlay. ghostty_unicode_codepoint_width() measures one
+ * codepoint. ghostty_unicode_grapheme_width() finds and measures a full grapheme
+ * cluster, with the rules the terminal uses when mode 2027 is on. You don't need
+ * a terminal.
  *
- * Use ghostty_unicode_codepoint_width() to determine how many terminal
- * grid cells a codepoint occupies, using the exact same width table the
- * terminal itself uses when laying out printed text. Use
- * ghostty_unicode_grapheme_width() to segment and measure full grapheme
- * clusters with the same rules the terminal uses when mode 2027 is
- * enabled. These functions are useful for predicting column layout of
- * text that has not yet been written to the terminal, such as IME
- * preedit (composition) overlays.
+ * ## Example
+ *
+ * @code{.c}
+ * uint8_t width = ghostty_unicode_codepoint_width(0x1F600);
+ * @endcode
+ *
+ * We don't have a guide or an example for these yet.
  *
  * @{
  */
@@ -112,6 +115,14 @@ GHOSTTY_API uint8_t ghostty_unicode_codepoint_width(uint32_t cp);
  *   cluster is a valid emoji variation sequence base (per Unicode
  *   emoji-variation-sequences.txt). Invalid variation selectors are
  *   ignored entirely.
+ * - A skin tone modifier (U+1F3FB through U+1F3FF) that continues a
+ *   cluster forces it wide (2), just like VS16. A modifier asks for the
+ *   emoji form of the codepoint before it, so U+261D U+1F3FB (index
+ *   pointing up, light skin tone) is 2 cells wide even though U+261D on
+ *   its own is 1. A modifier only continues a cluster after an emoji that
+ *   accepts skin tones, or after a Prepend codepoint such as U+0600.
+ *   After anything else, such as "a", it starts a new cluster, which is
+ *   2 cells wide on its own.
  * - Any other continuation codepoint that contributes to grapheme width
  *   forces the cluster wide (2). Note this means cluster width is NOT the
  *   maximum of per-codepoint widths: some continuation marks have narrow
