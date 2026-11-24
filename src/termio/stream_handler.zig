@@ -150,6 +150,7 @@ pub const StreamHandler = struct {
     ) void {
         if (self.replaying) switch (msg) {
             .report_title,
+            .resize_window,
             .clipboard_read,
             .desktop_notification,
             .ring_bell,
