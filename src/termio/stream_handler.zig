@@ -89,6 +89,17 @@ pub const StreamHandler = struct {
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
 
+    /// Set while replaying output a keeper buffered while this pane was
+    /// detached. Replay restores what the screen shows; it must not answer
+    /// queries or re-fire one-shot events, because the program that sent
+    /// them asked long ago and a late answer lands in its input as junk.
+    ///
+    /// It also prevents a hang: replay runs on the IO thread before its
+    /// event loop starts, so nothing drains the termio mailbox yet. Enough
+    /// queries in the replay fill that mailbox, and the IO thread then
+    /// blocks forever waiting on itself.
+    replaying: bool = false,
+
     pub const Stream = terminal.Stream(StreamHandler);
 
     /// True if we have tmux control mode built in.
@@ -131,6 +142,20 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: apprt.surface.Message,
     ) void {
+        if (self.replaying) switch (msg) {
+            .report_title,
+            .clipboard_read,
+            .desktop_notification,
+            .ring_bell,
+            .start_command,
+            .stop_command,
+            => return,
+            .clipboard_write => |w| return w.req.deinit(),
+            .kitty_clipboard_read => |req| return req.destroy(),
+            .kitty_clipboard_write => |req| return req.destroy(),
+            else => {},
+        };
+
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
@@ -141,6 +166,21 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        // During replay, drop everything that answers the program. State
+        // changes (linefeed mode, synchronized output) still go through,
+        // and there are too few of those to fill the mailbox.
+        if (self.replaying) switch (msg) {
+            .write_small,
+            .write_stable,
+            .write_alloc,
+            .size_report,
+            .color_scheme_report,
+            .visibility_report,
+            .focused,
+            => return msg.deinit(),
+            else => {},
+        };
+
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
@@ -1966,5 +2006,44 @@ test "kitty clipboard write: oversized text replies EFBIG" {
 
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
+    try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "replay drops replies so a full mailbox can't hang the IO thread" {
+    const testing = std.testing;
+
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = undefined,
+    };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.termio_mailbox = &mailbox;
+    handler.renderer_state = &renderer_state;
+    handler.replaying = true;
+
+    // Far more replies than the mailbox holds. Nothing drains it here, just
+    // as nothing does while a reattached pane replays, so any reply that got
+    // through would eventually block forever.
+    for (0..1000) |_| {
+        handler.messageWriter(.{ .write_stable = "\x1B[?62;22c" });
+        // Long enough to need an allocation, which dropping must free.
+        const long: []const u8 = "\x1B]11;rgb:0000/0000/0000\x1B\\" ** 16;
+        handler.messageWriter(try termio.Message.writeReq(testing.allocator, long));
+        handler.messageWriter(.{ .size_report = .mode_2048 });
+    }
+
+    // State changes still go through.
+    handler.messageWriter(.{ .linefeed_mode = true });
+    const msg = mailbox.spsc.queue.pop(global.io()).?;
+    defer msg.deinit();
+    try testing.expect(msg == .linefeed_mode);
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
 }

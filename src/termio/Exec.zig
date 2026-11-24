@@ -148,6 +148,9 @@ pub fn threadEnter(
     // thread starts, or replayed output would race live output and interleave.
     if (self.subprocess.keeper_session) |session| {
         if (session.replay.len > 0) {
+            const handler = &io.terminal_stream.handler;
+            handler.replaying = true;
+            defer handler.replaying = false;
             io.processOutput(session.replay);
             log.info("replayed {d} bytes into reattached pane", .{session.replay.len});
         }
