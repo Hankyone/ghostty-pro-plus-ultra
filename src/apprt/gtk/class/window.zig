@@ -29,6 +29,7 @@ const DebugWarning = @import("debug_warning.zig").DebugWarning;
 const CommandPalette = @import("command_palette.zig").CommandPalette;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
+const TabColorDialog = @import("tab_color_dialog.zig").TabColorDialog;
 const Overrides = @import("Overrides.zig");
 
 const log = std.log.scoped(.gtk_ghostty_window);
@@ -400,6 +401,7 @@ pub const Window = extern struct {
             .init("prompt-surface-title", actionPromptSurfaceTitle, null),
             .init("prompt-tab-title", actionPromptTabTitle, null),
             .init("prompt-context-tab-title", actionPromptContextTabTitle, null),
+            .init("prompt-context-tab-color", actionPromptContextTabColor, null),
             .init("prompt-window-title", actionPromptWindowTitle, null),
             .init("ring-bell", actionRingBell, null),
             .init("split-right", actionSplitRight, null),
@@ -1773,6 +1775,8 @@ pub const Window = extern struct {
             self,
             .{},
         );
+
+        tab.syncColorIndicator();
     }
 
     fn tabViewPageDetached(
@@ -1868,7 +1872,8 @@ pub const Window = extern struct {
     fn surfaceClipboardWrite(
         _: *Surface,
         clipboard_type: apprt.Clipboard,
-        text: [*:0]const u8,
+        _: [*:0]const u8,
+        cleared: bool,
         self: *Self,
     ) callconv(.c) void {
         // We only toast for the standard clipboard.
@@ -1882,7 +1887,7 @@ pub const Window = extern struct {
             return;
         }
 
-        if (text[0] != 0)
+        if (!cleared)
             self.addToast(i18n._("Copied to clipboard"))
         else
             self.addToast(i18n._("Cleared clipboard"));
@@ -2102,6 +2107,22 @@ pub const Window = extern struct {
         tab.promptTabTitle();
     }
 
+    fn actionPromptContextTabColor(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const page = self.private().context_menu_page orelse return;
+        const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
+        self.promptTabColor(tab);
+    }
+
+    /// Adwaita menus omit GMenu icons; use a dialog of swatch buttons instead.
+    fn promptTabColor(_: *Self, tab: *Tab) void {
+        const dialog = TabColorDialog.new(tab);
+        dialog.present(tab.as(gtk.Widget));
+    }
+
     fn actionPromptSurfaceTitle(
         _: *gio.SimpleAction,
         _: ?*glib.Variant,
@@ -2312,6 +2333,7 @@ pub const Window = extern struct {
             gobject.ext.ensureType(SplitTree);
             gobject.ext.ensureType(Surface);
             gobject.ext.ensureType(Tab);
+            gobject.ext.ensureType(TabColorDialog);
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{

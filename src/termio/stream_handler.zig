@@ -140,8 +140,10 @@ pub const StreamHandler = struct {
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
         self.terminal.setDefaultXtChecksum(config.xt_checksum_extension);
 
-        // The config could have changed any of our colors so update mode 2031
-        self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
+        // The config could have changed any of our colors, but the mode
+        // 2031 report is sent by Termio.changeConfig. This runs on the io
+        // thread, which is the only reader of the termio mailbox, so
+        // sending to it here would deadlock if the mailbox were full.
     }
 
     inline fn surfaceMessageWriter(
@@ -229,9 +231,19 @@ pub const StreamHandler = struct {
         comptime action: Stream.Action.Tag,
         value: Stream.Action.Value(action),
     ) void {
-        self.vtFallible(action, value) catch |err| {
-            log.warn("error handling VT action action={} err={}", .{ action, err });
-        };
+        self.vtFallible(action, value) catch |err| vtFailed(action, err);
+    }
+
+    /// The stream's hook for runs it knows are printable ASCII.
+    pub fn vtPrintAscii(self: *StreamHandler, bytes: []const u8) void {
+        self.terminal.printSliceAscii(bytes) catch |err| vtFailed(.print_slice, err);
+    }
+
+    /// This is noinline to keep failure handling and logging out of the
+    /// hot VT action path.
+    noinline fn vtFailed(action: Stream.Action.Tag, err: anyerror) void {
+        @branchHint(.cold);
+        log.warn("error handling VT action action={} err={}", .{ action, err });
     }
 
     inline fn vtFallible(
@@ -243,7 +255,7 @@ pub const StreamHandler = struct {
         // which indicates that the most common actions are:
         //
         // 1. print
-        // 2. set_attribute
+        // 2. set_attributes
         // 3. carriage_return
         // 4. line_feed
         // 5. cursor_pos
@@ -305,6 +317,8 @@ pub const StreamHandler = struct {
             .erase_chars => self.terminal.eraseChars(value),
             .insert_lines => self.terminal.insertLines(value),
             .insert_blanks => self.terminal.insertBlanks(value),
+            .insert_columns => self.terminal.insertColumns(value),
+            .delete_columns => self.terminal.deleteColumns(value),
             .delete_lines => self.terminal.deleteLines(value),
             .scroll_up => try self.terminal.scrollUp(value),
             .scroll_down => self.terminal.scrollDown(value),
@@ -315,6 +329,8 @@ pub const StreamHandler = struct {
             .index => try self.index(),
             .next_line => try self.nextLine(),
             .reverse_index => try self.reverseIndex(),
+            .back_index => self.terminal.backIndex(),
+            .forward_index => self.terminal.forwardIndex(),
             .full_reset => try self.fullReset(),
             .soft_reset => self.terminal.softReset(),
             .set_mode => try self.setMode(value.mode, true),
@@ -392,23 +408,12 @@ pub const StreamHandler = struct {
                 if (self.terminal.flags.mouse_event != .none) .default else .text,
             ),
             .configure_charset => self.configureCharset(value.slot, value.charset),
-            .set_attribute => {
+            .set_attributes => {
                 @branchHint(.likely);
-                switch (value) {
-                    .unknown => |unk| {
-                        // We optimize for the happy path scenario here, since
-                        // unknown/invalid SGRs aren't that common in the wild.
-                        @branchHint(.unlikely);
-                        log.warn("unimplemented or unknown SGR attribute: {any}", .{unk});
-                    },
-                    else => {
-                        @branchHint(.likely);
-                        self.terminal.setAttribute(value) catch |err| {
-                            @branchHint(.cold);
-                            log.warn("error setting attribute {}: {}", .{ value, err });
-                        };
-                    },
-                }
+                self.terminal.setAttributes(value.parser()) catch |err| {
+                    @branchHint(.cold);
+                    log.warn("error setting attributes: {}", .{err});
+                };
             },
             .dcs_hook => try self.dcsHook(value),
             .dcs_put => try self.dcsPut(value),
@@ -519,6 +524,11 @@ pub const StreamHandler = struct {
 
                         .windows => {
                             // TODO
+                        },
+
+                        .active_window => {
+                            // TODO: notify the GUI that tmux's current
+                            // window changed.
                         },
                     }
                 }
@@ -908,7 +918,7 @@ pub const StreamHandler = struct {
                 // remainder for the row/column as base-10 numbers. This
                 // will support a very large terminal.
                 var msg: termio.Message = .{ .write_small = .{} };
-                const resp = try std.fmt.bufPrint(&msg.write_small.data, "\x1B[{};{}R", .{
+                const resp = try std.mem.print(&msg.write_small.data, "\x1B[{};{}R", .{
                     pos.y + 1,
                     pos.x + 1,
                 });
@@ -996,7 +1006,7 @@ pub const StreamHandler = struct {
     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
         log.debug("querying kitty keyboard mode", .{});
         var data: termio.Message.WriteReq.Small.Array = undefined;
-        const resp = try std.fmt.bufPrint(&data, "\x1b[?{}u", .{
+        const resp = try std.mem.print(&data, "\x1b[?{}u", .{
             self.terminal.screens.active.kitty_keyboard.current().int(),
         });
 
@@ -1013,7 +1023,7 @@ pub const StreamHandler = struct {
     ) !void {
         log.debug("reporting XTVERSION: ghostty {s}", .{build_config.version_string});
         var buf: [288]u8 = undefined;
-        const resp = try std.fmt.bufPrint(
+        const resp = try std.mem.print(
             &buf,
             "\x1BP>|{s} {s}\x1B\\",
             .{
@@ -1224,11 +1234,11 @@ pub const StreamHandler = struct {
         const req = try alloc.create(apprt.ClipboardRequest.KittyRead);
         const mimes = try alloc.alloc([:0]const u8, mimes_len);
         for (mimes_buf[0..mimes_len], mimes) |src, *dst| {
-            dst.* = try alloc.dupeZ(u8, src);
+            dst.* = try alloc.dupeSentinel(u8, src, 0);
         }
         const id = try alloc.dupe(u8, meta.id);
         const pw_owned = try alloc.dupe(u8, pw);
-        const name_owned = try alloc.dupeZ(u8, meta.name);
+        const name_owned = try alloc.dupeSentinel(u8, meta.name, 0);
         req.* = .{
             // The arena must be copied in last so it tracks every
             // allocation above.
@@ -1443,12 +1453,12 @@ pub const StreamHandler = struct {
             committed.contents.len,
         );
         for (committed.contents, contents) |src, *dst| dst.* = .{
-            .mime = try alloc.dupeZ(u8, src.mime),
-            .data = try alloc.dupeZ(u8, src.data),
+            .mime = try alloc.dupeSentinel(u8, src.mime, 0),
+            .data = try alloc.dupeSentinel(u8, src.data, 0),
         };
         const id = try alloc.dupe(u8, committed.id);
         const pw_owned = try alloc.dupe(u8, pw);
-        const name_owned = try alloc.dupeZ(u8, committed.name);
+        const name_owned = try alloc.dupeSentinel(u8, committed.name, 0);
         req.* = .{
             // The arena must be copied in last so it tracks every
             // allocation above.
@@ -1570,7 +1580,7 @@ pub const StreamHandler = struct {
             return;
         }
 
-        if (builtin.os.tag == .windows) {
+        if (builtin.target.os.tag == .windows) {
             log.warn("reportPwd unimplemented on windows", .{});
             return;
         }
@@ -1579,7 +1589,7 @@ pub const StreamHandler = struct {
         // for this OSC 7 context (e.g. kitty-shell-cwd expects the full,
         // unencoded path).
         const uri: std.Uri = internal_os.uri.parse(url, .{
-            .mac_address = comptime builtin.os.tag != .macos,
+            .mac_address = comptime builtin.target.os.tag != .macos,
             .raw_path = std.mem.startsWith(u8, url, "kitty-shell-cwd://"),
         }) catch |e| {
             log.warn("invalid url in OSC 7: {}", .{e});
@@ -1594,9 +1604,13 @@ pub const StreamHandler = struct {
         }
 
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = uri.getHost(&host_buffer) catch |err| switch (err) {
+        const host = osc7Host(uri, &host_buffer) catch |err| switch (err) {
             error.UriMissingHost => {
                 log.warn("OSC 7 uri must contain a hostname: {}", .{err});
+                return;
+            },
+            error.NameTooLong => {
+                log.warn("failed to get full hostname for OSC 7 validation: {}", .{err});
                 return;
             },
         };
@@ -1604,7 +1618,7 @@ pub const StreamHandler = struct {
         // OSC 7 is a little sketchy because anyone can send any value from
         // any host (such an SSH session). The best practice terminals follow
         // is to valid the hostname to be local.
-        const host_valid = internal_os.hostname.isLocal(host.bytes) catch |err| switch (err) {
+        const host_valid = internal_os.hostname.isLocal(host) catch |err| switch (err) {
             error.PermissionDenied,
             error.Unexpected,
             => {
@@ -1613,16 +1627,17 @@ pub const StreamHandler = struct {
             },
         };
         if (!host_valid) {
-            log.warn("OSC 7 host ({s}) must be local", .{host.bytes});
+            log.warn("OSC 7 host ({s}) must be local", .{host});
             return;
         }
 
         // We need the raw path, which might require unescaping. We try to
         // avoid making any heap allocations by using the stack first.
         var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
-        var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
+        var stack_alloc_buf: [1024]u8 = undefined;
+        var stack_alloc: std.heap.BufferFirstAllocator = .init(&stack_alloc_buf, arena_alloc.allocator());
         defer arena_alloc.deinit();
-        const path = try uri.path.toRawMaybeAlloc(stack_alloc.get());
+        const path = try uri.path.toRawMaybeAlloc(stack_alloc.allocator());
 
         log.debug("terminal pwd: {s}", .{path});
         try self.terminal.setPwd(path);
@@ -1764,7 +1779,7 @@ pub const StreamHandler = struct {
                             },
                         });
                     }
-                    mask.* = .initEmpty();
+                    mask.* = .empty;
                 },
 
                 .reset_special => log.warn(
@@ -1817,7 +1832,7 @@ pub const StreamHandler = struct {
                             .dynamic => |dynamic| try response.writer.print(
                                 "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
                                 .{
-                                    @intFromEnum(dynamic),
+                                    @backingInt(dynamic),
                                     @as(u16, color.r) * 257,
                                     @as(u16, color.g) * 257,
                                     @as(u16, color.b) * 257,
@@ -1839,7 +1854,7 @@ pub const StreamHandler = struct {
                             .dynamic => |dynamic| try response.writer.print(
                                 "\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}",
                                 .{
-                                    @intFromEnum(dynamic),
+                                    @backingInt(dynamic),
                                     @as(u16, color.r),
                                     @as(u16, color.g),
                                     @as(u16, color.b),
@@ -1983,6 +1998,62 @@ pub const StreamHandler = struct {
     }
 };
 
+/// Returns the raw (percent-decoded) host of an OSC 7 URI.
+///
+/// This deliberately does not check that the host is a valid RFC 1123
+/// hostname. The host only has to match the local hostname (see
+/// `internal_os.hostname.isLocal`), and local hostnames are often not
+/// valid RFC 1123 hostnames: macOS allows names like "Foo's MacBook Pro",
+/// some systems use underscores, and some report a MAC address.
+fn osc7Host(
+    uri: std.Uri,
+    buffer: *[std.Io.net.HostName.max_len]u8,
+) error{ UriMissingHost, NameTooLong }![]const u8 {
+    const component = uri.host orelse return error.UriMissingHost;
+    return component.toRaw(buffer) catch |err| switch (err) {
+        error.NoSpaceLeft => error.NameTooLong,
+    };
+}
+
+test "osc7Host accepts hostnames that are not RFC 1123" {
+    const testing = std.testing;
+
+    const Case = struct {
+        url: []const u8,
+        host: []const u8,
+        mac_address: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .url = "kitty-shell-cwd://Foo MacBook Pro/tmp", .host = "Foo MacBook Pro" },
+        .{ .url = "file://Foo's MacBook Pro/tmp", .host = "Foo's MacBook Pro" },
+        .{ .url = "file://my_host/tmp", .host = "my_host" },
+        .{ .url = "file://h%C3%B6st/tmp", .host = "höst" },
+        .{ .url = "file://example.com/tmp", .host = "example.com" },
+        .{
+            .url = "file://12:34:56:78:90:aa/tmp",
+            .host = "12:34:56:78:90:aa",
+            .mac_address = true,
+        },
+    };
+
+    for (cases) |case| {
+        const uri = try internal_os.uri.parse(case.url, .{
+            .mac_address = case.mac_address,
+            .raw_path = std.mem.startsWith(u8, case.url, "kitty-shell-cwd://"),
+        });
+        var buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        try testing.expectEqualStrings(case.host, try osc7Host(uri, &buf));
+    }
+}
+
+test "osc7Host requires a host" {
+    const testing = std.testing;
+
+    const uri = try internal_os.uri.parse("file:///tmp", .{});
+    var buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    try testing.expectError(error.UriMissingHost, osc7Host(uri, &buf));
+}
+
 test "kitty clipboard read: targets-only never consumes a one-time grant" {
     const testing = std.testing;
 
@@ -2084,7 +2155,7 @@ test "replay drops replies so a full mailbox can't hang the IO thread" {
     for (0..1000) |_| {
         handler.messageWriter(.{ .write_stable = "\x1B[?62;22c" });
         // Long enough to need an allocation, which dropping must free.
-        const long: []const u8 = "\x1B]11;rgb:0000/0000/0000\x1B\\" ** 16;
+        const long: []const u8 = "\x1B]10;rgb:ffff/ffff/ffff\x1B\\\x1B]11;rgb:0000/0000/0000\x1B\\";
         handler.messageWriter(try termio.Message.writeReq(testing.allocator, long));
         handler.messageWriter(.{ .size_report = .mode_2048 });
     }
@@ -2094,5 +2165,71 @@ test "replay drops replies so a full mailbox can't hang the IO thread" {
     const msg = mailbox.spsc.queue.pop(global.io()).?;
     defer msg.deinit();
     try testing.expect(msg == .linefeed_mode);
+    try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "tmux active_window notification is handled" {
+    if (comptime !StreamHandler.tmux_enabled) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = undefined,
+    };
+    var handler: StreamHandler = undefined;
+    handler.alloc = testing.allocator;
+    handler.termio_mailbox = &mailbox;
+    handler.renderer_state = &renderer_state;
+    handler.termio_messaged = false;
+    handler.tmux_viewer = null;
+    defer if (handler.tmux_viewer) |viewer| {
+        viewer.deinit();
+        testing.allocator.destroy(viewer);
+        handler.tmux_viewer = null;
+    };
+
+    var enter_cmd: terminal.dcs.Command = .{ .tmux = .enter };
+    try handler.dcsCommand(&enter_cmd);
+    try testing.expect(handler.tmux_viewer != null);
+
+    var startup: terminal.dcs.Command = .{ .tmux = .{ .block_end = "" } };
+    try handler.dcsCommand(&startup);
+
+    var session: terminal.dcs.Command = .{ .tmux = .{
+        .session_changed = .{ .id = 7, .name = "main" },
+    } };
+    try handler.dcsCommand(&session);
+    try testing.expect(handler.termio_messaged);
+    if (mailbox.spsc.queue.pop(global.io())) |msg| msg.deinit();
+
+    // %session-window-changed for our session reaches the active_window
+    // arm. That arm does not write to the PTY.
+    handler.termio_messaged = false;
+    var changed: terminal.dcs.Command = .{ .tmux = .{
+        .session_window_changed = .{ .session_id = 7, .window_id = 3 },
+    } };
+    try handler.dcsCommand(&changed);
+    try testing.expect(!handler.termio_messaged);
+    try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+    try testing.expect(handler.tmux_viewer != null);
+
+    // Other sessions and pane changes must not write either.
+    var other: terminal.dcs.Command = .{ .tmux = .{
+        .session_window_changed = .{ .session_id = 99, .window_id = 1 },
+    } };
+    try handler.dcsCommand(&other);
+    var pane: terminal.dcs.Command = .{ .tmux = .{
+        .window_pane_changed = .{ .window_id = 3, .pane_id = 1 },
+    } };
+    try handler.dcsCommand(&pane);
+    try testing.expect(!handler.termio_messaged);
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
 }

@@ -22,18 +22,7 @@
 const std = @import("std");
 const posix = std.posix;
 
-const c = @cImport({
-    @cInclude("sys/socket.h");
-    @cInclude("sys/un.h");
-    @cInclude("sys/ioctl.h");
-    @cInclude("sys/stat.h");
-    @cInclude("poll.h");
-    @cInclude("unistd.h");
-    @cInclude("signal.h");
-    @cInclude("fcntl.h");
-    @cInclude("errno.h");
-    @cInclude("stdlib.h");
-});
+const c = @import("c");
 
 /// Declared by hand rather than via `util.h`, which isn't in the header set
 /// Zig gives a plain libc executable. The symbol lives in libSystem.
@@ -181,7 +170,7 @@ fn start(alloc: std.mem.Allocator, spec: SpawnSpec) !Keeper {
     const argv = try dupeArgv(alloc, spec.argv);
     const envp = try dupeArgv(alloc, spec.env);
     const cwd: ?[:0]const u8 = if (spec.cwd) |v|
-        try alloc.dupeZ(u8, v)
+        try alloc.dupeSentinel(u8, v, 0)
     else
         null;
 
@@ -752,7 +741,7 @@ fn dupeArgv(
     items: []const []const u8,
 ) ![]?[*:0]const u8 {
     const out = try alloc.alloc(?[*:0]const u8, items.len + 1);
-    for (items, 0..) |item, i| out[i] = (try alloc.dupeZ(u8, item)).ptr;
+    for (items, 0..) |item, i| out[i] = (try alloc.dupeSentinel(u8, item, 0)).ptr;
     out[items.len] = null;
     return out;
 }

@@ -9,6 +9,7 @@ const GhosttyKeeper = @This();
 
 const std = @import("std");
 const Config = @import("Config.zig");
+const translate_c = @import("translate_c");
 
 exe: *std.Build.Step.Compile,
 
@@ -21,6 +22,23 @@ pub fn init(b: *std.Build, cfg: *const Config) !GhosttyKeeper {
             .optimize = cfg.optimize,
             .link_libc = true,
         }),
+    });
+
+    try translate_c.addImportToModule(b, "c", exe.root_module, .{
+        .source = .{ .includes = .{ .files = &.{
+            .{ .path = "sys/socket.h" },
+            .{ .path = "sys/un.h" },
+            .{ .path = "sys/ioctl.h" },
+            .{ .path = "sys/stat.h" },
+            .{ .path = "poll.h" },
+            .{ .path = "unistd.h" },
+            .{ .path = "signal.h" },
+            .{ .path = "fcntl.h" },
+            .{ .path = "errno.h" },
+            .{ .path = "stdlib.h" },
+        } } },
+        .target = cfg.target,
+        .optimize = cfg.optimize,
     });
 
     return .{ .exe = exe };

@@ -33,11 +33,8 @@ pub fn create(b: *std.Build, opts: Options) *LibtoolStep {
     const self = b.allocator.create(LibtoolStep) catch @panic("OOM");
 
     const run_step = RunStep.create(b, b.fmt("libtool {s}", .{opts.name}));
-    run_step.addArgs(&.{
-        b.pathFromRoot("scripts/libtool_wrapper.sh"),
-        "-static",
-        "-o",
-    });
+    run_step.addFileArg(b.path("scripts/libtool_wrapper.sh"));
+    run_step.addArgs(&.{ "-static", "-o" });
     const output = run_step.addOutputFileArg(opts.out_name);
     for (opts.sources, 0..) |source, i| {
         run_step.addFileArg(normalizeArchive(

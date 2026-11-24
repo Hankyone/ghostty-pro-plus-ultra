@@ -178,7 +178,7 @@ pub fn threadEnter(
     // Start our read thread
     const read_thread = try std.Thread.spawn(
         .{},
-        if (builtin.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
+        if (builtin.target.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
         .{ pty_fds.read, io, pipe[0] },
     );
     read_thread.setName(global.io(), "io-reader") catch {};
@@ -220,7 +220,7 @@ pub fn threadEnter(
     // Start our termios timer. We don't support this on Windows.
     // Fundamentally, we could support this on Windows so we're just
     // waiting for someone to implement it.
-    if (comptime builtin.os.tag != .windows) {
+    if (comptime builtin.target.os.tag != .windows) {
         termios_timer.run(
             td.loop,
             &td.backend.exec.termios_timer_c,
@@ -325,7 +325,7 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
         ),
     }
 
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         // Interrupt the blocking read so the thread can see the quit message
         if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
             switch (windows.GetLastError()) {
@@ -349,7 +349,7 @@ pub fn focusGained(
     const execdata = &td.backend.exec;
 
     // Windows has no termios, so there is nothing to poll.
-    if (comptime builtin.os.tag == .windows) return;
+    if (comptime builtin.target.os.tag == .windows) return;
 
     if (!focused) {
         // Flag the timer to end on the next iteration. This is
@@ -435,7 +435,7 @@ fn termiosTimer(
     // timer on windows but we want this assertion to fire if
     // we ever do start the timer on windows.
     // TODO: support on windows
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         @panic("termios timer not implemented on Windows");
     }
 
@@ -686,6 +686,10 @@ pub const Config = struct {
     pane_id: ?[]const u8 = null,
 
     command: ?configpkg.Command = null,
+
+    /// The environment for the subprocess. init takes ownership of this
+    /// whether or not it succeeds, so the caller must not free it after
+    /// calling init.
     env: EnvMap,
     env_override: configpkg.RepeatableStringMap = .{},
     shell_integration: configpkg.Config.ShellIntegration = .detect,
@@ -764,6 +768,7 @@ const Subprocess = struct {
         // Get our env. If a default env isn't provided by the caller
         // then we get it ourselves.
         var env = cfg.env;
+        errdefer env.deinit();
 
         // If we have a resources dir then set our env var
         if (cfg.resources_dir) |dir| {
@@ -784,7 +789,7 @@ const Subprocess = struct {
             // Assume that the resources directory is adjacent to the terminfo
             // database
             var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const dir = try std.fmt.bufPrint(&buf, "{s}/terminfo", .{
+            const dir = try std.mem.print(&buf, "{s}/terminfo", .{
                 std.fs.path.dirname(base) orelse unreachable,
             });
             try env.put("TERMINFO", dir);
@@ -851,7 +856,7 @@ const Subprocess = struct {
             var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
             const xdg_data_dir_key = "XDG_DATA_DIRS";
-            if (std.fmt.bufPrint(&buf, "{s}/..", .{resources_dir})) |data_dir| {
+            if (std.mem.print(&buf, "{s}/..", .{resources_dir})) |data_dir| {
                 try env.put(
                     xdg_data_dir_key,
                     try appendEnv(
@@ -865,7 +870,7 @@ const Subprocess = struct {
             }
 
             const manpath_key = "MANPATH";
-            if (std.fmt.bufPrint(&buf, "{s}/../man", .{resources_dir})) |man_dir| {
+            if (std.mem.print(&buf, "{s}/../man", .{resources_dir})) |man_dir| {
                 // Always append with colon in front, as it mean that if
                 // `MANPATH` is empty, then it should be treated as an extra
                 // path instead of overriding all paths set by OS.
@@ -895,7 +900,7 @@ const Subprocess = struct {
         // Setup our shell integration, if we can.
         const shell_command: configpkg.Command = shell: {
             const default_shell_command: configpkg.Command =
-                cfg.command orelse .{ .shell = switch (builtin.os.tag) {
+                cfg.command orelse .{ .shell = switch (builtin.target.os.tag) {
                     .windows => "cmd.exe",
                     else => "sh",
                 } };
@@ -974,7 +979,7 @@ const Subprocess = struct {
 
                 // The comptime here is important to ensure the full slice
                 // is put into the binary data and not the stack.
-                break :oom comptime switch (builtin.os.tag) {
+                break :oom comptime switch (builtin.target.os.tag) {
                     .windows => &.{"cmd.exe"},
                     else => &.{"/bin/sh"},
                 };
@@ -987,7 +992,7 @@ const Subprocess = struct {
         // We have to copy the cwd because there is no guarantee that
         // pointers in full_config remain valid.
         const cwd: ?[:0]u8 = if (cfg.working_directory) |cwd|
-            try alloc.dupeZ(u8, cwd)
+            try alloc.dupeSentinel(u8, cwd, 0)
         else
             null;
 
@@ -1134,7 +1139,7 @@ const Subprocess = struct {
         });
         self.pty = pty;
         errdefer if (!in_child) {
-            if (comptime builtin.os.tag != .windows) {
+            if (comptime builtin.target.os.tag != .windows) {
                 _ = posix.system.close(pty.slave);
             }
 
@@ -1145,7 +1150,7 @@ const Subprocess = struct {
         // Cleanup we only run in our parent when we successfully start
         // the process.
         defer if (!in_child and self.process != null) {
-            if (comptime builtin.os.tag != .windows) {
+            if (comptime builtin.target.os.tag != .windows) {
                 // Once our subcommand is started we can close the slave
                 // side. This prevents the slave fd from being leaked to
                 // future children.
@@ -1243,20 +1248,20 @@ const Subprocess = struct {
             .args = self.args,
             .env = if (self.env) |*env| env else null,
             .cwd = cwd,
-            .stdin = if (builtin.os.tag == .windows) null else .{
+            .stdin = if (builtin.target.os.tag == .windows) null else .{
                 .handle = pty.slave,
                 .flags = .{ .nonblocking = false },
             },
-            .stdout = if (builtin.os.tag == .windows) null else .{
+            .stdout = if (builtin.target.os.tag == .windows) null else .{
                 .handle = pty.slave,
                 .flags = .{ .nonblocking = false },
             },
-            .stderr = if (builtin.os.tag == .windows) null else .{
+            .stderr = if (builtin.target.os.tag == .windows) null else .{
                 .handle = pty.slave,
                 .flags = .{ .nonblocking = false },
             },
-            .pseudo_console = if (builtin.os.tag == .windows) pty.pseudo_console else {},
-            .os_pre_exec = switch (comptime builtin.os.tag) {
+            .pseudo_console = if (builtin.target.os.tag == .windows) pty.pseudo_console else {},
+            .os_pre_exec = switch (comptime builtin.target.os.tag) {
                 .windows => null,
                 else => f: {
                     const f = struct {
@@ -1302,7 +1307,7 @@ const Subprocess = struct {
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
 
         self.process = .{ .fork_exec = cmd };
-        return switch (builtin.os.tag) {
+        return switch (builtin.target.os.tag) {
             .windows => .{
                 .read = pty.out_pipe,
                 .write = pty.in_pipe,
@@ -1445,7 +1450,7 @@ const Subprocess = struct {
     /// exit code.
     fn killCommand(command: *Command, foreground_pgid: ?c.pid_t) !void {
         if (command.pid) |pid| {
-            switch (builtin.os.tag) {
+            switch (builtin.target.os.tag) {
                 .windows => {
                     if (windows.exp.kernel32.TerminateProcess(pid, 0) == windows.FALSE) {
                         return windows.unexpectedError(windows.GetLastError());
@@ -1788,7 +1793,7 @@ pub const ReadThread = struct {
         // Right now, on Darwin, `std.Thread.setName` can only name the current
         // thread, and we have no way to get the current thread from within it,
         // so instead we use this code to name the thread instead.
-        if (builtin.os.tag.isDarwin()) {
+        if (builtin.target.os.tag.isDarwin()) {
             internal_os.macos.pthread_setname_np(&"io-reader".*);
             setQosClass();
         }
@@ -1843,7 +1848,7 @@ pub const ReadThread = struct {
             return;
         };
         defer gather_thread.join();
-        if (comptime !builtin.os.tag.isDarwin()) {
+        if (comptime !builtin.target.os.tag.isDarwin()) {
             gather_thread.setName(global.io(), "io-gather") catch {};
         }
 
@@ -1896,7 +1901,7 @@ pub const ReadThread = struct {
     /// and publishes each batch to the parse stage. This thread owns
     /// all fd monitoring, including the quit fd.
     fn gatherMainPosix(fd: posix.fd_t, quit: posix.fd_t, pipeline: *Pipeline) void {
-        if (builtin.os.tag.isDarwin()) {
+        if (builtin.target.os.tag.isDarwin()) {
             internal_os.macos.pthread_setname_np(&"io-gather".*);
             setQosClass();
         }
@@ -2317,8 +2322,7 @@ fn execCommand(
                 // Use "exec" to replace the bash process with
                 // our intended command so we don't have a parent
                 // process hanging around.
-                const cmd = try std.fmt.allocPrintSentinel(
-                    alloc,
+                const cmd = try alloc.printSentinel(
                     "exec -l {s}",
                     .{v},
                     0,
@@ -2347,7 +2351,7 @@ fn execCommand(
             var args: std.ArrayList([:0]const u8) = try .initCapacity(alloc, 4);
             defer args.deinit(alloc);
 
-            if (comptime builtin.os.tag == .windows) {
+            if (comptime builtin.target.os.tag == .windows) {
                 // On Windows we run the shell value directly rather than
                 // wrapping in `cmd.exe /C <shell>`. An intermediate cmd
                 // process is wasteful for the common case (`wsl ~`,
@@ -2373,11 +2377,11 @@ fn execCommand(
                             try alloc.dupe(u8, v)
                     else
                         try alloc.dupe(u8, v);
-                    try args.append(alloc, try alloc.dupeZ(u8, argv0));
+                    try args.append(alloc, try alloc.dupeSentinel(u8, argv0), 0);
                 } else {
                     var it = std.mem.tokenizeAny(u8, v, " \t");
                     while (it.next()) |tok| {
-                        try args.append(alloc, try alloc.dupeZ(u8, tok));
+                        try args.append(alloc, try alloc.dupeSentinel(u8, tok), 0);
                     }
                 }
                 break :shell try args.toOwnedSlice(alloc);
@@ -2422,7 +2426,7 @@ fn appendEnvAlways(
     current: []const u8,
     value: []const u8,
 ) Allocator.Error![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}{c}{s}", .{
+    return try alloc.print("{s}{c}{s}", .{
         current,
         std.fs.path.delimiter,
         value,
@@ -2437,7 +2441,7 @@ pub fn getProcessInfo(self: *Exec, comptime info: ProcessInfo) ?ProcessInfo.Type
 }
 
 test "execCommand darwin: shell command" {
-    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2464,7 +2468,7 @@ test "execCommand darwin: shell command" {
 }
 
 test "execCommand darwin: direct command" {
-    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2491,7 +2495,7 @@ test "execCommand darwin: direct command" {
 }
 
 test "execCommand: shell command, empty passwd" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2517,7 +2521,7 @@ test "execCommand: shell command, empty passwd" {
 }
 
 test "execCommand: shell command, error passwd" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2543,7 +2547,7 @@ test "execCommand: shell command, error passwd" {
 }
 
 test "execCommand: direct command, error passwd" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2569,7 +2573,7 @@ test "execCommand: direct command, error passwd" {
 }
 
 test "execCommand: direct command, config freed" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2601,7 +2605,7 @@ test "execCommand: direct command, config freed" {
 }
 
 test "execCommand windows: bare cmd.exe resolves via COMSPEC" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2623,7 +2627,7 @@ test "execCommand windows: bare cmd.exe resolves via COMSPEC" {
 }
 
 test "execCommand windows: bare non-cmd shell is passed through" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2641,7 +2645,7 @@ test "execCommand windows: bare non-cmd shell is passed through" {
 }
 
 test "execCommand windows: shell with args is split on whitespace" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2660,7 +2664,7 @@ test "execCommand windows: shell with args is split on whitespace" {
 }
 
 test "execCommand windows: direct command is passed through unchanged" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     var arena = ArenaAllocator.init(testing.allocator);
@@ -2749,4 +2753,54 @@ test "killPid: falls back to the pid when the child never leaves our group" {
     // The test runner still being alive to observe that means we fell back to
     // signalling the pid, rather than killpg'ing the group we share with it.
     try Subprocess.killPid(pid, null);
+}
+
+test "init frees the env when it fails" {
+    const testing = std.testing;
+
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+
+    const Run = struct {
+        fn initWithEnv(alloc: Allocator, cfg: *const configpkg.Config) !void {
+            var env: EnvMap = .init(alloc);
+            {
+                errdefer env.deinit();
+                try env.put("HOME", "/home/ghostty");
+                try env.put("SHELL", "/bin/sh");
+            }
+
+            // The env is not freed here once init has it: the failing
+            // allocator reports it as a leak unless init freed it.
+            var exec = try init(alloc, .{
+                .env = env,
+                .resources_dir = null,
+                .term = "xterm-ghostty",
+                .rt_pre_exec_info = .init(cfg),
+                .rt_post_fork_info = .init(cfg),
+            });
+            exec.deinit();
+        }
+    };
+
+    // Fail each allocation in turn, while building the env and inside init,
+    // as std.testing.checkAllAllocationFailures does. That function cannot
+    // be used directly: init deliberately falls back to a basic shell when
+    // building the command fails, so some runs succeed despite the failure.
+    // Every run must still free all it allocated.
+    const count = count: {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        try Run.initWithEnv(failing.allocator(), &config);
+        break :count failing.alloc_index;
+    };
+    for (0..count) |fail_index| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        Run.initWithEnv(failing.allocator(), &config) catch |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        };
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }

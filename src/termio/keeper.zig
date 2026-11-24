@@ -20,20 +20,7 @@ const global = @import("../global.zig");
 
 const log = std.log.scoped(.keeper);
 
-const c = @cImport({
-    @cInclude("sys/socket.h");
-    @cInclude("sys/un.h");
-    @cInclude("sys/stat.h");
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("sys/wait.h");
-    @cInclude("signal.h");
-    @cInclude("errno.h");
-    @cInclude("sys/time.h");
-    if (builtin.os.tag == .macos) {
-        @cInclude("libproc.h");
-    }
-});
+const c = @import("keeper-c");
 
 /// The binary we spawn, relative to the resources directory.
 const keeper_exe = "ghostty-keeper";
